@@ -100,6 +100,16 @@ Config at `~/.config/modelwarden/config.json`; state (manifests, inventory) at
 
 ## Spikes first (verify before building on them)
 
+> **Status 2026-08-16: all four spikes run and confirmed** — details in
+> `docs/spikes.md`. Headlines: full-hash of ~217 GiB took ~5.7 min at 683 MB/s
+> (background hashing tolerable, no partial-hash tier needed); JSON manifests
+> proven at KB scale with offline roots merging cleanly; the real HF cache
+> contained 4 pruned-husk repos with dangling refs, 1 multi-snapshot repo, 2
+> interrupted downloads (→ scanner rules + `warden doctor`); fs-UUID confirmed
+> as removable identity, with by-uuid only listing attached devices (manifest
+> must persist the UUID). Bonus: hashing found a real 16.7 GiB shelf duplicate
+> that inode comparison cannot see.
+
 Throwaway scripts, read-only against the real stores. Verdicts recorded here and
 in `docs/spikes.md`.
 
