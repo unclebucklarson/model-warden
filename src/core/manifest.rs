@@ -286,7 +286,36 @@ pub fn refresh(
         if !spec.path.exists() {
             continue;
         }
-        let previous = load_manifest(&manifest_path(state, &spec.id));
+        // Carry-forward sources: this machine's stored manifest AND the
+        // manifest the drive itself carries — so a drive written by backup/
+        // demote (or by another machine entirely) re-catalogs with its
+        // hashes intact instead of pending a rehash.
+        let stored = load_manifest(&manifest_path(state, &spec.id));
+        let carried = spec
+            .kind
+            .owned()
+            .then(|| load_manifest(&spec.path.join(".modelwarden/manifest.json")))
+            .flatten();
+        let previous = match (stored, carried) {
+            (Some(mut s), Some(c)) => {
+                let by_rel: BTreeMap<&Path, &FileRecord> =
+                    c.files.iter().map(|f| (f.rel_path.as_path(), f)).collect();
+                for f in &mut s.files {
+                    if f.sha256.is_none()
+                        && let Some(cf) = by_rel.get(f.rel_path.as_path())
+                        && cf.fingerprint == f.fingerprint
+                    {
+                        f.sha256 = cf.sha256.clone();
+                        f.verified_unix = cf.verified_unix;
+                    }
+                }
+                let known: Vec<PathBuf> = s.files.iter().map(|f| f.rel_path.clone()).collect();
+                s.files
+                    .extend(c.files.into_iter().filter(|cf| !known.contains(&cf.rel_path)));
+                Some(s)
+            }
+            (s, c) => s.or(c),
+        };
         manifests.push(build_root_manifest(spec, previous.as_ref()));
     }
 

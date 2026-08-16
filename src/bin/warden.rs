@@ -22,8 +22,12 @@ Commands (landing per ROADMAP.md milestone):
   backup <path> [--label X]        copy every hashed content to a target,
                                    read-back verified; registers the target
   verify <path|root-id>            re-hash a root against its manifest
-  archive    promote to shelf / demote to cold storage    (M5)
-  dedup      reclaim duplicates by hardlink (owned roots)  (M5)
+  archive <query>                  promote a cache-owned model to the shelf
+  archive demote <query> --to <path|id> [--remove-source]
+                                   verified copy to cold storage; the shelf
+                                   copy is deleted only with --remove-source
+  dedup [--hardlink]               collapse same-fs duplicate copies in owned
+                                   roots (default: dry run report)
   fetch      download from HuggingFace into the shelf     (M7)
 ";
 
@@ -45,6 +49,8 @@ fn main() -> ExitCode {
         Some("where") => cmd_where(&args, json),
         Some("backup") => cmd_backup(&args, json),
         Some("verify") => cmd_verify(&args, json),
+        Some("archive") => cmd_archive(&args),
+        Some("dedup") => cmd_dedup(&args, json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -383,7 +389,6 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
         eprintln!("warden: no inventory yet — run `warden hash` first");
         return ExitCode::from(2);
     };
-    let q = query.to_lowercase();
     let root_label = |id: &str| {
         inv.roots
             .iter()
@@ -391,16 +396,7 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
             .and_then(|r| r.label.clone())
             .unwrap_or_else(|| id.to_string())
     };
-    let matches: Vec<_> = inv
-        .models
-        .iter()
-        .filter(|(_, e)| {
-            e.display_name.to_lowercase().contains(&q)
-                || e.locations
-                    .iter()
-                    .any(|l| l.rel_path.to_string_lossy().to_lowercase().contains(&q))
-        })
-        .collect();
+    let matches = modelwarden::core::archive::find(&inv, query);
     if json {
         let owned: std::collections::BTreeMap<_, _> =
             matches.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect();
@@ -430,6 +426,179 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+/// One catalog entry matching the query, or a clear complaint.
+fn resolve_one<'a>(
+    inv: &'a manifest::Inventory,
+    query: &str,
+) -> Result<(&'a String, &'a manifest::ModelEntry), ExitCode> {
+    let matches = modelwarden::core::archive::find(inv, query);
+    match matches.len() {
+        0 => {
+            eprintln!("warden: nothing matching \"{query}\" in the catalog");
+            Err(ExitCode::from(1))
+        }
+        1 => Ok(matches[0]),
+        n => {
+            eprintln!("warden: \"{query}\" matches {n} models — name or hash prefix works:");
+            for (key, e) in matches.iter().take(10) {
+                let ident = key
+                    .strip_prefix("sha256:")
+                    .map(|h| &h[..12])
+                    .unwrap_or("unhashed");
+                eprintln!("  {ident}  {}  ({})", e.display_name, human_size(e.size));
+            }
+            Err(ExitCode::from(2))
+        }
+    }
+}
+
+fn cmd_archive(args: &[String]) -> ExitCode {
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let cfg = settings::AppConfig::load(&settings::config_file());
+
+    if args.get(1).map(String::as_str) == Some("demote") {
+        let Some(query) = args.get(2).filter(|a| !a.starts_with("--")) else {
+            eprintln!("usage: warden archive demote <query> --to <path|root-id> [--remove-source]");
+            return ExitCode::from(2);
+        };
+        let Some(to) = args
+            .iter()
+            .position(|a| a == "--to")
+            .and_then(|i| args.get(i + 1))
+        else {
+            eprintln!("warden: demote needs --to <path|root-id>");
+            return ExitCode::from(2);
+        };
+        let remove_source = args.iter().any(|a| a == "--remove-source");
+        let (key, entry) = match resolve_one(&inv, query) {
+            Ok(m) => m,
+            Err(code) => return code,
+        };
+        let canonical = std::path::Path::new(to).canonicalize().ok();
+        let Some(target) = modelwarden::core::roots::discover_roots(&cfg)
+            .into_iter()
+            .find(|r| r.id == *to || Some(&r.path) == canonical.as_ref())
+        else {
+            eprintln!("warden: {to} is not a registered root — `warden roots add` it first");
+            return ExitCode::from(2);
+        };
+        match modelwarden::core::archive::demote(&inv, key, entry, &target, remove_source, &mut |ev| {
+            print_backup_event(&ev)
+        }) {
+            Ok(out) => {
+                println!("demoted to {}", out.dest.display());
+                if let Some(src) = out.removed_source {
+                    println!("removed shelf copy {} (verified on cold storage first)", src.display());
+                } else {
+                    println!("shelf copy kept (pass --remove-source to free it)");
+                }
+                rerun_hash_quietly();
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("warden: {e:#}");
+                ExitCode::FAILURE
+            }
+        }
+    } else {
+        let Some(query) = args.get(1).filter(|a| !a.starts_with("--")) else {
+            eprintln!("usage: warden archive <query>  (or: warden archive demote …)");
+            return ExitCode::from(2);
+        };
+        let (key, entry) = match resolve_one(&inv, query) {
+            Ok(m) => m,
+            Err(code) => return code,
+        };
+        let Some(shelf_root) = cfg.scan_dirs.first() else {
+            eprintln!("warden: no shelf configured (scan_dirs is empty)");
+            return ExitCode::from(2);
+        };
+        match modelwarden::core::archive::promote(&inv, key, entry, shelf_root, &mut |ev| {
+            print_backup_event(&ev)
+        }) {
+            Ok(dest) => {
+                println!("archived to {}", dest.display());
+                rerun_hash_quietly();
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("warden: {e:#}");
+                ExitCode::FAILURE
+            }
+        }
+    }
+}
+
+/// Write operations change the world; fold the change into the catalog
+/// immediately (cheap — fingerprints carry all existing hashes forward).
+fn rerun_hash_quietly() {
+    let cfg = settings::AppConfig::load(&settings::config_file());
+    let specs = modelwarden::core::roots::discover_roots(&cfg);
+    if let Err(e) = manifest::refresh(&specs, &settings::state_dir(), |_| {}) {
+        eprintln!("warden: catalog refresh after write failed: {e:#}");
+    }
+}
+
+fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let hardlink = args.iter().any(|a| a == "--hardlink");
+    let result = modelwarden::core::dedup::reclaim(&inv, !hardlink, |ev| {
+        use modelwarden::core::dedup::ReclaimEvent;
+        match ev {
+            ReclaimEvent::Group { name, size } => {
+                eprintln!("group: {name} ({})", human_size(size))
+            }
+            ReclaimEvent::Verifying { path } => eprintln!("  verifying {}", path.display()),
+            ReclaimEvent::Relinked { path } => eprintln!("  relinked  {}", path.display()),
+            ReclaimEvent::SkippedForeign { path } => {
+                eprintln!("  skipped   {} (foreign store — never touched)", path.display())
+            }
+            ReclaimEvent::Failed { path, error } => {
+                eprintln!("  FAILED    {}: {error}", path.display())
+            }
+        }
+    });
+    match result {
+        Ok(report) => {
+            if hardlink && !report.relinked.is_empty() {
+                rerun_hash_quietly();
+            }
+            if json {
+                return print_json(&report);
+            }
+            if hardlink {
+                println!(
+                    "{} paths relinked, {} freed, {} foreign-store sets skipped, {} failed",
+                    report.relinked.len(),
+                    human_size(report.freed),
+                    report.skipped_foreign,
+                    report.failed
+                );
+            } else {
+                println!(
+                    "DRY RUN: {} paths would be relinked, freeing {} ({} foreign-store sets untouchable) — pass --hardlink to do it",
+                    report.relinked.len(),
+                    human_size(report.freed),
+                    report.skipped_foreign
+                );
+            }
+            if report.failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        }
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_backup_event(ev: &backup::BackupEvent) {

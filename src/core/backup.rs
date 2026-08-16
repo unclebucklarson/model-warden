@@ -179,7 +179,7 @@ fn dest_layout(entry: &ModelEntry, loc: &Location) -> PathBuf {
 /// read, require it to match `expected`, then read the finished temp back
 /// and require that to match too. Only then rename into place. Returns the
 /// destination's fingerprint.
-fn copy_verified(
+pub(crate) fn copy_verified(
     src: &Path,
     dest: &Path,
     expected: &str,

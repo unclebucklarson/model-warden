@@ -47,9 +47,22 @@ backed up, which are the same bytes — without ever losing bytes.**
   copies (backups) are intentional redundancy, never "reclaimable" —
   hardlinks can't cross filesystems. 35 tests green.
 
+- **M5** — archival + reclaim. `warden archive <query>` promotes a
+  cache-owned model to the shelf (hardlink same-fs, verified copy across);
+  `warden archive demote <query> --to <root>` is a verified copy to cold
+  storage that records into the drive's carried manifest — the shelf copy is
+  deleted only with an explicit `--remove-source`, and only after the cold
+  copy's read-back hash matched (a verified move never loses bytes).
+  `warden dedup` dry-runs by default; `--hardlink` re-verifies both sides
+  against the bytes as they are NOW, then collapses same-fs owned-root
+  copies via temp-link + rename. Queries accept sha256 prefixes (two
+  contents can share a name). refresh() now merges a drive's carried
+  manifest into carry-forward, so drives written by backup/demote (or
+  another machine) re-catalog with hashes intact. GUI: Tools → Back up…
+  dialog with live progress. Real dry run: 16.7 GiB reclaimable. 41 tests.
+
 ## Later milestones (deliverables in PLAN.md)
 
-- **M5** — archival + owned-root hardlink reclaim (CLI); backup reaches GUI.
 - **M6** — GUI write parity, disk-usage view (CLI `warden report` too),
   publish inventory schema v1.
 - **M7** — acquisition (`warden fetch`, HF downloads into the shelf).

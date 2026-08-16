@@ -59,6 +59,9 @@ struct App {
     show_roots: bool,
     roots_add_path: String,
     roots_add_label: String,
+    show_backup: bool,
+    backup_path: String,
+    backup_label: String,
 }
 
 impl App {
@@ -79,6 +82,9 @@ impl App {
             show_roots: false,
             roots_add_path: String::new(),
             roots_add_label: String::new(),
+            show_backup: false,
+            backup_path: String::new(),
+            backup_label: String::new(),
         };
         // Whatever the last `warden hash` (CLI or GUI) recorded is shown
         // immediately; a live rescan refreshes the inventory view.
@@ -226,6 +232,15 @@ impl App {
                 self.spawn_doctor();
                 ui.close();
             }
+            ui.separator();
+            if ui
+                .button("Back up to…")
+                .on_hover_text("Verified copy of every hashed content to a target drive")
+                .clicked()
+            {
+                self.show_backup = true;
+                ui.close();
+            }
         });
         ui.menu_button("Help", |ui| {
             if ui.button("About").clicked() {
@@ -353,6 +368,132 @@ impl App {
                     }
                 });
         });
+    }
+
+    fn spawn_backup(&mut self, path: String, label: String) {
+        self.spawn("backing up", move |tx| {
+            use modelwarden::core::{backup, roots};
+            let state = settings::state_dir();
+            let Some(inv) = manifest::load_inventory(&state) else {
+                let _ = tx.send(Msg::Error("no inventory yet — run Update manifests first".into()));
+                return;
+            };
+            let mut cfg = settings::AppConfig::load(&settings::config_file());
+            let target_path = std::path::PathBuf::from(path.trim());
+            let canonical = target_path.canonicalize().ok();
+            let reg = match cfg
+                .roots
+                .iter()
+                .find(|r| Some(&r.path) == canonical.as_ref())
+                .cloned()
+            {
+                Some(r) => r,
+                None => {
+                    let label = (!label.trim().is_empty()).then(|| label.trim().to_string());
+                    match roots::register_root(&mut cfg, &target_path, label)
+                        .and_then(|r| {
+                            cfg.save(&settings::config_file())?;
+                            Ok(r)
+                        }) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            let _ = tx.send(Msg::Error(format!("{e:#}")));
+                            return;
+                        }
+                    }
+                }
+            };
+            let tspec = roots::RootSpec {
+                id: reg.id,
+                kind: roots::RootKind::Removable,
+                path: reg.path,
+                label: reg.label,
+            };
+            let result = backup::backup(&inv, &tspec, |ev| {
+                let line = match ev {
+                    backup::BackupEvent::FileStart { label, size } => {
+                        format!("backing up {label} ({})", human_size(size))
+                    }
+                    backup::BackupEvent::FileProgress { label, phase, done, total } => {
+                        format!("{phase} {label} — {}%", done * 100 / total.max(1))
+                    }
+                    backup::BackupEvent::FileDone { label, secs } => {
+                        format!("verified {label} in {secs:.0}s")
+                    }
+                    backup::BackupEvent::Skipped { label, reason } => {
+                        format!("skipped {label}: {reason}")
+                    }
+                    backup::BackupEvent::Failed { label, error } => {
+                        format!("FAILED {label}: {error}")
+                    }
+                };
+                let _ = tx.send(Msg::Progress(line));
+            });
+            match result {
+                Ok((man, report)) => {
+                    let save = manifest::save_json(&man, &backup::target_manifest_path(&tspec.path))
+                        .and_then(|()| {
+                            manifest::save_json(&man, &manifest::manifest_path(&state, &tspec.id))
+                        })
+                        .and_then(|()| {
+                            let inv = manifest::merge(&manifest::load_all_manifests(&state));
+                            manifest::save_json(&inv, &manifest::inventory_path(&state))?;
+                            Ok(inv)
+                        });
+                    match save {
+                        Ok(inv) => {
+                            let _ = tx.send(Msg::Refreshed(inv));
+                            let _ = tx.send(Msg::Finished(format!(
+                                "backup: {} copied ({}), {} already on target, {} failed",
+                                report.copied,
+                                human_size(report.copied_bytes),
+                                report.skipped_already,
+                                report.failed
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Error(format!("recording backup: {e:#}")));
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn backup_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_backup {
+            return;
+        }
+        let mut open = self.show_backup;
+        let mut start: Option<(String, String)> = None;
+        egui::Window::new("Back Up")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Verified copy of every hashed content to a target directory.");
+                ui.label("A copy only counts once the target read back the right hash.");
+                ui.horizontal(|ui| {
+                    ui.label("Target:");
+                    ui.text_edit_singleline(&mut self.backup_path);
+                    ui.label("Label:");
+                    ui.text_edit_singleline(&mut self.backup_label);
+                });
+                let ready = !self.backup_path.trim().is_empty();
+                if ui
+                    .add_enabled(ready, egui::Button::new("Start backup"))
+                    .clicked()
+                {
+                    start = Some((self.backup_path.clone(), self.backup_label.clone()));
+                }
+            });
+        if let Some((path, label)) = start {
+            self.spawn_backup(path, label);
+            open = false;
+        }
+        self.show_backup = open;
     }
 
     fn roots_dialog(&mut self, ctx: &egui::Context) {
@@ -551,6 +692,7 @@ impl eframe::App for App {
         });
 
         self.roots_dialog(ui.ctx());
+        self.backup_dialog(ui.ctx());
 
         if self.show_about {
             egui::Window::new("About")

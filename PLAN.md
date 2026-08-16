@@ -51,6 +51,7 @@ had a fuzzy seam and got merged. This split survives only if the seam stays cris
 | Backup layout | Human-readable tree: `<target>/<family>/<file>.gguf` + a target-local manifest recording hashes and dates. A human can rescue files without warden. |
 | Acquisition target | HF downloads land in the shelf (warden-owned), provenance (repo, revision, etag, when) recorded at download time. Warden does not write into the HF cache. |
 | Safety invariants | Never delete model bytes — hardlinking is the only reclaim, after hash-verifying both files, via temp-link+rename. All copies go .partial → verify hash → rename. Refuse-overwrite everywhere. Manifest writes atomic (temp+rename). Never write inside a store another tool owns. |
+| Demotion refinement (2026-08-16) | A demote is a *verified move*: copy → read-back hash on cold storage → record in the drive's carried manifest → only then, and only with an explicit `--remove-source`, delete the shelf copy. Default keeps both. This is the one sanctioned deletion, because the bytes are provably preserved first. |
 | Milestone ordering | Spikes before building; downloads (acquisition) deliberately last, after inventory/dedup/backup/archival mature. |
 
 ## Architecture
