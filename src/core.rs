@@ -10,6 +10,7 @@ pub mod dedup;
 pub mod doctor;
 pub mod gguf;
 pub mod identity;
+pub mod lock;
 pub mod manifest;
 pub mod roots;
 pub mod scan;

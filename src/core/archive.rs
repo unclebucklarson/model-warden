@@ -176,6 +176,59 @@ pub fn demote(
     })
 }
 
+/// Bring a content back from a drive to the shelf — the return leg of
+/// backup/demote. A verified copy (three-way, `.partial` temp), keeping the
+/// layout the drive already has. The drive is never modified.
+pub fn restore(
+    inv: &Inventory,
+    key: &str,
+    entry: &ModelEntry,
+    shelf_root: &Path,
+    on: &mut impl FnMut(BackupEvent),
+) -> Result<PathBuf> {
+    let Some(hash) = key.strip_prefix("sha256:") else {
+        bail!("{} isn't hashed in the catalog", entry.display_name);
+    };
+    if entry
+        .locations
+        .iter()
+        .any(|l| l.kind == RootKind::Shelf && inv.live_accessible(l))
+    {
+        bail!("{} is already on the shelf", entry.display_name);
+    }
+    let Some(src_loc) = entry
+        .locations
+        .iter()
+        .find(|l| l.kind == RootKind::Removable && inv.live_accessible(l))
+    else {
+        // Distinguish "drive not plugged in" from "no drive has it".
+        if entry
+            .locations
+            .iter()
+            .any(|l| l.kind == RootKind::Removable)
+        {
+            bail!(
+                "{} lives on an offline drive — plug it in first (`warden where` names it)",
+                entry.display_name
+            );
+        }
+        bail!(
+            "{} has no copy on any drive; if it's in a cache store, `warden archive` it instead",
+            entry.display_name
+        );
+    };
+    let src_root = inv
+        .root(&src_loc.root_id)
+        .context("source root missing from inventory")?;
+    let src = src_root.path.join(&src_loc.rel_path);
+    let dest = shelf_root.join(&src_loc.rel_path);
+    if dest.exists() {
+        bail!("{} already exists — refusing to overwrite", dest.display());
+    }
+    backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, on)?;
+    Ok(dest)
+}
+
 /// Find catalog entries matching a query: name substring, path substring,
 /// or a sha256 prefix — the tiebreaker when two contents share a name.
 pub fn find<'a>(
@@ -270,6 +323,50 @@ mod tests {
         );
         // Refuses to overwrite on a second run.
         assert!(promote(&inv, key, entry, shelf.path(), &mut |_| {}).is_err());
+    }
+
+    #[test]
+    fn restore_brings_drive_copies_back_to_the_shelf() {
+        let drive = tempfile::tempdir().unwrap();
+        let shelf = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(drive.path().join("Fam")).unwrap();
+        std::fs::write(
+            drive.path().join("Fam/cold.gguf"),
+            synthetic_gguf("llama", 2048, 15),
+        )
+        .unwrap();
+        let drive_spec = RootSpec {
+            id: "ext-drive001".into(),
+            kind: RootKind::Removable,
+            path: drive.path().to_path_buf(),
+            label: Some("archive1".into()),
+        };
+        let mut man = build_root_manifest(&drive_spec, None);
+        for f in &mut man.files {
+            f.sha256 = Some(
+                identity::sha256_file(&drive_spec.path.join(&f.rel_path), |_, _| {}).unwrap(),
+            );
+        }
+        let inv = merge(&[man.clone()]);
+        let (key, entry) = inv.models.iter().next().unwrap();
+
+        let dest = restore(&inv, key, entry, shelf.path(), &mut |_| {}).unwrap();
+        assert_eq!(dest, shelf.path().join("Fam/cold.gguf"));
+        assert!(dest.is_file());
+        assert!(
+            drive.path().join("Fam/cold.gguf").is_file(),
+            "the drive is never modified"
+        );
+        // Second restore refuses (already exists at dest).
+        assert!(restore(&inv, key, entry, shelf.path(), &mut |_| {}).is_err());
+
+        // Offline drive: helpful refusal, not a copy attempt.
+        let mut offline = man;
+        offline.root.path = "/media/nowhere/unplugged".into();
+        let inv2 = merge(&[offline]);
+        let (key2, entry2) = inv2.models.iter().next().unwrap();
+        let err = restore(&inv2, key2, entry2, shelf.path(), &mut |_| {}).unwrap_err();
+        assert!(format!("{err}").contains("offline drive"));
     }
 
     #[test]

@@ -50,13 +50,76 @@ fn agent() -> ureq::Agent {
         .build()
 }
 
+fn with_auth(req: ureq::Request, token: Option<&str>) -> ureq::Request {
+    match token {
+        Some(t) => req.set("Authorization", &format!("Bearer {t}")),
+        None => req,
+    }
+}
+
+/// The HF token for gated repos, most explicit source first: caller's
+/// (`--token`), the env vars the HF tooling uses, then the token file the
+/// `hf` CLI writes on login.
+pub fn resolve_token(explicit: Option<String>) -> Option<String> {
+    explicit
+        .or_else(|| std::env::var("HF_TOKEN").ok())
+        .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| {
+            let base = std::env::var_os("HF_HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::home_dir()
+                        .unwrap_or_else(|| PathBuf::from("."))
+                        .join(".cache/huggingface")
+                });
+            token_from_file(&base.join("token"))
+        })
+}
+
+fn token_from_file(path: &Path) -> Option<String> {
+    let t = std::fs::read_to_string(path).ok()?;
+    let t = t.trim();
+    (!t.is_empty()).then(|| t.to_string())
+}
+
+/// llama.cpp split convention: `<name>-00001-of-00003.gguf`. Returns the
+/// stem-with-set (`<name>`, part index, part count) when it matches.
+fn split_parts(filename: &str) -> Option<(&str, u32, u32)> {
+    let stem = filename.strip_suffix(".gguf")?;
+    // <prefix>-NNNNN-of-NNNNN
+    let (rest, count) = stem.rsplit_once("-of-")?;
+    let (prefix, idx) = rest.rsplit_once('-')?;
+    if idx.len() != 5 || count.len() != 5 {
+        return None;
+    }
+    Some((prefix, idx.parse().ok()?, count.parse().ok()?))
+}
+
+/// The full download set a chosen file implies: every sibling part of its
+/// split (in order), or just the file itself. Errors if the listing is
+/// missing parts — a split with holes is not servable.
+pub fn split_set(all: &[RemoteFile], chosen: &str) -> Result<Vec<String>> {
+    let Some((prefix, _, count)) = split_parts(chosen) else {
+        return Ok(vec![chosen.to_string()]);
+    };
+    let mut parts = Vec::new();
+    for i in 1..=count {
+        let want = format!("{prefix}-{i:05}-of-{count:05}.gguf");
+        if !all.iter().any(|f| f.filename == want) {
+            bail!("split set incomplete: {want} is missing from the repo listing");
+        }
+        parts.push(want);
+    }
+    Ok(parts)
+}
+
 /// GGUF files a repo offers, with sizes when the API provides them.
-pub fn list_files(repo: &str) -> Result<Vec<RemoteFile>> {
+pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
     let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
-    let resp = agent()
-        .get(&url)
+    let resp = with_auth(agent().get(&url), token)
         .call()
-        .with_context(|| format!("querying {repo}"))?;
+        .with_context(|| format!("querying {repo} (gated repos need a token)"))?;
     let json: serde_json::Value = resp.into_json().context("parsing repo metadata")?;
     let Some(siblings) = json.get("siblings").and_then(|s| s.as_array()) else {
         bail!("{repo}: no file list in API response");
@@ -96,6 +159,7 @@ pub fn fetch(
     repo: &str,
     filename: &str,
     shelf_root: &Path,
+    token: Option<&str>,
     mut on: impl FnMut(FetchEvent),
 ) -> Result<(PathBuf, Provenance)> {
     let dest = dest_for(shelf_root, repo, filename)?;
@@ -115,7 +179,7 @@ pub fn fetch(
 
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
     let label = format!("{repo}/{filename}");
-    let mut req = agent().get(&url);
+    let mut req = with_auth(agent().get(&url), token);
     if resume_from > 0 {
         req = req.set("Range", &format!("bytes={resume_from}-"));
     }
@@ -132,8 +196,10 @@ pub fn fetch(
         .header("x-repo-commit")
         .map(str::to_string)
         .or_else(|| {
-            agent()
-                .get(&format!("https://huggingface.co/api/models/{repo}"))
+            with_auth(
+                agent().get(&format!("https://huggingface.co/api/models/{repo}")),
+                token,
+            )
                 .call()
                 .ok()
                 .and_then(|r| r.into_json::<serde_json::Value>().ok())
@@ -243,6 +309,56 @@ mod tests {
         );
         assert!(dest_for(shelf, "org/repo", "../escape.gguf").is_err());
         assert!(dest_for(shelf, "org/repo", "/abs.gguf").is_err());
+    }
+
+    #[test]
+    fn split_sets_expand_and_demand_completeness() {
+        let files = |names: &[&str]| -> Vec<RemoteFile> {
+            names
+                .iter()
+                .map(|n| RemoteFile {
+                    filename: n.to_string(),
+                    size: None,
+                })
+                .collect()
+        };
+        // Not a split: passes through.
+        let all = files(&["model-Q4_K_M.gguf"]);
+        assert_eq!(
+            split_set(&all, "model-Q4_K_M.gguf").unwrap(),
+            vec!["model-Q4_K_M.gguf"]
+        );
+        // A split expands to every part, in order, from any chosen part.
+        let all = files(&[
+            "UD/big-00002-of-00003.gguf",
+            "UD/big-00001-of-00003.gguf",
+            "UD/big-00003-of-00003.gguf",
+        ]);
+        assert_eq!(
+            split_set(&all, "UD/big-00002-of-00003.gguf").unwrap(),
+            vec![
+                "UD/big-00001-of-00003.gguf",
+                "UD/big-00002-of-00003.gguf",
+                "UD/big-00003-of-00003.gguf"
+            ]
+        );
+        // A hole in the listing is an error, not a partial download.
+        let all = files(&["big-00001-of-00003.gguf", "big-00003-of-00003.gguf"]);
+        assert!(split_set(&all, "big-00001-of-00003.gguf").is_err());
+        // Five-digit discipline: near-misses are not splits.
+        assert!(split_parts("model-001-of-003.gguf").is_none());
+        assert!(split_parts("model-00001-of-00003.txt").is_none());
+    }
+
+    #[test]
+    fn token_file_reading_trims_and_ignores_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        assert_eq!(token_from_file(&path), None, "missing file");
+        std::fs::write(&path, "  hf_abc123\n").unwrap();
+        assert_eq!(token_from_file(&path).as_deref(), Some("hf_abc123"));
+        std::fs::write(&path, "   \n").unwrap();
+        assert_eq!(token_from_file(&path), None, "blank file");
     }
 
     #[test]

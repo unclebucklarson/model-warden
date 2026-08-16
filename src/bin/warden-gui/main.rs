@@ -169,6 +169,13 @@ impl App {
 
     fn spawn_hash(&mut self) {
         self.spawn("updating catalog (rescan + hash)", |tx| {
+            let _lock = match modelwarden::core::lock::WriteLock::acquire(&settings::state_dir()) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
             if let Some(inv) = Self::refresh_catalog(tx) {
                 let n = inv.models.len();
                 let _ = tx.send(Msg::Refreshed(inv));
@@ -197,6 +204,13 @@ impl App {
     fn spawn_promote(&mut self, key: String) {
         self.spawn("archiving to shelf", move |tx| {
             let state = settings::state_dir();
+            let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
             let Some(inv) = manifest::load_inventory(&state) else {
                 let _ = tx.send(Msg::Error("catalog missing — update it first".into()));
                 return;
@@ -229,6 +243,13 @@ impl App {
     fn spawn_demote(&mut self, key: String, root_id: String, remove_source: bool) {
         self.spawn("demoting to cold storage", move |tx| {
             let state = settings::state_dir();
+            let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
             let Some(inv) = manifest::load_inventory(&state) else {
                 let _ = tx.send(Msg::Error("catalog missing — update it first".into()));
                 return;
@@ -819,7 +840,8 @@ impl App {
 
     fn spawn_list_remote(&mut self, repo: String) {
         self.spawn("listing repo files", move |tx| {
-            match modelwarden::core::acquire::list_files(&repo) {
+            let token = modelwarden::core::acquire::resolve_token(None);
+            match modelwarden::core::acquire::list_files(&repo, token.as_deref()) {
                 Ok(files) => {
                     let n = files.len();
                     let _ = tx.send(Msg::RemoteFiles(files));
@@ -832,7 +854,7 @@ impl App {
         });
     }
 
-    fn spawn_fetch(&mut self, repo: String, filename: String) {
+    fn spawn_fetch(&mut self, repo: String, parts: Vec<String>) {
         self.spawn("downloading", move |tx| {
             use modelwarden::core::acquire;
             let cfg = settings::AppConfig::load(&settings::config_file());
@@ -840,50 +862,69 @@ impl App {
                 let _ = tx.send(Msg::Error("no shelf configured (scan_dirs is empty)".into()));
                 return;
             };
-            let txp = tx.clone();
-            let result = acquire::fetch(&repo, &filename, &shelf_root, move |ev| {
-                let line = match ev {
-                    acquire::FetchEvent::Start { label, total, resumed_from } => format!(
-                        "downloading {label} ({}){}",
-                        total.map(human_size).unwrap_or_else(|| "size unknown".into()),
-                        if resumed_from > 0 {
-                            format!(", resuming at {}", human_size(resumed_from))
-                        } else {
-                            String::new()
-                        }
-                    ),
-                    acquire::FetchEvent::Progress { label, done, total } => match total {
-                        Some(t) => format!(
-                            "downloading {label} — {} / {} ({}%)",
-                            human_size(done),
-                            human_size(t),
-                            done * 100 / t.max(1)
-                        ),
-                        None => format!("downloading {label} — {}", human_size(done)),
-                    },
-                    acquire::FetchEvent::Hashing { label } => format!("hashing {label}"),
-                };
-                let _ = txp.send(Msg::Progress(line));
-            });
-            match result {
-                Ok((dest, prov)) => {
-                    let done = match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
-                        Ok(hash) => {
-                            let state = settings::state_dir();
-                            let _ = acquire::record_provenance(&state, &hash, &prov);
-                            format!("fetched {} ({})", dest.display(), &hash[..12])
-                        }
-                        Err(e) => format!("fetched {} (hash failed: {e:#})", dest.display()),
-                    };
-                    if let Some(inv) = Self::refresh_catalog(tx) {
-                        let _ = tx.send(Msg::Refreshed(inv));
-                    }
-                    let _ = tx.send(Msg::Finished(done));
-                }
+            let state = settings::state_dir();
+            let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                Ok(l) => l,
                 Err(e) => {
                     let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            let token = acquire::resolve_token(None);
+            let mut summary = Vec::new();
+            for filename in &parts {
+                if let Ok(dest) = acquire::dest_for(&shelf_root, &repo, filename)
+                    && dest.exists()
+                {
+                    summary.push(format!("{filename}: already present"));
+                    continue;
+                }
+                let txp = tx.clone();
+                let result =
+                    acquire::fetch(&repo, filename, &shelf_root, token.as_deref(), move |ev| {
+                        let line = match ev {
+                            acquire::FetchEvent::Start { label, total, resumed_from } => format!(
+                                "downloading {label} ({}){}",
+                                total.map(human_size).unwrap_or_else(|| "size unknown".into()),
+                                if resumed_from > 0 {
+                                    format!(", resuming at {}", human_size(resumed_from))
+                                } else {
+                                    String::new()
+                                }
+                            ),
+                            acquire::FetchEvent::Progress { label, done, total } => match total {
+                                Some(t) => format!(
+                                    "downloading {label} — {} / {} ({}%)",
+                                    human_size(done),
+                                    human_size(t),
+                                    done * 100 / t.max(1)
+                                ),
+                                None => format!("downloading {label} — {}", human_size(done)),
+                            },
+                            acquire::FetchEvent::Hashing { label } => format!("hashing {label}"),
+                        };
+                        let _ = txp.send(Msg::Progress(line));
+                    });
+                match result {
+                    Ok((dest, prov)) => {
+                        match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
+                            Ok(hash) => {
+                                let _ = acquire::record_provenance(&state, &hash, &prov);
+                                summary.push(format!("fetched {} ({})", dest.display(), &hash[..12]));
+                            }
+                            Err(e) => summary
+                                .push(format!("fetched {} (hash failed: {e:#})", dest.display())),
+                        }
+                    }
+                    Err(e) => {
+                        summary.push(format!("FAILED {filename}: {e:#}"));
+                    }
                 }
             }
+            if let Some(inv) = Self::refresh_catalog(tx) {
+                let _ = tx.send(Msg::Refreshed(inv));
+            }
+            let _ = tx.send(Msg::Finished(summary.join("; ")));
         });
     }
 
@@ -923,6 +964,7 @@ impl App {
                                         f.filename.clone(),
                                     ));
                                 }
+                                // (split sets expand below, at dispatch)
                                 ui.label(format!(
                                     "{:>10}  {}",
                                     f.size.map(human_size).unwrap_or_default(),
@@ -938,8 +980,21 @@ impl App {
             self.spawn_list_remote(repo);
         }
         if let Some((repo, filename)) = download {
-            self.spawn_fetch(repo, filename);
-            open = false;
+            let parts = self
+                .fetch_files
+                .as_deref()
+                .map(|all| modelwarden::core::acquire::split_set(all, &filename))
+                .unwrap_or_else(|| Ok(vec![filename.clone()]));
+            match parts {
+                Ok(parts) => {
+                    if parts.len() > 1 {
+                        self.activity.push(format!("split model: {} parts", parts.len()));
+                    }
+                    self.spawn_fetch(repo, parts);
+                    open = false;
+                }
+                Err(e) => self.activity.push(format!("error: {e:#}")),
+            }
         }
         self.show_fetch = open;
     }

@@ -80,13 +80,20 @@ backed up, which are the same bytes — without ever losing bytes.**
   real downloads. 43 tests green.
 
 **All seven planned milestones are complete.** What remains lives below.
+- **M8** — the three gaps a real-world day would hit. `warden restore
+  <query>`: the return leg of backup/demote — verified copy from a drive
+  back to the shelf, drive never modified, offline drives named in the
+  refusal. Split-GGUF downloads: `fetch` expands any part to its full
+  `-NNNNN-of-NNNNN` set (refusing sets with holes), skips already-present
+  parts, and supports gated repos (--token / $HF_TOKEN / hf CLI login).
+  Single-instance write lock: pid file under the state dir guards every
+  write command in both frontends; live holders block with a clear message,
+  stale locks from crashed runs are stolen. 49 tests green.
 
 ## Smaller items (fold in opportunistically)
 
 - `--json` output on every read command from the moment it exists (scan: done).
 - Activity log lines mirror between CLI verbose mode and GUI panel.
-- Single-instance lock file before the first write operation lands (M4) so
-  two wardens can't race a backup/archive.
 - Ollama projector layers: manifests can carry `image.projector` blobs
   alongside `image.model`; inventory them like HF mmproj files.
 - Track mmproj ↔ parent-model companionship so archival/backup of a vision

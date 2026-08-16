@@ -30,9 +30,18 @@ warden backup <path>     verified copy of every content to a target drive
 warden verify <path|id>  re-hash a root against its manifest (bit-rot check)
 warden archive <query>   promote a cache-owned model to the shelf
 warden archive demote <query> --to <root> [--remove-source]
+warden restore <query>   verified copy from a drive back to the shelf
 warden dedup [--hardlink]  collapse same-fs duplicates (dry run by default)
 warden report            disk usage by model family
+warden fetch <org/repo> [pattern] [--token T]
+                         download from HF: split sets fetched together,
+                         Range resume, gated repos via --token/$HF_TOKEN/
+                         the hf CLI's saved login
 ```
+
+Write operations take a single-instance lock (`state/warden.lock`) so two
+wardens can't race a backup or reclaim; stale locks from crashed runs are
+detected and stolen.
 
 ## Safety model
 

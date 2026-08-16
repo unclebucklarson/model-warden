@@ -26,12 +26,17 @@ Commands (landing per ROADMAP.md milestone):
   archive demote <query> --to <path|id> [--remove-source]
                                    verified copy to cold storage; the shelf
                                    copy is deleted only with --remove-source
+  restore <query>                  verified copy from a drive back to the shelf
   dedup [--hardlink]               collapse same-fs duplicate copies in owned
                                    roots (default: dry run report)
   report [--json]                  disk usage grouped by model family
-  fetch <org/repo> [pattern]       list a repo's GGUFs; with a pattern
-                                   matching one file, download it to the
-                                   shelf (Range-resume, provenance recorded)
+  fetch <org/repo> [pattern] [--token T]
+                                   list a repo's GGUFs; with a pattern
+                                   matching one file (or one split set),
+                                   download to the shelf: Range-resume,
+                                   split parts fetched together, provenance
+                                   recorded. Token: --token, $HF_TOKEN, or
+                                   the hf CLI's saved login
 ";
 
 fn main() -> ExitCode {
@@ -53,6 +58,7 @@ fn main() -> ExitCode {
         Some("backup") => cmd_backup(&args, json),
         Some("verify") => cmd_verify(&args, json),
         Some("archive") => cmd_archive(&args),
+        Some("restore") => cmd_restore(&args),
         Some("dedup") => cmd_dedup(&args, json),
         Some("report") => cmd_report(json),
         Some("fetch") => cmd_fetch(&args, json),
@@ -126,6 +132,10 @@ fn cmd_hash(json: bool) -> ExitCode {
     let cfg = settings::AppConfig::load(&settings::config_file());
     let state = settings::state_dir();
     let specs = modelwarden::core::roots::discover_roots(&cfg);
+    let _lock = match take_write_lock(&state) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
     let mut hashed_count = 0usize;
     let inv = manifest::refresh(&specs, &state, |ev| match ev {
         manifest::RefreshEvent::HashStart { label, size } => {
@@ -459,6 +469,13 @@ fn resolve_one<'a>(
     }
 }
 
+fn take_write_lock(state: &std::path::Path) -> Result<modelwarden::core::lock::WriteLock, ExitCode> {
+    modelwarden::core::lock::WriteLock::acquire(state).map_err(|e| {
+        eprintln!("warden: {e:#}");
+        ExitCode::FAILURE
+    })
+}
+
 fn cmd_archive(args: &[String]) -> ExitCode {
     let state = settings::state_dir();
     let Some(inv) = manifest::load_inventory(&state) else {
@@ -493,6 +510,10 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             eprintln!("warden: {to} is not a registered root — `warden roots add` it first");
             return ExitCode::from(2);
         };
+        let _lock = match take_write_lock(&state) {
+            Ok(l) => l,
+            Err(code) => return code,
+        };
         match modelwarden::core::archive::demote(&inv, key, entry, &target, remove_source, &mut |ev| {
             print_backup_event(&ev)
         }) {
@@ -523,6 +544,10 @@ fn cmd_archive(args: &[String]) -> ExitCode {
         let Some(shelf_root) = cfg.scan_dirs.first() else {
             eprintln!("warden: no shelf configured (scan_dirs is empty)");
             return ExitCode::from(2);
+        };
+        let _lock = match take_write_lock(&state) {
+            Ok(l) => l,
+            Err(code) => return code,
         };
         match modelwarden::core::archive::promote(&inv, key, entry, shelf_root, &mut |ev| {
             print_backup_event(&ev)
@@ -557,6 +582,14 @@ fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
         return ExitCode::from(2);
     };
     let hardlink = args.iter().any(|a| a == "--hardlink");
+    let _lock = if hardlink {
+        match take_write_lock(&state) {
+            Ok(l) => Some(l),
+            Err(code) => return code,
+        }
+    } else {
+        None
+    };
     let result = modelwarden::core::dedup::reclaim(&inv, !hardlink, |ev| {
         use modelwarden::core::dedup::ReclaimEvent;
         match ev {
@@ -606,15 +639,61 @@ fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
     }
 }
 
+fn cmd_restore(args: &[String]) -> ExitCode {
+    let Some(query) = args.get(1).filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: warden restore <query>");
+        return ExitCode::from(2);
+    };
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let (key, entry) = match resolve_one(&inv, query) {
+        Ok(m) => m,
+        Err(code) => return code,
+    };
+    let cfg = settings::AppConfig::load(&settings::config_file());
+    let Some(shelf_root) = cfg.scan_dirs.first().cloned() else {
+        eprintln!("warden: no shelf configured (scan_dirs is empty)");
+        return ExitCode::from(2);
+    };
+    let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match modelwarden::core::archive::restore(&inv, key, entry, &shelf_root, &mut |ev| {
+        print_backup_event(&ev)
+    }) {
+        Ok(dest) => {
+            println!("restored to {}", dest.display());
+            rerun_hash_quietly();
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
     use modelwarden::core::acquire;
     let Some(repo) = args.get(1).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: warden fetch <org/repo> [pattern]");
+        eprintln!("usage: warden fetch <org/repo> [pattern] [--token T]");
         return ExitCode::from(2);
     };
     let pattern = args.get(2).filter(|a| !a.starts_with("--"));
+    let cli_token = args
+        .iter()
+        .position(|a| a == "--token")
+        .and_then(|i| args.get(i + 1).cloned());
+    let token = acquire::resolve_token(cli_token);
 
-    let files = match acquire::list_files(repo) {
+    let files = match acquire::list_files(repo, token.as_deref()) {
         Ok(f) => f,
         Err(e) => {
             eprintln!("warden: {e:#}");
@@ -635,7 +714,29 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
         }
         None => files.iter().collect(),
     };
-    if pattern.is_none() || matches.len() != 1 {
+
+    // What to download: a unique match expands to its split set; several
+    // matches are fine when they ARE exactly one split set.
+    let chosen: Option<Vec<String>> = match matches.as_slice() {
+        [one] => match acquire::split_set(&files, &one.filename) {
+            Ok(set) => Some(set),
+            Err(e) => {
+                eprintln!("warden: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        [first, ..] if pattern.is_some() => match acquire::split_set(&files, &first.filename) {
+            Ok(set)
+                if set.len() == matches.len()
+                    && matches.iter().all(|m| set.contains(&m.filename)) =>
+            {
+                Some(set)
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(parts) = chosen else {
         if json {
             return print_json(&matches);
         }
@@ -658,67 +759,92 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
             Some(p) => println!("\n\"{p}\" matches {} files — narrow it down", matches.len()),
         }
         return ExitCode::SUCCESS;
-    }
+    };
 
-    let file = matches[0];
     let cfg = settings::AppConfig::load(&settings::config_file());
     let Some(shelf_root) = cfg.scan_dirs.first().cloned() else {
         eprintln!("warden: no shelf configured (scan_dirs is empty)");
         return ExitCode::from(2);
     };
-    let result = acquire::fetch(repo, &file.filename, &shelf_root, |ev| match ev {
-        acquire::FetchEvent::Start {
-            label,
-            total,
-            resumed_from,
-        } => {
-            eprintln!(
-                "downloading {label} ({}){}",
-                total.map(human_size).unwrap_or_else(|| "size unknown".into()),
-                if resumed_from > 0 {
-                    format!(", resuming at {}", human_size(resumed_from))
-                } else {
-                    String::new()
-                }
-            );
-        }
-        acquire::FetchEvent::Progress { done, total, .. } => {
-            if let Some(t) = total {
-                eprint!("\r  {} / {} ({}%)   ", human_size(done), human_size(t), done * 100 / t.max(1));
-            } else {
-                eprint!("\r  {}   ", human_size(done));
+    let state = settings::state_dir();
+    let _lock = match take_write_lock(&state) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    if parts.len() > 1 {
+        eprintln!("split model: {} parts", parts.len());
+    }
+    let mut failed = false;
+    for filename in &parts {
+        match acquire::dest_for(&shelf_root, repo, filename) {
+            Ok(dest) if dest.exists() => {
+                eprintln!("  {filename}: already present, skipping");
+                continue;
             }
-            let _ = std::io::stderr().flush();
+            Err(e) => {
+                eprintln!("warden: {e:#}");
+                failed = true;
+                continue;
+            }
+            Ok(_) => {}
         }
-        acquire::FetchEvent::Hashing { .. } => eprintln!("\n  hashing…"),
-    });
-    match result {
-        Ok((dest, prov)) => {
-            eprintln!();
-            // Hash now — provenance is keyed by content identity.
-            match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
-                Ok(hash) => {
-                    let state = settings::state_dir();
-                    if let Err(e) = acquire::record_provenance(&state, &hash, &prov) {
-                        eprintln!("warden: recording provenance: {e:#}");
+        let result = acquire::fetch(repo, filename, &shelf_root, token.as_deref(), |ev| match ev {
+            acquire::FetchEvent::Start {
+                label,
+                total,
+                resumed_from,
+            } => {
+                eprintln!(
+                    "downloading {label} ({}){}",
+                    total.map(human_size).unwrap_or_else(|| "size unknown".into()),
+                    if resumed_from > 0 {
+                        format!(", resuming at {}", human_size(resumed_from))
+                    } else {
+                        String::new()
                     }
-                    println!(
-                        "fetched {} ({} rev {})",
-                        dest.display(),
-                        &hash[..12],
-                        prov.revision.as_deref().unwrap_or("unknown")
-                    );
-                }
-                Err(e) => eprintln!("warden: hashing download: {e:#}"),
+                );
             }
-            rerun_hash_quietly();
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("\nwarden: {e:#}");
-            ExitCode::FAILURE
+            acquire::FetchEvent::Progress { done, total, .. } => {
+                if let Some(t) = total {
+                    eprint!(
+                        "\r  {} / {} ({}%)   ",
+                        human_size(done),
+                        human_size(t),
+                        done * 100 / t.max(1)
+                    );
+                } else {
+                    eprint!("\r  {}   ", human_size(done));
+                }
+                let _ = std::io::stderr().flush();
+            }
+            acquire::FetchEvent::Hashing { .. } => eprintln!("\n  hashing…"),
+        });
+        match result {
+            Ok((dest, prov)) => {
+                eprintln!();
+                match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
+                    Ok(hash) => {
+                        if let Err(e) = acquire::record_provenance(&state, &hash, &prov) {
+                            eprintln!("warden: recording provenance: {e:#}");
+                        }
+                        println!(
+                            "fetched {} ({} rev {})",
+                            dest.display(),
+                            &hash[..12],
+                            prov.revision.as_deref().unwrap_or("unknown")
+                        );
+                    }
+                    Err(e) => eprintln!("warden: hashing download: {e:#}"),
+                }
+            }
+            Err(e) => {
+                eprintln!("\nwarden: {e:#}");
+                failed = true;
+            }
         }
     }
+    rerun_hash_quietly();
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
 fn cmd_report(json: bool) -> ExitCode {
@@ -825,6 +951,10 @@ fn cmd_backup(args: &[String], json: bool) -> ExitCode {
         label: reg.label,
     };
 
+    let _lock = match take_write_lock(&state) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
     match backup::backup(&inv, &tspec, |ev| print_backup_event(&ev)) {
         Ok((man, report)) => {
             let save = manifest::save_json(&man, &backup::target_manifest_path(&tspec.path))
@@ -888,6 +1018,10 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
                 }
             }
         }
+    };
+    let _lock = match take_write_lock(&state) {
+        Ok(l) => l,
+        Err(code) => return code,
     };
     match backup::verify(&mut man, |ev| print_backup_event(&ev)) {
         Ok(report) => {
