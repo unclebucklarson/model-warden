@@ -1,7 +1,8 @@
 //! Thin CLI over the core. Subcommands land milestone by milestone; write
 //! operations are usable here one milestone before the GUI exposes them.
 
-use modelwarden::core::{scan, settings};
+use modelwarden::core::{doctor, manifest, scan, settings};
+use std::io::Write;
 use std::process::ExitCode;
 
 const USAGE: &str = "\
@@ -10,10 +11,11 @@ modelwarden — inventory, backup, and archival for local model files
 Usage: warden <command>
 
 Commands (landing per ROADMAP.md milestone):
-  scan [--json]   list every model across every store
-  hash       compute/refresh SHA-256 identities           (M2)
-  status     inventory + manifest summary                 (M2)
-  dups       report hash-identical duplicates             (M2)
+  scan [--json]     list every model across every store (live view, no writes)
+  hash [--json]     update manifests; compute missing SHA-256 identities
+  status [--json]   manifest + identity summary
+  dups [--json]     hash-identical duplicates and reclaimable bytes
+  doctor [--json]   store health: dangling refs, orphans, interrupted downloads
   roots      manage storage roots (add/list)              (M3)
   where      locate a model across roots, incl. offline   (M3)
   backup     verified copy to a backup target             (M4)
@@ -25,12 +27,17 @@ Commands (landing per ROADMAP.md milestone):
 fn main() -> ExitCode {
     env_logger::init();
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let json = args.iter().any(|a| a == "--json");
     match args.first().map(String::as_str) {
         None | Some("help" | "--help" | "-h") => {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Some("scan") => cmd_scan(args.iter().any(|a| a == "--json")),
+        Some("scan") => cmd_scan(json),
+        Some("hash") => cmd_hash(json),
+        Some("status") => cmd_status(json),
+        Some("dups") => cmd_dups(json),
+        Some("doctor") => cmd_doctor(json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -47,14 +54,7 @@ fn cmd_scan(json: bool) -> ExitCode {
     );
 
     if json {
-        match serde_json::to_string_pretty(&models) {
-            Ok(s) => println!("{s}"),
-            Err(e) => {
-                eprintln!("warden: serializing scan: {e}");
-                return ExitCode::FAILURE;
-            }
-        }
-        return ExitCode::SUCCESS;
+        return print_json(&models);
     }
 
     let src = |m: &scan::ModelFile| match &m.source {
@@ -98,6 +98,207 @@ fn cmd_scan(json: bool) -> ExitCode {
         }
     );
     ExitCode::SUCCESS
+}
+
+/// Rescan every root, carry forward hashes whose fingerprints still match,
+/// hash what's missing, persist manifests + the merged inventory.
+fn cmd_hash(json: bool) -> ExitCode {
+    let cfg = settings::AppConfig::load(&settings::config_file());
+    let state = settings::state_dir();
+    let specs = modelwarden::core::roots::discover_roots(&cfg);
+    let mut hashed_count = 0usize;
+    let inv = manifest::refresh(&specs, &state, |ev| match ev {
+        manifest::RefreshEvent::HashStart { label, size } => {
+            eprint!("  {label} ({})… ", human_size(size));
+            let _ = std::io::stderr().flush();
+        }
+        manifest::RefreshEvent::HashProgress { .. } => {}
+        manifest::RefreshEvent::HashDone { secs, .. } => {
+            eprintln!("done in {secs:.0}s");
+            hashed_count += 1;
+        }
+        manifest::RefreshEvent::HashFailed { error, .. } => eprintln!("FAILED: {error}"),
+    });
+    let inv = match inv {
+        Ok(inv) => inv,
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    if json {
+        return print_json(&inv);
+    }
+    let hashed = inv
+        .models
+        .keys()
+        .filter(|k| k.starts_with("sha256:"))
+        .count();
+    println!(
+        "{} newly hashed; inventory: {} distinct contents ({} hashed) → {}",
+        hashed_count,
+        inv.models.len(),
+        hashed,
+        manifest::inventory_path(&state).display()
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_status(json: bool) -> ExitCode {
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    if json {
+        return print_json(&inv);
+    }
+    let manifests = manifest::load_all_manifests(&state);
+    println!("inventory generated {}", ago(inv.generated_unix));
+    println!("{:<14} {:<7} {:>6} {:>9}  {}", "ROOT", "KIND", "FILES", "SIZE", "PATH");
+    for m in &manifests {
+        let total: u64 = m.files.iter().map(|f| f.size).sum();
+        let online = m.root.path.exists();
+        println!(
+            "{:<14} {:<7} {:>6} {:>9}  {}{}",
+            m.root.id,
+            format!("{:?}", m.root.kind).to_lowercase(),
+            m.files.len(),
+            human_size(total),
+            m.root.path.display(),
+            if online { "" } else { "  [OFFLINE]" }
+        );
+    }
+    let total_models = inv.models.len();
+    let hashed = inv
+        .models
+        .keys()
+        .filter(|k| k.starts_with("sha256:"))
+        .count();
+    let unreachable = inv
+        .models
+        .values()
+        .filter(|m| m.locations.iter().all(|l| !l.accessible))
+        .count();
+    let dups = manifest::dup_groups(&inv);
+    let reclaimable: u64 = dups.iter().map(|d| d.reclaimable).sum();
+    println!(
+        "\n{total_models} distinct contents; {hashed} hashed, {} pending; {unreachable} unreachable",
+        total_models - hashed
+    );
+    if !dups.is_empty() {
+        println!(
+            "{} duplicated contents, {} reclaimable — see `warden dups`",
+            dups.len(),
+            human_size(reclaimable)
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_dups(json: bool) -> ExitCode {
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let groups = manifest::dup_groups(&inv);
+    if json {
+        return print_json(&groups);
+    }
+    if groups.is_empty() {
+        println!("no hash-identical duplicates (hardlinked copies don't count — they share bytes)");
+        return ExitCode::SUCCESS;
+    }
+    let mut reclaimable = 0u64;
+    for g in &groups {
+        reclaimable += g.reclaimable;
+        println!(
+            "{}  {}  ({}, {} reclaimable)",
+            &g.sha256[..12],
+            g.display_name,
+            human_size(g.size),
+            human_size(g.reclaimable)
+        );
+        for loc in &g.locations {
+            println!(
+                "    [{}] {}  (inode {}:{})",
+                loc.root_id,
+                loc.rel_path.display(),
+                loc.dev,
+                loc.ino
+            );
+        }
+    }
+    println!(
+        "\n{} duplicated contents, {} reclaimable (dedup lands in M5, owned roots only)",
+        groups.len(),
+        human_size(reclaimable)
+    );
+    ExitCode::SUCCESS
+}
+
+fn cmd_doctor(json: bool) -> ExitCode {
+    let findings = doctor::check(
+        &scan::default_ollama_stores(),
+        scan::default_hf_hub().as_deref(),
+    );
+    if json {
+        return print_json(&findings);
+    }
+    if findings.is_empty() {
+        println!("all stores healthy");
+        return ExitCode::SUCCESS;
+    }
+    for f in &findings {
+        println!(
+            "{:<24} {:<45} {}{}",
+            f.kind.label(),
+            truncate(&f.subject, 45),
+            f.detail,
+            if f.bytes > 0 {
+                format!("  ({})", human_size(f.bytes))
+            } else {
+                String::new()
+            }
+        );
+    }
+    let waste: u64 = findings.iter().map(|f| f.bytes).sum();
+    println!(
+        "\n{} findings{}",
+        findings.len(),
+        if waste > 0 {
+            format!(", {} in orphaned/partial blobs", human_size(waste))
+        } else {
+            String::new()
+        }
+    );
+    ExitCode::SUCCESS
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> ExitCode {
+    match serde_json::to_string_pretty(value) {
+        Ok(s) => {
+            println!("{s}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("warden: serializing: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn ago(unix: u64) -> String {
+    let now = manifest::now_unix();
+    let d = now.saturating_sub(unix);
+    match d {
+        0..=90 => format!("{d}s ago"),
+        91..=5400 => format!("{} min ago", d / 60),
+        5401..=172_800 => format!("{} hours ago", d / 3600),
+        _ => format!("{} days ago", d / 86_400),
+    }
 }
 
 fn human_size(bytes: u64) -> String {

@@ -5,6 +5,8 @@
 //! Shell pattern follows llamacppCodeConf's ui.rs (re-typed, not copied).
 
 use eframe::egui;
+use modelwarden::core::doctor::Finding;
+use modelwarden::core::manifest::{self, DupGroup, RefreshEvent};
 use modelwarden::core::scan::{self, ModelFile, Source};
 use modelwarden::core::settings;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -26,17 +28,20 @@ fn main() -> eframe::Result {
 
 enum Msg {
     Scanned(Vec<ModelFile>),
+    /// Replaces the busy label's detail line (hash progress and the like).
+    Progress(String),
+    Dups(Vec<DupGroup>),
+    Doctor(Vec<Finding>),
     Finished(String),
-    // Scanning can't fail today, but every future worker (hash, backup)
-    // reports failures through here — the channel vocabulary is the pattern.
-    #[allow(dead_code)]
     Error(String),
 }
 
-#[derive(Default, PartialEq)]
+#[derive(Default, PartialEq, Clone, Copy)]
 enum Pane {
     #[default]
     Inventory,
+    Duplicates,
+    Health,
 }
 
 struct App {
@@ -44,8 +49,11 @@ struct App {
     rx: Receiver<Msg>,
     pane: Pane,
     models: Vec<ModelFile>,
+    dups: Vec<DupGroup>,
+    findings: Option<Vec<Finding>>,
     activity: Vec<String>,
     busy: Option<String>,
+    progress: Option<String>,
     show_about: bool,
 }
 
@@ -57,10 +65,18 @@ impl App {
             rx,
             pane: Pane::default(),
             models: Vec::new(),
+            dups: Vec::new(),
+            findings: None,
             activity: Vec::new(),
             busy: None,
+            progress: None,
             show_about: false,
         };
+        // Whatever the last `warden hash` (CLI or GUI) recorded is shown
+        // immediately; a live rescan refreshes the inventory view.
+        if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
+            app.dups = manifest::dup_groups(&inv);
+        }
         app.spawn_scan();
         app
     }
@@ -93,17 +109,72 @@ impl App {
         });
     }
 
+    fn spawn_hash(&mut self) {
+        self.spawn("updating manifests & hashes", |tx| {
+            let cfg = settings::AppConfig::load(&settings::config_file());
+            let state = settings::state_dir();
+            let specs = modelwarden::core::roots::discover_roots(&cfg);
+            let result = manifest::refresh(&specs, &state, |ev| {
+                let line = match ev {
+                    RefreshEvent::HashStart { label, size } => {
+                        format!("hashing {label} ({})", human_size(size))
+                    }
+                    RefreshEvent::HashProgress { label, done, total } => {
+                        format!("hashing {label} — {}%", done * 100 / total.max(1))
+                    }
+                    RefreshEvent::HashDone { label, secs } => {
+                        format!("hashed {label} in {secs:.0}s")
+                    }
+                    RefreshEvent::HashFailed { label, error } => {
+                        format!("FAILED {label}: {error}")
+                    }
+                };
+                let _ = tx.send(Msg::Progress(line));
+            });
+            match result {
+                Ok(inv) => {
+                    let n = inv.models.len();
+                    let _ = tx.send(Msg::Dups(manifest::dup_groups(&inv)));
+                    let _ = tx.send(Msg::Finished(format!("manifests updated: {n} contents")));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_doctor(&mut self) {
+        self.spawn("checking store health", |tx| {
+            let findings = modelwarden::core::doctor::check(
+                &scan::default_ollama_stores(),
+                scan::default_hf_hub().as_deref(),
+            );
+            let n = findings.len();
+            let _ = tx.send(Msg::Doctor(findings));
+            let _ = tx.send(Msg::Finished(format!("doctor: {n} findings")));
+        });
+    }
+
     fn drain_messages(&mut self) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Scanned(models) => self.models = models,
+                Msg::Progress(line) => self.progress = Some(line),
+                Msg::Dups(dups) => self.dups = dups,
+                Msg::Doctor(findings) => {
+                    self.findings = Some(findings);
+                    self.pane = Pane::Health;
+                }
                 Msg::Finished(line) => {
                     self.activity.push(line);
                     self.busy = None;
+                    self.progress = None;
                 }
                 Msg::Error(line) => {
                     self.activity.push(format!("error: {line}"));
                     self.busy = None;
+                    self.progress = None;
                 }
             }
         }
@@ -120,6 +191,24 @@ impl App {
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
             }
         });
+        ui.menu_button("Tools", |ui| {
+            if ui
+                .button("Update manifests && hashes")
+                .on_hover_text("Rescans roots, hashes new/changed files, rewrites manifests")
+                .clicked()
+            {
+                self.spawn_hash();
+                ui.close();
+            }
+            if ui
+                .button("Check store health")
+                .on_hover_text("Dangling refs, orphan blobs, interrupted downloads — read-only")
+                .clicked()
+            {
+                self.spawn_doctor();
+                ui.close();
+            }
+        });
         ui.menu_button("Help", |ui| {
             if ui.button("About").clicked() {
                 self.show_about = true;
@@ -132,13 +221,21 @@ impl App {
         ui.horizontal(|ui| {
             if let Some(label) = &self.busy {
                 ui.spinner();
-                ui.label(label);
+                ui.label(self.progress.as_ref().unwrap_or(label));
             } else {
                 let total: u64 = self.models.iter().map(|m| m.file_size).sum();
                 let missing = self.models.iter().filter(|m| !m.accessible).count();
                 let mut line = format!("{} files, {}", self.models.len(), human_size(total));
                 if missing > 0 {
                     line.push_str(&format!(" — {missing} missing"));
+                }
+                if !self.dups.is_empty() {
+                    let reclaimable: u64 = self.dups.iter().map(|d| d.reclaimable).sum();
+                    line.push_str(&format!(
+                        " — {} duplicated, {} reclaimable",
+                        self.dups.len(),
+                        human_size(reclaimable)
+                    ));
                 }
                 ui.label(line);
             }
@@ -168,7 +265,8 @@ impl App {
                             Source::Ollama { .. } => "ollama",
                             Source::HfHub { .. } => "hf-hub",
                         });
-                        ui.label(m.display_name()).on_hover_text(m.path.display().to_string());
+                        ui.label(m.display_name())
+                            .on_hover_text(m.path.display().to_string());
                         ui.label(
                             m.meta
                                 .as_ref()
@@ -192,6 +290,87 @@ impl App {
                 });
         });
     }
+
+    fn duplicates_pane(&mut self, ui: &mut egui::Ui) {
+        if self.dups.is_empty() {
+            ui.label("No hash-identical duplicates known. Tools → Update manifests & hashes to refresh.");
+            ui.label("(Hardlinked copies don't count — they already share bytes.)");
+            return;
+        }
+        let reclaimable: u64 = self.dups.iter().map(|d| d.reclaimable).sum();
+        ui.label(format!(
+            "{} duplicated contents, {} reclaimable. Reclaim (hardlink, owned roots only) lands in M5.",
+            self.dups.len(),
+            human_size(reclaimable)
+        ));
+        ui.separator();
+        egui::ScrollArea::both().show(ui, |ui| {
+            for g in &self.dups {
+                ui.strong(format!(
+                    "{}  {} — {} each, {} reclaimable",
+                    &g.sha256[..12],
+                    g.display_name,
+                    human_size(g.size),
+                    human_size(g.reclaimable)
+                ));
+                for loc in &g.locations {
+                    ui.monospace(format!(
+                        "    [{}] {}  (inode {}:{})",
+                        loc.root_id,
+                        loc.rel_path.display(),
+                        loc.dev,
+                        loc.ino
+                    ));
+                }
+                ui.add_space(6.0);
+            }
+        });
+    }
+
+    fn health_pane(&mut self, ui: &mut egui::Ui) {
+        let Some(findings) = &self.findings else {
+            ui.label("Not checked yet — Tools → Check store health.");
+            return;
+        };
+        if findings.is_empty() {
+            ui.label("All stores healthy.");
+            return;
+        }
+        let waste: u64 = findings.iter().map(|f| f.bytes).sum();
+        ui.label(format!(
+            "{} findings{} — read-only report; nothing is fixed automatically.",
+            findings.len(),
+            if waste > 0 {
+                format!(", {} in orphaned/partial blobs", human_size(waste))
+            } else {
+                String::new()
+            }
+        ));
+        ui.separator();
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("health")
+                .striped(true)
+                .min_col_width(60.0)
+                .show(ui, |ui| {
+                    ui.strong("Problem");
+                    ui.strong("Repo / model");
+                    ui.strong("Detail");
+                    ui.strong("Size");
+                    ui.end_row();
+                    for f in findings {
+                        ui.label(f.kind.label());
+                        ui.label(&f.subject);
+                        ui.label(&f.detail);
+                        ui.label(if f.bytes > 0 {
+                            human_size(f.bytes)
+                        } else {
+                            String::new()
+                        });
+                        ui.end_row();
+                    }
+                });
+        });
+    }
 }
 
 impl eframe::App for App {
@@ -199,7 +378,8 @@ impl eframe::App for App {
         self.drain_messages();
         if self.busy.is_some() {
             // Keep repainting while a worker runs so its results land promptly.
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(250));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(250));
         }
 
         egui::Panel::top("menu").show(ui, |ui| {
@@ -222,10 +402,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.pane, Pane::Inventory, "📦 Inventory");
+                ui.selectable_value(&mut self.pane, Pane::Duplicates, "🔗 Duplicates");
+                ui.selectable_value(&mut self.pane, Pane::Health, "🩺 Health");
             });
             ui.separator();
             match self.pane {
                 Pane::Inventory => self.inventory_pane(ui),
+                Pane::Duplicates => self.duplicates_pane(ui),
+                Pane::Health => self.health_pane(ui),
             }
         });
 

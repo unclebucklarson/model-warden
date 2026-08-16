@@ -198,6 +198,15 @@ pub fn scan(
     out
 }
 
+/// GGUFs under one shelf directory (manifest generation scans roots
+/// individually rather than through the deduping `scan()` view — per-root
+/// truth lists a file in every root that has it).
+pub fn shelf_models(dir: &Path) -> Vec<ModelFile> {
+    let mut out = Vec::new();
+    walk_gguf(dir, 0, &mut out);
+    out
+}
+
 /// Depth-limited recursive walk collecting `*.gguf`. The shelf layout here
 /// is `~/models/<ModelName>/<file>.gguf`, so a few levels is plenty.
 fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {

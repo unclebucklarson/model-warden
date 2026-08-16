@@ -74,6 +74,9 @@ modelwarden/
                               minus serving-side router_cache_id/alias_suggestion]
       identity.rs            Fingerprint{size,mtime,dev,ino} + lazy SHA-256;
                              background hash worker with mpsc progress
+      doctor.rs              store health, read-only: dangling refs, pruned
+                             husks, orphan blobs, incomplete downloads,
+                             manifests naming missing blobs
       manifest.rs            per-root manifest read/write (atomic temp+rename,
                              schema_version), merged Inventory view
       roots.rs               storage-root registry: kind (shelf/ollama/hf/

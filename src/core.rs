@@ -7,6 +7,7 @@ pub mod acquire;
 pub mod archive;
 pub mod backup;
 pub mod dedup;
+pub mod doctor;
 pub mod gguf;
 pub mod identity;
 pub mod manifest;

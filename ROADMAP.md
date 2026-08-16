@@ -16,24 +16,19 @@ backed up, which are the same bytes — without ever losing bytes.**
   MISSING instead of vanishing. `warden scan [--json]` prints the unified
   table (23 files / 284 GiB on the dev machine); GUI shows the same inventory
   read-only with menu bar, status bar, activity log.
+- **M2** — content identity + manifests. `manifest::refresh()` is the one
+  write path both frontends share: rescan roots, carry hashes forward on
+  fingerprint match, hash the rest with byte progress, persist per-root
+  manifests + merged inventory (atomic, `.bak`-keeping) under
+  `~/.local/state/modelwarden/`. `warden hash/status/dups/doctor` +
+  `--json`; GUI gains Duplicates and Health panes, Tools menu, live hash
+  progress in the status bar. Doctor's first real run: 7 findings, 2.9 GiB
+  of orphaned/partial blobs. Dups confirmed the 16.7 GiB Qwen3.8 duplicate.
+  28 tests green.
 
-## M2 — content identity + manifests (NEXT)
-
-1. **Background SHA-256 worker**: fingerprint-gated (rehash only on
-   fingerprint mismatch), per-file progress (a 22 GiB file takes ~35s —
-   spinner isn't enough), throttle option.
-2. **Per-root manifests + merged inventory** persisted to
-   `~/.local/state/modelwarden/` (schema proven in spike 2), atomic writes.
-3. **`warden hash` / `warden status` / `warden dups`** (report-only; dups
-   groups by sha256 and shows reclaimable bytes — the 16.7 GiB Qwen3.8 dup is
-   the acceptance test).
-4. **`warden doctor`** (spike 3 fallout): store-health report — dangling HF
-   refs, pruned husk repos, orphan blobs, `.incomplete` downloads, Ollama
-   manifests naming missing blobs. Read-only.
-5. GUI: hash progress in status bar, duplicate-groups view, doctor findings.
 ## Later milestones (deliverables in PLAN.md)
 
-- **M3** — roots + offline media (`warden roots`, `warden where`).
+- **M3 (NEXT)** — roots + offline media (`warden roots`, `warden where`).
 - **M4** — backup, CLI first; plus `warden verify` (re-hash a backup target
   on demand — the manual form of the parked scheduled scrub).
 - **M5** — archival + owned-root hardlink reclaim (CLI); backup reaches GUI.

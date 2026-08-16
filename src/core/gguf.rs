@@ -11,12 +11,13 @@
 //! Harvested verbatim from llamacppCodeConf (src/core/gguf.rs) per PLAN.md.
 
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{BufReader, Read};
 use std::path::Path;
 
-/// What the inventory shows per model file.
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+/// What the inventory shows per model file. (De)serializable because it is
+/// recorded in per-root manifests.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct GgufMeta {
     /// `general.architecture` — "llama", "qwen3", …
     pub architecture: Option<String>,

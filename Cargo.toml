@@ -17,3 +17,17 @@ thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Hashing 300 GiB is CPU-bound; unoptimized sha2 runs ~10x slower than the
+# 680 MB/s the spike measured. Optimize the hash path even in dev builds so
+# `cargo run -- hash` is usable during development.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.digest]
+opt-level = 3
+[profile.dev.package.block-buffer]
+opt-level = 3
+[profile.dev.package.generic-array]
+opt-level = 3
+[profile.dev.package.cpufeatures]
+opt-level = 3
