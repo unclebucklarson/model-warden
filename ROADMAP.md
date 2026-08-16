@@ -25,10 +25,18 @@ backed up, which are the same bytes — without ever losing bytes.**
   progress in the status bar. Doctor's first real run: 7 findings, 2.9 GiB
   of orphaned/partial blobs. Dups confirmed the 16.7 GiB Qwen3.8 duplicate.
   28 tests green.
+- **M3** — roots + offline media. Registered roots (drive/NAS) with durable
+  identity: fs UUID primary, `.modelwarden/root-id` marker fallback —
+  re-adding a remounted drive keeps its id. `warden roots add/list`,
+  `warden where` (searches the catalog incl. offline locations, with live
+  root-presence checks so an unplug shows OFFLINE immediately). refresh()
+  skips offline roots instead of clobbering their manifests. New config:
+  `discover_stores: false` limits warden to scan_dirs + registered roots.
+  GUI: Storage Roots dialog (list + register), catalog-only offline entries
+  greyed in the inventory with their drive label. 31 tests green.
 
 ## Later milestones (deliverables in PLAN.md)
 
-- **M3 (NEXT)** — roots + offline media (`warden roots`, `warden where`).
 - **M4** — backup, CLI first; plus `warden verify` (re-hash a backup target
   on demand — the manual form of the parked scheduled scrub).
 - **M5** — archival + owned-root hardlink reclaim (CLI); backup reaches GUI.

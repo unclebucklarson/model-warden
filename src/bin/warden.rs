@@ -16,8 +16,9 @@ Commands (landing per ROADMAP.md milestone):
   status [--json]   manifest + identity summary
   dups [--json]     hash-identical duplicates and reclaimable bytes
   doctor [--json]   store health: dangling refs, orphans, interrupted downloads
-  roots      manage storage roots (add/list)              (M3)
-  where      locate a model across roots, incl. offline   (M3)
+  roots list [--json]              all roots incl. offline drives
+  roots add <path> [--label X]     register a drive/NAS mount by fs UUID
+  where <query> [--json]           locate a model across roots, incl. offline
   backup     verified copy to a backup target             (M4)
   archive    promote to shelf / demote to cold storage    (M5)
   dedup      reclaim duplicates by hardlink (owned roots)  (M5)
@@ -38,6 +39,8 @@ fn main() -> ExitCode {
         Some("status") => cmd_status(json),
         Some("dups") => cmd_dups(json),
         Some("doctor") => cmd_doctor(json),
+        Some("roots") => cmd_roots(&args, json),
+        Some("where") => cmd_where(&args, json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -47,11 +50,13 @@ fn main() -> ExitCode {
 
 fn cmd_scan(json: bool) -> ExitCode {
     let cfg = settings::AppConfig::load(&settings::config_file());
-    let models = scan::scan(
-        &cfg.scan_dirs,
-        &scan::default_ollama_stores(),
-        scan::default_hf_hub().as_deref(),
-    );
+    let ollama = if cfg.discover_stores {
+        scan::default_ollama_stores()
+    } else {
+        Vec::new()
+    };
+    let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
+    let models = scan::scan(&cfg.scan_dirs, &ollama, hub.as_deref());
 
     if json {
         return print_json(&models);
@@ -274,6 +279,140 @@ fn cmd_doctor(json: bool) -> ExitCode {
             String::new()
         }
     );
+    ExitCode::SUCCESS
+}
+
+fn cmd_roots(args: &[String], json: bool) -> ExitCode {
+    let mut cfg = settings::AppConfig::load(&settings::config_file());
+    match args.get(1).map(String::as_str) {
+        Some("add") => {
+            let Some(path) = args.get(2).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: warden roots add <path> [--label X]");
+                return ExitCode::from(2);
+            };
+            let label = args
+                .iter()
+                .position(|a| a == "--label")
+                .and_then(|i| args.get(i + 1).cloned());
+            match modelwarden::core::roots::register_root(
+                &mut cfg,
+                std::path::Path::new(path),
+                label,
+            ) {
+                Ok(root) => {
+                    if let Err(e) = cfg.save(&settings::config_file()) {
+                        eprintln!("warden: saving config: {e:#}");
+                        return ExitCode::FAILURE;
+                    }
+                    println!(
+                        "registered {} as {} (uuid: {}) — run `warden hash` to catalog it",
+                        root.path.display(),
+                        root.id,
+                        root.fs_uuid.as_deref().unwrap_or("none; marker file")
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("warden: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        None | Some("list") => {
+            let specs = modelwarden::core::roots::discover_roots(&cfg);
+            if json {
+                return print_json(&specs);
+            }
+            let state = settings::state_dir();
+            let manifests = manifest::load_all_manifests(&state);
+            println!(
+                "{:<16} {:<7} {:<10} {:>6} {:>9}  {}",
+                "ROOT", "KIND", "STATE", "FILES", "SIZE", "PATH"
+            );
+            for s in &specs {
+                let m = manifests.iter().find(|m| m.root.id == s.id);
+                let (files, size) = m
+                    .map(|m| (m.files.len(), m.files.iter().map(|f| f.size).sum::<u64>()))
+                    .unwrap_or((0, 0));
+                println!(
+                    "{:<16} {:<7} {:<10} {:>6} {:>9}  {}{}",
+                    s.id,
+                    s.kind.label(),
+                    if s.path.exists() { "online" } else { "OFFLINE" },
+                    files,
+                    human_size(size),
+                    s.path.display(),
+                    s.label
+                        .as_deref()
+                        .map(|l| format!("  ({l})"))
+                        .unwrap_or_default()
+                );
+            }
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("warden: unknown roots subcommand `{other}` (add, list)");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn cmd_where(args: &[String], json: bool) -> ExitCode {
+    let Some(query) = args.get(1).filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: warden where <query>");
+        return ExitCode::from(2);
+    };
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let q = query.to_lowercase();
+    let root_label = |id: &str| {
+        inv.roots
+            .iter()
+            .find(|r| r.id == id)
+            .and_then(|r| r.label.clone())
+            .unwrap_or_else(|| id.to_string())
+    };
+    let matches: Vec<_> = inv
+        .models
+        .iter()
+        .filter(|(_, e)| {
+            e.display_name.to_lowercase().contains(&q)
+                || e.locations
+                    .iter()
+                    .any(|l| l.rel_path.to_string_lossy().to_lowercase().contains(&q))
+        })
+        .collect();
+    if json {
+        let owned: std::collections::BTreeMap<_, _> =
+            matches.iter().map(|(k, v)| ((*k).clone(), (*v).clone())).collect();
+        return print_json(&owned);
+    }
+    if matches.is_empty() {
+        println!("nothing matching \"{query}\" in the catalog");
+        return ExitCode::from(1);
+    }
+    for (key, e) in &matches {
+        let ident = key
+            .strip_prefix("sha256:")
+            .map(|h| &h[..12])
+            .unwrap_or("unhashed");
+        println!("{}  {}  ({})", ident, e.display_name, human_size(e.size));
+        for l in &e.locations {
+            println!(
+                "    [{}] {}  — {}",
+                root_label(&l.root_id),
+                l.rel_path.display(),
+                if inv.live_accessible(l) {
+                    "present"
+                } else {
+                    "OFFLINE"
+                }
+            );
+        }
+    }
     ExitCode::SUCCESS
 }
 

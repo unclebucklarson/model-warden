@@ -14,6 +14,24 @@ pub struct AppConfig {
     /// Shelf directories to scan for GGUFs (the Ollama stores and HF hub
     /// cache are found automatically and aren't listed here).
     pub scan_dirs: Vec<PathBuf>,
+    /// User-registered roots: removable drives, NAS mounts, backup targets.
+    /// Identified by fs UUID / marker file so they survive remounts.
+    pub roots: Vec<RegisteredRoot>,
+    /// Auto-discover the Ollama stores and HF hub cache (default). Off means
+    /// warden only looks at `scan_dirs` and registered roots.
+    pub discover_stores: bool,
+}
+
+/// A root the user registered with `warden roots add` (or the GUI dialog).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegisteredRoot {
+    /// Stable id — from the drive's fs UUID or its marker file, so the same
+    /// drive keeps its identity across remount points.
+    pub id: String,
+    /// Where it was last mounted. A missing path means offline, not gone.
+    pub path: PathBuf,
+    pub label: Option<String>,
+    pub fs_uuid: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -22,7 +40,11 @@ impl Default for AppConfig {
         if let Some(home) = std::env::home_dir() {
             scan_dirs.push(home.join("models"));
         }
-        Self { scan_dirs }
+        Self {
+            scan_dirs,
+            roots: Vec::new(),
+            discover_stores: true,
+        }
     }
 }
 

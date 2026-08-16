@@ -48,7 +48,7 @@ pub struct FileRecord {
 /// starts unhashed.
 pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> RootManifest {
     let models: Vec<ModelFile> = match spec.kind {
-        RootKind::Shelf => scan::shelf_models(&spec.path),
+        RootKind::Shelf | RootKind::Removable => scan::shelf_models(&spec.path),
         RootKind::Ollama => scan::ollama_models(&spec.path),
         RootKind::HfHub => scan::hf_hub_models(&spec.path),
     };
@@ -173,6 +173,9 @@ pub struct Inventory {
 pub struct ModelEntry {
     pub size: u64,
     pub display_name: String,
+    /// GGUF header data from the first location that could read it.
+    #[serde(default)]
+    pub meta: Option<GgufMeta>,
     pub locations: Vec<Location>,
 }
 
@@ -186,6 +189,22 @@ pub struct Location {
     /// bytes) from real copies (reclaimable). (0,0) when unknown.
     pub dev: u64,
     pub ino: u64,
+}
+
+impl Inventory {
+    pub fn root(&self, id: &str) -> Option<&RootSpec> {
+        self.roots.iter().find(|r| r.id == id)
+    }
+
+    /// Stored accessibility can go stale the moment a drive is unplugged;
+    /// this re-checks the root's presence right now.
+    pub fn live_accessible(&self, loc: &Location) -> bool {
+        loc.accessible
+            && self
+                .root(&loc.root_id)
+                .map(|r| r.path.exists())
+                .unwrap_or(false)
+    }
 }
 
 pub fn merge(manifests: &[RootManifest]) -> Inventory {
@@ -207,8 +226,12 @@ pub fn merge(manifests: &[RootManifest]) -> Inventory {
             let entry = models.entry(key).or_insert_with(|| ModelEntry {
                 size: f.size,
                 display_name,
+                meta: None,
                 locations: Vec::new(),
             });
+            if entry.meta.is_none() {
+                entry.meta = f.meta.clone();
+            }
             entry.locations.push(Location {
                 root_id: m.root.id.clone(),
                 kind: m.root.kind,
@@ -252,6 +275,12 @@ pub fn refresh(
 
     let mut manifests = Vec::new();
     for spec in specs {
+        // An offline root is skipped, NOT rebuilt: rebuilding against a
+        // missing path would clobber its stored manifest with an empty one,
+        // and offline is not gone. It still merges below.
+        if !spec.path.exists() {
+            continue;
+        }
         let previous = load_manifest(&manifest_path(state, &spec.id));
         manifests.push(build_root_manifest(spec, previous.as_ref()));
     }
@@ -361,6 +390,7 @@ mod tests {
             id: "shelf-test".into(),
             kind: RootKind::Shelf,
             path: path.to_path_buf(),
+            label: None,
         }
     }
 
@@ -452,6 +482,7 @@ mod tests {
             id: "shelf-offline".into(),
             kind: RootKind::Shelf,
             path: "/media/nowhere/archive".into(),
+            label: None,
         };
         b.files[0].fingerprint = None;
         b.files[0].rel_path = "backup/m.gguf".into();
@@ -508,6 +539,42 @@ mod tests {
     }
 
     #[test]
+    fn refresh_never_clobbers_an_offline_roots_manifest() {
+        let state = tempfile::tempdir().unwrap();
+        // A stored manifest for a drive that is not plugged in.
+        let stored = RootManifest {
+            schema_version: SCHEMA_VERSION,
+            root: RootSpec {
+                id: "ext-cafe0123".into(),
+                kind: RootKind::Removable,
+                path: "/media/nowhere/archive1".into(),
+                label: Some("archive1".into()),
+            },
+            generated_unix: 42,
+            files: vec![FileRecord {
+                rel_path: "cold/m.gguf".into(),
+                size: 1000,
+                fingerprint: None,
+                sha256: Some("dd".into()),
+                name: None,
+                meta: None,
+                accessible: true,
+            }],
+        };
+        save_json(&stored, &manifest_path(state.path(), "ext-cafe0123")).unwrap();
+
+        let inv = refresh(&[stored.root.clone()], state.path(), |_| {}).unwrap();
+        // The manifest survived untouched and the offline copy is still known.
+        assert_eq!(
+            load_manifest(&manifest_path(state.path(), "ext-cafe0123")),
+            Some(stored)
+        );
+        let entry = &inv.models["sha256:dd"];
+        assert_eq!(entry.locations.len(), 1);
+        assert!(!entry.locations[0].accessible, "offline, not gone");
+    }
+
+    #[test]
     fn dup_groups_ignore_hardlinks_and_rank_by_reclaimable() {
         let mut models = BTreeMap::new();
         let loc = |root: &str, ino: u64| Location {
@@ -524,6 +591,7 @@ mod tests {
             ModelEntry {
                 size: 500,
                 display_name: "linked".into(),
+                meta: None,
                 locations: vec![loc("a", 1), loc("b", 1)],
             },
         );
@@ -533,6 +601,7 @@ mod tests {
             ModelEntry {
                 size: 700,
                 display_name: "copied".into(),
+                meta: None,
                 locations: vec![loc("a", 2), loc("a", 3), loc("b", 2)],
             },
         );

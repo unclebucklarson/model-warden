@@ -30,7 +30,7 @@ enum Msg {
     Scanned(Vec<ModelFile>),
     /// Replaces the busy label's detail line (hash progress and the like).
     Progress(String),
-    Dups(Vec<DupGroup>),
+    Refreshed(manifest::Inventory),
     Doctor(Vec<Finding>),
     Finished(String),
     Error(String),
@@ -49,12 +49,16 @@ struct App {
     rx: Receiver<Msg>,
     pane: Pane,
     models: Vec<ModelFile>,
+    inv: Option<manifest::Inventory>,
     dups: Vec<DupGroup>,
     findings: Option<Vec<Finding>>,
     activity: Vec<String>,
     busy: Option<String>,
     progress: Option<String>,
     show_about: bool,
+    show_roots: bool,
+    roots_add_path: String,
+    roots_add_label: String,
 }
 
 impl App {
@@ -65,17 +69,22 @@ impl App {
             rx,
             pane: Pane::default(),
             models: Vec::new(),
+            inv: None,
             dups: Vec::new(),
             findings: None,
             activity: Vec::new(),
             busy: None,
             progress: None,
             show_about: false,
+            show_roots: false,
+            roots_add_path: String::new(),
+            roots_add_label: String::new(),
         };
         // Whatever the last `warden hash` (CLI or GUI) recorded is shown
         // immediately; a live rescan refreshes the inventory view.
         if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
             app.dups = manifest::dup_groups(&inv);
+            app.inv = Some(inv);
         }
         app.spawn_scan();
         app
@@ -98,11 +107,13 @@ impl App {
     fn spawn_scan(&mut self) {
         self.spawn("scanning stores", |tx| {
             let cfg = settings::AppConfig::load(&settings::config_file());
-            let models = scan::scan(
-                &cfg.scan_dirs,
-                &scan::default_ollama_stores(),
-                scan::default_hf_hub().as_deref(),
-            );
+            let ollama = if cfg.discover_stores {
+                scan::default_ollama_stores()
+            } else {
+                Vec::new()
+            };
+            let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
+            let models = scan::scan(&cfg.scan_dirs, &ollama, hub.as_deref());
             let n = models.len();
             let _ = tx.send(Msg::Scanned(models));
             let _ = tx.send(Msg::Finished(format!("scan: {n} files")));
@@ -134,7 +145,7 @@ impl App {
             match result {
                 Ok(inv) => {
                     let n = inv.models.len();
-                    let _ = tx.send(Msg::Dups(manifest::dup_groups(&inv)));
+                    let _ = tx.send(Msg::Refreshed(inv));
                     let _ = tx.send(Msg::Finished(format!("manifests updated: {n} contents")));
                 }
                 Err(e) => {
@@ -161,7 +172,10 @@ impl App {
             match msg {
                 Msg::Scanned(models) => self.models = models,
                 Msg::Progress(line) => self.progress = Some(line),
-                Msg::Dups(dups) => self.dups = dups,
+                Msg::Refreshed(inv) => {
+                    self.dups = manifest::dup_groups(&inv);
+                    self.inv = Some(inv);
+                }
                 Msg::Doctor(findings) => {
                     self.findings = Some(findings);
                     self.pane = Pane::Health;
@@ -184,6 +198,10 @@ impl App {
         ui.menu_button("File", |ui| {
             if ui.button("Rescan stores").clicked() {
                 self.spawn_scan();
+                ui.close();
+            }
+            if ui.button("Storage Roots…").clicked() {
+                self.show_roots = true;
                 ui.close();
             }
             ui.separator();
@@ -287,8 +305,127 @@ impl App {
                         }
                         ui.end_row();
                     }
+                    // Catalog-only entries: content whose every location is
+                    // offline right now (unplugged drives). Greyed, labeled
+                    // with the drive — offline is not gone.
+                    if let Some(inv) = &self.inv {
+                        let label_of = |root_id: &str| {
+                            inv.roots
+                                .iter()
+                                .find(|r| r.id == root_id)
+                                .and_then(|r| r.label.clone())
+                                .unwrap_or_else(|| root_id.to_string())
+                        };
+                        for entry in inv.models.values() {
+                            if entry.locations.iter().any(|l| inv.live_accessible(l)) {
+                                continue;
+                            }
+                            // Only rows whose absence is an unplugged drive;
+                            // pruned-store entries already show as MISSING in
+                            // the live rows above.
+                            let Some(loc) = entry.locations.iter().find(|l| {
+                                !inv.root(&l.root_id)
+                                    .map(|r| r.path.exists())
+                                    .unwrap_or(false)
+                            }) else {
+                                continue;
+                            };
+                            ui.weak(loc.kind.label());
+                            ui.weak(&entry.display_name);
+                            ui.weak(
+                                entry
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|g| g.architecture.clone())
+                                    .unwrap_or_default(),
+                            );
+                            ui.weak(
+                                entry
+                                    .meta
+                                    .as_ref()
+                                    .and_then(|g| g.quantization.clone())
+                                    .unwrap_or_default(),
+                            );
+                            ui.weak(human_size(entry.size));
+                            ui.weak(format!("offline: {}", label_of(&loc.root_id)));
+                            ui.end_row();
+                        }
+                    }
                 });
         });
+    }
+
+    fn roots_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_roots {
+            return;
+        }
+        let mut open = self.show_roots;
+        egui::Window::new("Storage Roots")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                let cfg = settings::AppConfig::load(&settings::config_file());
+                let specs = modelwarden::core::roots::discover_roots(&cfg);
+                egui::Grid::new("roots").striped(true).show(ui, |ui| {
+                    ui.strong("Root");
+                    ui.strong("Kind");
+                    ui.strong("State");
+                    ui.strong("Path");
+                    ui.end_row();
+                    for s in &specs {
+                        ui.label(&s.id);
+                        ui.label(s.kind.label());
+                        if s.path.exists() {
+                            ui.label("online");
+                        } else {
+                            ui.weak("OFFLINE");
+                        }
+                        ui.label(format!(
+                            "{}{}",
+                            s.path.display(),
+                            s.label
+                                .as_deref()
+                                .map(|l| format!("  ({l})"))
+                                .unwrap_or_default()
+                        ));
+                        ui.end_row();
+                    }
+                });
+                ui.separator();
+                ui.label("Register a drive or NAS mount (identified by fs UUID + marker file):");
+                ui.horizontal(|ui| {
+                    ui.label("Path:");
+                    ui.text_edit_singleline(&mut self.roots_add_path);
+                    ui.label("Label:");
+                    ui.text_edit_singleline(&mut self.roots_add_label);
+                    if ui.button("Add").clicked() {
+                        let mut cfg = settings::AppConfig::load(&settings::config_file());
+                        let label = (!self.roots_add_label.trim().is_empty())
+                            .then(|| self.roots_add_label.trim().to_string());
+                        match modelwarden::core::roots::register_root(
+                            &mut cfg,
+                            std::path::Path::new(self.roots_add_path.trim()),
+                            label,
+                        )
+                        .and_then(|root| {
+                            cfg.save(&settings::config_file())?;
+                            Ok(root)
+                        }) {
+                            Ok(root) => {
+                                self.activity.push(format!(
+                                    "registered {} as {} — Tools → Update manifests to catalog it",
+                                    root.path.display(),
+                                    root.id
+                                ));
+                                self.roots_add_path.clear();
+                                self.roots_add_label.clear();
+                            }
+                            Err(e) => self.activity.push(format!("error: {e:#}")),
+                        }
+                    }
+                });
+            });
+        self.show_roots = open;
     }
 
     fn duplicates_pane(&mut self, ui: &mut egui::Ui) {
@@ -412,6 +549,8 @@ impl eframe::App for App {
                 Pane::Health => self.health_pane(ui),
             }
         });
+
+        self.roots_dialog(ui.ctx());
 
         if self.show_about {
             egui::Window::new("About")
