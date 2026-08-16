@@ -35,10 +35,20 @@ backed up, which are the same bytes — without ever losing bytes.**
   GUI: Storage Roots dialog (list + register), catalog-only offline entries
   greyed in the inventory with their drive label. 31 tests green.
 
+- **M4** — verified backup. `warden backup <path>` copies every hashed
+  content to a target (auto-registered as a root) in a human-readable
+  layout; a copy only counts after three-way verification (catalog hash =
+  source-read hash = destination read-back hash), via .partial temp names.
+  Target carries its own `.modelwarden/manifest.json` so the drive stays
+  self-describing unplugged. `warden verify <path|id>` re-hashes a root
+  against its manifest (bit-rot detection proven in test), updating
+  `verified_unix`. Status answers "is this model safe?": N of M contents
+  have a copy on a registered drive. Dup accounting fixed: cross-device
+  copies (backups) are intentional redundancy, never "reclaimable" —
+  hardlinks can't cross filesystems. 35 tests green.
+
 ## Later milestones (deliverables in PLAN.md)
 
-- **M4** — backup, CLI first; plus `warden verify` (re-hash a backup target
-  on demand — the manual form of the parked scheduled scrub).
 - **M5** — archival + owned-root hardlink reclaim (CLI); backup reaches GUI.
 - **M6** — GUI write parity, disk-usage view (CLI `warden report` too),
   publish inventory schema v1.
@@ -54,6 +64,9 @@ backed up, which are the same bytes — without ever losing bytes.**
   alongside `image.model`; inventory them like HF mmproj files.
 - Track mmproj ↔ parent-model companionship so archival/backup of a vision
   model brings its projector along.
+- `warden backup --repair`: re-copy backup files that failed verify (today a
+  corrupted target copy is reported but refuses overwrite; the user deletes
+  it manually first).
 
 ## Sibling project: llamacppCodeConf (`~/src2/llamacppCodeConf`)
 

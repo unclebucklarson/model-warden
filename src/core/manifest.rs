@@ -41,6 +41,10 @@ pub struct FileRecord {
     pub name: Option<String>,
     pub meta: Option<GgufMeta>,
     pub accessible: bool,
+    /// When these bytes were last read end-to-end and matched `sha256`
+    /// (set by backup and `warden verify`, carried while unchanged).
+    #[serde(default)]
+    pub verified_unix: Option<u64>,
 }
 
 /// Scan one root and reconcile with its previous manifest: a file whose
@@ -70,11 +74,11 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
                 .unwrap_or(&m.path)
                 .to_path_buf();
             let fingerprint = m.accessible.then(|| Fingerprint::of(&m.path).ok()).flatten();
-            let sha256 = prior.get(rel_path.as_path()).and_then(|old| {
-                (old.fingerprint.is_some() && old.fingerprint == fingerprint)
-                    .then(|| old.sha256.clone())
-                    .flatten()
-            });
+            let unchanged = prior
+                .get(rel_path.as_path())
+                .filter(|old| old.fingerprint.is_some() && old.fingerprint == fingerprint);
+            let sha256 = unchanged.and_then(|old| old.sha256.clone());
+            let verified_unix = unchanged.and_then(|old| old.verified_unix);
             let name = match &m.source {
                 Source::Ollama { name } => Some(name.clone()),
                 Source::HfHub { repo } => Some(repo.clone()),
@@ -88,6 +92,7 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
                 name,
                 meta: m.meta.clone(),
                 accessible: m.accessible,
+                verified_unix,
             }
         })
         .collect();
@@ -350,29 +355,31 @@ pub struct DupGroup {
     pub reclaimable: u64,
 }
 
-/// Hash-identical content present as more than one set of bytes. Hardlinked
-/// paths count as ONE set — nothing to reclaim there.
+/// Hash-identical content present as more than one set of bytes *on the
+/// same filesystem*. Hardlinked paths count as ONE set — nothing to reclaim
+/// there — and copies on different devices (e.g. a backup drive) are
+/// intentional redundancy, not waste: hardlinks can't cross filesystems.
 pub fn dup_groups(inv: &Inventory) -> Vec<DupGroup> {
     let mut out = Vec::new();
     for (key, entry) in &inv.models {
         let Some(hash) = key.strip_prefix("sha256:") else {
             continue;
         };
-        let mut inodes: Vec<(u64, u64)> = entry
-            .locations
-            .iter()
-            .filter(|l| l.accessible)
-            .map(|l| (l.dev, l.ino))
-            .collect();
-        inodes.sort();
-        inodes.dedup();
-        if inodes.len() > 1 {
+        let mut by_dev: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
+        for l in entry.locations.iter().filter(|l| l.accessible && l.dev != 0) {
+            by_dev.entry(l.dev).or_default().insert(l.ino);
+        }
+        let extra_inodes: u64 = by_dev
+            .values()
+            .map(|inos| inos.len() as u64 - 1)
+            .sum();
+        if extra_inodes > 0 {
             out.push(DupGroup {
                 sha256: hash.to_string(),
                 size: entry.size,
                 display_name: entry.display_name.clone(),
                 locations: entry.locations.clone(),
-                reclaimable: (inodes.len() as u64 - 1) * entry.size,
+                reclaimable: extra_inodes * entry.size,
             });
         }
     }
@@ -474,6 +481,7 @@ mod tests {
                 name: None,
                 meta: None,
                 accessible: true,
+                verified_unix: None,
             }],
         };
         // Same content recorded on an unplugged drive.
@@ -559,6 +567,7 @@ mod tests {
                 name: None,
                 meta: None,
                 accessible: true,
+                verified_unix: None,
             }],
         };
         save_json(&stored, &manifest_path(state.path(), "ext-cafe0123")).unwrap();
@@ -603,6 +612,27 @@ mod tests {
                 display_name: "copied".into(),
                 meta: None,
                 locations: vec![loc("a", 2), loc("a", 3), loc("b", 2)],
+            },
+        );
+        // A copy on another filesystem (backup drive): intentional
+        // redundancy, not reclaimable — hardlinks can't cross devices.
+        models.insert(
+            "sha256:backedup".to_string(),
+            ModelEntry {
+                size: 900,
+                display_name: "backedup".into(),
+                meta: None,
+                locations: vec![
+                    loc("a", 7),
+                    Location {
+                        root_id: "vault".into(),
+                        kind: RootKind::Removable,
+                        rel_path: "x".into(),
+                        accessible: true,
+                        dev: 2,
+                        ino: 7,
+                    },
+                ],
             },
         );
         let inv = Inventory {

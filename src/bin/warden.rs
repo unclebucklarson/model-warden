@@ -1,7 +1,7 @@
 //! Thin CLI over the core. Subcommands land milestone by milestone; write
 //! operations are usable here one milestone before the GUI exposes them.
 
-use modelwarden::core::{doctor, manifest, scan, settings};
+use modelwarden::core::{backup, doctor, manifest, scan, settings};
 use std::io::Write;
 use std::process::ExitCode;
 
@@ -19,7 +19,9 @@ Commands (landing per ROADMAP.md milestone):
   roots list [--json]              all roots incl. offline drives
   roots add <path> [--label X]     register a drive/NAS mount by fs UUID
   where <query> [--json]           locate a model across roots, incl. offline
-  backup     verified copy to a backup target             (M4)
+  backup <path> [--label X]        copy every hashed content to a target,
+                                   read-back verified; registers the target
+  verify <path|root-id>            re-hash a root against its manifest
   archive    promote to shelf / demote to cold storage    (M5)
   dedup      reclaim duplicates by hardlink (owned roots)  (M5)
   fetch      download from HuggingFace into the shelf     (M7)
@@ -41,6 +43,8 @@ fn main() -> ExitCode {
         Some("doctor") => cmd_doctor(json),
         Some("roots") => cmd_roots(&args, json),
         Some("where") => cmd_where(&args, json),
+        Some("backup") => cmd_backup(&args, json),
+        Some("verify") => cmd_verify(&args, json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -199,6 +203,18 @@ fn cmd_status(json: bool) -> ExitCode {
             human_size(reclaimable)
         );
     }
+    let backed_up = inv
+        .models
+        .values()
+        .filter(|m| {
+            m.locations
+                .iter()
+                .any(|l| l.kind == modelwarden::core::roots::RootKind::Removable)
+        })
+        .count();
+    println!(
+        "{backed_up} of {total_models} contents have a copy on a registered drive"
+    );
     ExitCode::SUCCESS
 }
 
@@ -414,6 +430,168 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
         }
     }
     ExitCode::SUCCESS
+}
+
+fn print_backup_event(ev: &backup::BackupEvent) {
+    match ev {
+        backup::BackupEvent::FileStart { label, size } => {
+            eprint!("  {label} ({})… ", human_size(*size));
+            let _ = std::io::stderr().flush();
+        }
+        backup::BackupEvent::FileProgress { .. } => {}
+        backup::BackupEvent::FileDone { secs, .. } => eprintln!("verified in {secs:.0}s"),
+        backup::BackupEvent::Skipped { label, reason } => eprintln!("  {label}: skipped — {reason}"),
+        backup::BackupEvent::Failed { label, error } => eprintln!("  {label}: FAILED — {error}"),
+    }
+}
+
+fn cmd_backup(args: &[String], json: bool) -> ExitCode {
+    let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: warden backup <path> [--label X]");
+        return ExitCode::from(2);
+    };
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let mut cfg = settings::AppConfig::load(&settings::config_file());
+    let target_path = std::path::Path::new(path);
+    // Reuse the registered root when this path already is one; register
+    // otherwise so the target participates in the catalog from now on.
+    let canonical = target_path.canonicalize().ok();
+    let registered = cfg
+        .roots
+        .iter()
+        .find(|r| Some(&r.path) == canonical.as_ref())
+        .cloned();
+    let reg = match registered {
+        Some(r) => r,
+        None => {
+            let label = args
+                .iter()
+                .position(|a| a == "--label")
+                .and_then(|i| args.get(i + 1).cloned());
+            match modelwarden::core::roots::register_root(&mut cfg, target_path, label) {
+                Ok(r) => {
+                    if let Err(e) = cfg.save(&settings::config_file()) {
+                        eprintln!("warden: saving config: {e:#}");
+                        return ExitCode::FAILURE;
+                    }
+                    eprintln!("registered backup target as {}", r.id);
+                    r
+                }
+                Err(e) => {
+                    eprintln!("warden: {e:#}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+    };
+    let tspec = modelwarden::core::roots::RootSpec {
+        id: reg.id,
+        kind: modelwarden::core::roots::RootKind::Removable,
+        path: reg.path,
+        label: reg.label,
+    };
+
+    match backup::backup(&inv, &tspec, |ev| print_backup_event(&ev)) {
+        Ok((man, report)) => {
+            let save = manifest::save_json(&man, &backup::target_manifest_path(&tspec.path))
+                .and_then(|()| {
+                    manifest::save_json(&man, &manifest::manifest_path(&state, &tspec.id))
+                })
+                .and_then(|()| {
+                    let inv = manifest::merge(&manifest::load_all_manifests(&state));
+                    manifest::save_json(&inv, &manifest::inventory_path(&state))
+                });
+            if let Err(e) = save {
+                eprintln!("warden: recording backup: {e:#}");
+                return ExitCode::FAILURE;
+            }
+            if json {
+                return print_json(&report);
+            }
+            println!(
+                "{} copied ({}), {} already on target, {} failed → {}",
+                report.copied,
+                human_size(report.copied_bytes),
+                report.skipped_already,
+                report.failed,
+                tspec.path.display()
+            );
+            if report.failed > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        }
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_verify(args: &[String], json: bool) -> ExitCode {
+    let Some(which) = args.get(1).filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: warden verify <path|root-id>");
+        return ExitCode::from(2);
+    };
+    let state = settings::state_dir();
+    let canonical = std::path::Path::new(which).canonicalize().ok();
+    let mut man = match manifest::load_all_manifests(&state).into_iter().find(|m| {
+        m.root.id == *which || Some(&m.root.path) == canonical.as_ref()
+    }) {
+        Some(m) => m,
+        None => {
+            // Maybe a drive that carries its own manifest but was never
+            // cataloged on this machine.
+            let Some(c) = &canonical else {
+                eprintln!("warden: no manifest for {which}");
+                return ExitCode::from(2);
+            };
+            match manifest::load_manifest(&backup::target_manifest_path(c)) {
+                Some(mut m) => {
+                    m.root.path = c.clone();
+                    m
+                }
+                None => {
+                    eprintln!("warden: no manifest for {which}");
+                    return ExitCode::from(2);
+                }
+            }
+        }
+    };
+    match backup::verify(&mut man, |ev| print_backup_event(&ev)) {
+        Ok(report) => {
+            let _ = manifest::save_json(&man, &manifest::manifest_path(&state, &man.root.id));
+            if man.root.kind.owned() {
+                let _ = manifest::save_json(&man, &backup::target_manifest_path(&man.root.path));
+            }
+            if json {
+                return print_json(&report);
+            }
+            println!(
+                "{} ok, {} mismatched, {} missing, {} unhashed",
+                report.ok,
+                report.mismatched.len(),
+                report.missing.len(),
+                report.unhashed
+            );
+            for p in &report.mismatched {
+                println!("  MISMATCH: {}", p.display());
+            }
+            for p in &report.missing {
+                println!("  MISSING:  {}", p.display());
+            }
+            if report.mismatched.is_empty() && report.missing.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> ExitCode {
