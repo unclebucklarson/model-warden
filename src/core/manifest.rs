@@ -18,7 +18,10 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-pub const SCHEMA_VERSION: u32 = 0;
+/// Version 1 is the published contract (docs/inventory-schema.md) that
+/// consumers like llamacppCodeConf read. Changes to the inventory shape
+/// from here on require a version bump and a note in that document.
+pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RootManifest {
@@ -382,6 +385,62 @@ pub struct DupGroup {
     pub locations: Vec<Location>,
     /// Bytes freeable by collapsing distinct inodes to one: `(inodes-1) * size`.
     pub reclaimable: u64,
+}
+
+/// Disk usage grouped by model family — `<architecture> <size_label>` when
+/// the GGUF header offers them, else the display name's leading token.
+#[derive(Debug, Clone, Serialize)]
+pub struct FamilyUsage {
+    pub family: String,
+    pub contents: usize,
+    /// One copy of each distinct content.
+    pub unique_bytes: u64,
+    /// Every live location counted — the difference to `unique_bytes` is
+    /// what duplication and backups cost.
+    pub stored_bytes: u64,
+}
+
+pub fn family_usage(inv: &Inventory) -> Vec<FamilyUsage> {
+    let mut map: BTreeMap<String, FamilyUsage> = BTreeMap::new();
+    for entry in inv.models.values() {
+        let family = entry
+            .meta
+            .as_ref()
+            .and_then(|g| {
+                g.architecture.as_ref().map(|a| match &g.size_label {
+                    Some(s) => format!("{a} {s}"),
+                    None => a.clone(),
+                })
+            })
+            .unwrap_or_else(|| {
+                entry
+                    .display_name
+                    .split([' ', ':', '/'])
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+        let mut inodes: Vec<(u64, u64)> = entry
+            .locations
+            .iter()
+            .filter(|l| inv.live_accessible(l))
+            .map(|l| (l.dev, l.ino))
+            .collect();
+        inodes.sort();
+        inodes.dedup();
+        let u = map.entry(family.clone()).or_insert(FamilyUsage {
+            family,
+            contents: 0,
+            unique_bytes: 0,
+            stored_bytes: 0,
+        });
+        u.contents += 1;
+        u.unique_bytes += entry.size;
+        u.stored_bytes += entry.size * inodes.len().max(1) as u64;
+    }
+    let mut out: Vec<FamilyUsage> = map.into_values().collect();
+    out.sort_by(|a, b| b.stored_bytes.cmp(&a.stored_bytes));
+    out
 }
 
 /// Hash-identical content present as more than one set of bytes *on the

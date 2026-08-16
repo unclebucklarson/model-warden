@@ -61,10 +61,17 @@ backed up, which are the same bytes — without ever losing bytes.**
   another machine) re-catalog with hashes intact. GUI: Tools → Back up…
   dialog with live progress. Real dry run: 16.7 GiB reclaimable. 41 tests.
 
+- **M6** — GUI write parity + published schema. The GUI is catalog-driven
+  now: Inventory rows carry Archive / Demote… actions (demote dialog with
+  target-drive dropdown and an explicit remove-source checkbox), Duplicates
+  gained a confirm-dialog Reclaim flow, and a Usage pane joins the tabs.
+  CLI `warden report` groups disk usage by GGUF-architecture family with
+  unique-vs-on-disk overhead. schema_version bumped to 1 and published in
+  docs/inventory-schema.md as the read-only consumer contract
+  (llamacppCodeConf reads inventory.json). README.md written. 41 tests.
+
 ## Later milestones (deliverables in PLAN.md)
 
-- **M6** — GUI write parity, disk-usage view (CLI `warden report` too),
-  publish inventory schema v1.
 - **M7** — acquisition (`warden fetch`, HF downloads into the shelf).
 
 ## Smaller items (fold in opportunistically)

@@ -28,6 +28,7 @@ Commands (landing per ROADMAP.md milestone):
                                    copy is deleted only with --remove-source
   dedup [--hardlink]               collapse same-fs duplicate copies in owned
                                    roots (default: dry run report)
+  report [--json]                  disk usage grouped by model family
   fetch      download from HuggingFace into the shelf     (M7)
 ";
 
@@ -51,6 +52,7 @@ fn main() -> ExitCode {
         Some("verify") => cmd_verify(&args, json),
         Some("archive") => cmd_archive(&args),
         Some("dedup") => cmd_dedup(&args, json),
+        Some("report") => cmd_report(json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -599,6 +601,47 @@ fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_report(json: bool) -> ExitCode {
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let usage = manifest::family_usage(&inv);
+    if json {
+        return print_json(&usage);
+    }
+    println!(
+        "{:<28} {:>8} {:>10} {:>10}  {}",
+        "FAMILY", "MODELS", "UNIQUE", "ON DISK", "OVERHEAD"
+    );
+    let (mut tu, mut ts) = (0u64, 0u64);
+    for u in &usage {
+        tu += u.unique_bytes;
+        ts += u.stored_bytes;
+        let overhead = u.stored_bytes - u.unique_bytes;
+        println!(
+            "{:<28} {:>8} {:>10} {:>10}  {}",
+            truncate(&u.family, 28),
+            u.contents,
+            human_size(u.unique_bytes),
+            human_size(u.stored_bytes),
+            if overhead > 0 {
+                format!("+{}", human_size(overhead))
+            } else {
+                String::new()
+            }
+        );
+    }
+    println!(
+        "\n{} unique, {} on disk ({} in duplicate/backup copies)",
+        human_size(tu),
+        human_size(ts),
+        human_size(ts - tu)
+    );
+    ExitCode::SUCCESS
 }
 
 fn print_backup_event(ev: &backup::BackupEvent) {
