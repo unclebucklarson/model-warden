@@ -70,9 +70,16 @@ backed up, which are the same bytes — without ever losing bytes.**
   docs/inventory-schema.md as the read-only consumer contract
   (llamacppCodeConf reads inventory.json). README.md written. 41 tests.
 
-## Later milestones (deliverables in PLAN.md)
+- **M7** — acquisition. `warden fetch <org/repo> [pattern]` lists a repo's
+  GGUFs (sizes included) and downloads a uniquely-matched file into the
+  shelf: streaming to `.partial` with Range resume (a 200-to-Range restart
+  is handled), refuse-overwrite, then hash + provenance (repo, revision
+  from `x-repo-commit` or the API's sha, etag, when) recorded by content
+  identity in `state/provenance.json`. GUI: Tools → Download from
+  HuggingFace… (list + per-file download with live progress). Verified with
+  real downloads. 43 tests green.
 
-- **M7** — acquisition (`warden fetch`, HF downloads into the shelf).
+**All seven planned milestones are complete.** What remains lives below.
 
 ## Smaller items (fold in opportunistically)
 

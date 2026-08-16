@@ -34,6 +34,7 @@ fn main() -> eframe::Result {
 enum Msg {
     /// Replaces the busy label's detail line (hash/copy progress).
     Progress(String),
+    RemoteFiles(Vec<modelwarden::core::acquire::RemoteFile>),
     Refreshed(manifest::Inventory),
     Doctor(Vec<Finding>),
     Finished(String),
@@ -79,6 +80,9 @@ struct App {
     demote_key: Option<String>,
     demote_target: String,
     demote_remove: bool,
+    show_fetch: bool,
+    fetch_repo: String,
+    fetch_files: Option<Vec<modelwarden::core::acquire::RemoteFile>>,
 }
 
 impl App {
@@ -106,6 +110,9 @@ impl App {
             demote_key: None,
             demote_target: String::new(),
             demote_remove: false,
+            show_fetch: false,
+            fetch_repo: String::new(),
+            fetch_files: None,
         };
         if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
             app.set_inventory(inv);
@@ -378,6 +385,7 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Progress(line) => self.progress = Some(line),
+                Msg::RemoteFiles(files) => self.fetch_files = Some(files),
                 Msg::Refreshed(inv) => self.set_inventory(inv),
                 Msg::Doctor(findings) => {
                     self.findings = Some(findings);
@@ -423,6 +431,14 @@ impl App {
                 .clicked()
             {
                 self.show_backup = true;
+                ui.close();
+            }
+            if ui
+                .button("Download from HuggingFace…")
+                .on_hover_text("Fetch a repo's GGUF into the shelf, resume-capable")
+                .clicked()
+            {
+                self.show_fetch = true;
                 ui.close();
             }
             if ui
@@ -801,6 +817,133 @@ impl App {
         }
     }
 
+    fn spawn_list_remote(&mut self, repo: String) {
+        self.spawn("listing repo files", move |tx| {
+            match modelwarden::core::acquire::list_files(&repo) {
+                Ok(files) => {
+                    let n = files.len();
+                    let _ = tx.send(Msg::RemoteFiles(files));
+                    let _ = tx.send(Msg::Finished(format!("{repo}: {n} GGUF files")));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn spawn_fetch(&mut self, repo: String, filename: String) {
+        self.spawn("downloading", move |tx| {
+            use modelwarden::core::acquire;
+            let cfg = settings::AppConfig::load(&settings::config_file());
+            let Some(shelf_root) = cfg.scan_dirs.first().cloned() else {
+                let _ = tx.send(Msg::Error("no shelf configured (scan_dirs is empty)".into()));
+                return;
+            };
+            let txp = tx.clone();
+            let result = acquire::fetch(&repo, &filename, &shelf_root, move |ev| {
+                let line = match ev {
+                    acquire::FetchEvent::Start { label, total, resumed_from } => format!(
+                        "downloading {label} ({}){}",
+                        total.map(human_size).unwrap_or_else(|| "size unknown".into()),
+                        if resumed_from > 0 {
+                            format!(", resuming at {}", human_size(resumed_from))
+                        } else {
+                            String::new()
+                        }
+                    ),
+                    acquire::FetchEvent::Progress { label, done, total } => match total {
+                        Some(t) => format!(
+                            "downloading {label} — {} / {} ({}%)",
+                            human_size(done),
+                            human_size(t),
+                            done * 100 / t.max(1)
+                        ),
+                        None => format!("downloading {label} — {}", human_size(done)),
+                    },
+                    acquire::FetchEvent::Hashing { label } => format!("hashing {label}"),
+                };
+                let _ = txp.send(Msg::Progress(line));
+            });
+            match result {
+                Ok((dest, prov)) => {
+                    let done = match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
+                        Ok(hash) => {
+                            let state = settings::state_dir();
+                            let _ = acquire::record_provenance(&state, &hash, &prov);
+                            format!("fetched {} ({})", dest.display(), &hash[..12])
+                        }
+                        Err(e) => format!("fetched {} (hash failed: {e:#})", dest.display()),
+                    };
+                    if let Some(inv) = Self::refresh_catalog(tx) {
+                        let _ = tx.send(Msg::Refreshed(inv));
+                    }
+                    let _ = tx.send(Msg::Finished(done));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn fetch_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_fetch {
+            return;
+        }
+        let mut open = self.show_fetch;
+        let mut list: Option<String> = None;
+        let mut download: Option<(String, String)> = None;
+        egui::Window::new("Download from HuggingFace")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("Downloads land in the shelf, resume on interruption, and record provenance.");
+                ui.horizontal(|ui| {
+                    ui.label("Repo (org/name):");
+                    ui.text_edit_singleline(&mut self.fetch_repo);
+                    if ui
+                        .add_enabled(
+                            self.fetch_repo.contains('/'),
+                            egui::Button::new("List files"),
+                        )
+                        .clicked()
+                    {
+                        list = Some(self.fetch_repo.trim().to_string());
+                    }
+                });
+                if let Some(files) = &self.fetch_files {
+                    ui.separator();
+                    egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
+                        for f in files {
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Download").clicked() {
+                                    download = Some((
+                                        self.fetch_repo.trim().to_string(),
+                                        f.filename.clone(),
+                                    ));
+                                }
+                                ui.label(format!(
+                                    "{:>10}  {}",
+                                    f.size.map(human_size).unwrap_or_default(),
+                                    f.filename
+                                ));
+                            });
+                        }
+                    });
+                }
+            });
+        if let Some(repo) = list {
+            self.fetch_files = None;
+            self.spawn_list_remote(repo);
+        }
+        if let Some((repo, filename)) = download {
+            self.spawn_fetch(repo, filename);
+            open = false;
+        }
+        self.show_fetch = open;
+    }
+
     fn reclaim_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_reclaim {
             return;
@@ -1017,6 +1160,7 @@ impl eframe::App for App {
         self.backup_dialog(ui.ctx());
         self.demote_dialog(ui.ctx());
         self.reclaim_dialog(ui.ctx());
+        self.fetch_dialog(ui.ctx());
 
         if self.show_about {
             egui::Window::new("About")

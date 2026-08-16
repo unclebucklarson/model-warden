@@ -29,7 +29,9 @@ Commands (landing per ROADMAP.md milestone):
   dedup [--hardlink]               collapse same-fs duplicate copies in owned
                                    roots (default: dry run report)
   report [--json]                  disk usage grouped by model family
-  fetch      download from HuggingFace into the shelf     (M7)
+  fetch <org/repo> [pattern]       list a repo's GGUFs; with a pattern
+                                   matching one file, download it to the
+                                   shelf (Range-resume, provenance recorded)
 ";
 
 fn main() -> ExitCode {
@@ -53,6 +55,7 @@ fn main() -> ExitCode {
         Some("archive") => cmd_archive(&args),
         Some("dedup") => cmd_dedup(&args, json),
         Some("report") => cmd_report(json),
+        Some("fetch") => cmd_fetch(&args, json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -598,6 +601,121 @@ fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
         }
         Err(e) => {
             eprintln!("warden: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
+    use modelwarden::core::acquire;
+    let Some(repo) = args.get(1).filter(|a| !a.starts_with("--")) else {
+        eprintln!("usage: warden fetch <org/repo> [pattern]");
+        return ExitCode::from(2);
+    };
+    let pattern = args.get(2).filter(|a| !a.starts_with("--"));
+
+    let files = match acquire::list_files(repo) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if files.is_empty() {
+        eprintln!("warden: {repo} offers no GGUF files");
+        return ExitCode::from(1);
+    }
+    let matches: Vec<_> = match pattern {
+        Some(p) => {
+            let q = p.to_lowercase();
+            files
+                .iter()
+                .filter(|f| f.filename.to_lowercase().contains(&q))
+                .collect()
+        }
+        None => files.iter().collect(),
+    };
+    if pattern.is_none() || matches.len() != 1 {
+        if json {
+            return print_json(&matches);
+        }
+        for f in &matches {
+            println!(
+                "{:>10}  {}",
+                f.size.map(human_size).unwrap_or_default(),
+                f.filename
+            );
+        }
+        match pattern {
+            None => println!(
+                "\n{} GGUF files — `warden fetch {repo} <pattern>` to download one",
+                matches.len()
+            ),
+            Some(p) if matches.is_empty() => {
+                eprintln!("nothing matching \"{p}\"");
+                return ExitCode::from(1);
+            }
+            Some(p) => println!("\n\"{p}\" matches {} files — narrow it down", matches.len()),
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    let file = matches[0];
+    let cfg = settings::AppConfig::load(&settings::config_file());
+    let Some(shelf_root) = cfg.scan_dirs.first().cloned() else {
+        eprintln!("warden: no shelf configured (scan_dirs is empty)");
+        return ExitCode::from(2);
+    };
+    let result = acquire::fetch(repo, &file.filename, &shelf_root, |ev| match ev {
+        acquire::FetchEvent::Start {
+            label,
+            total,
+            resumed_from,
+        } => {
+            eprintln!(
+                "downloading {label} ({}){}",
+                total.map(human_size).unwrap_or_else(|| "size unknown".into()),
+                if resumed_from > 0 {
+                    format!(", resuming at {}", human_size(resumed_from))
+                } else {
+                    String::new()
+                }
+            );
+        }
+        acquire::FetchEvent::Progress { done, total, .. } => {
+            if let Some(t) = total {
+                eprint!("\r  {} / {} ({}%)   ", human_size(done), human_size(t), done * 100 / t.max(1));
+            } else {
+                eprint!("\r  {}   ", human_size(done));
+            }
+            let _ = std::io::stderr().flush();
+        }
+        acquire::FetchEvent::Hashing { .. } => eprintln!("\n  hashing…"),
+    });
+    match result {
+        Ok((dest, prov)) => {
+            eprintln!();
+            // Hash now — provenance is keyed by content identity.
+            match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
+                Ok(hash) => {
+                    let state = settings::state_dir();
+                    if let Err(e) = acquire::record_provenance(&state, &hash, &prov) {
+                        eprintln!("warden: recording provenance: {e:#}");
+                    }
+                    println!(
+                        "fetched {} ({} rev {})",
+                        dest.display(),
+                        &hash[..12],
+                        prov.revision.as_deref().unwrap_or("unknown")
+                    );
+                }
+                Err(e) => eprintln!("warden: hashing download: {e:#}"),
+            }
+            rerun_hash_quietly();
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("\nwarden: {e:#}");
             ExitCode::FAILURE
         }
     }
