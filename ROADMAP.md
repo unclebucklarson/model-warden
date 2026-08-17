@@ -89,6 +89,12 @@ backed up, which are the same bytes — without ever losing bytes.**
   Single-instance write lock: pid file under the state dir guards every
   write command in both frontends; live holders block with a clear message,
   stale locks from crashed runs are stolen. 49 tests green.
+- **M8.1** — token management + 401 diagnosis (user-found: GUI listing hit
+  a bare 401). HF answers 401 for unknown ids too, so the error now
+  distinguishes: close-match "did you mean" suggestions from the search API
+  for mistyped ids, token guidance otherwise. Tokens: GUI masked field with
+  Remember-to-config, CLI --token --save-token, config `hf_token`, then
+  env/hf-login fallbacks.
 
 ## Smaller items (fold in opportunistically)
 

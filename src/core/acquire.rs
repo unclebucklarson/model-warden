@@ -58,10 +58,12 @@ fn with_auth(req: ureq::Request, token: Option<&str>) -> ureq::Request {
 }
 
 /// The HF token for gated repos, most explicit source first: caller's
-/// (`--token`), the env vars the HF tooling uses, then the token file the
-/// `hf` CLI writes on login.
-pub fn resolve_token(explicit: Option<String>) -> Option<String> {
+/// (`--token` / the GUI field), warden's config, the env vars the HF
+/// tooling uses, then the token file the `hf` CLI writes on login.
+pub fn resolve_token(explicit: Option<String>, cfg: &crate::core::settings::AppConfig) -> Option<String> {
     explicit
+        .filter(|t| !t.trim().is_empty())
+        .or_else(|| cfg.hf_token.clone().filter(|t| !t.trim().is_empty()))
         .or_else(|| std::env::var("HF_TOKEN").ok())
         .or_else(|| std::env::var("HUGGING_FACE_HUB_TOKEN").ok())
         .filter(|t| !t.trim().is_empty())
@@ -115,11 +117,30 @@ pub fn split_set(all: &[RemoteFile], chosen: &str) -> Result<Vec<String>> {
 }
 
 /// GGUF files a repo offers, with sizes when the API provides them.
+///
+/// HF answers **401 for unknown repo ids too** (it hides private repos), so
+/// a 401 gets a diagnosis: close-match suggestions when the id looks
+/// mistyped, token guidance when it doesn't.
 pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
     let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
-    let resp = with_auth(agent().get(&url), token)
-        .call()
-        .with_context(|| format!("querying {repo} (gated repos need a token)"))?;
+    let resp = match with_auth(agent().get(&url), token).call() {
+        Ok(r) => r,
+        Err(ureq::Error::Status(401 | 404, _)) => {
+            let suggestions = suggest_repos(repo, token);
+            if suggestions.is_empty() {
+                bail!(
+                    "{repo}: not found or gated/private (HF hides unknown repos behind 401). \
+                     Check the id (case-sensitive), or provide a token — GUI token field, \
+                     --token, config hf_token, $HF_TOKEN, or `hf auth login`."
+                );
+            }
+            bail!(
+                "{repo}: not found (ids are case-sensitive) — did you mean: {}?",
+                suggestions.join(", ")
+            );
+        }
+        Err(e) => return Err(e).with_context(|| format!("querying {repo}")),
+    };
     let json: serde_json::Value = resp.into_json().context("parsing repo metadata")?;
     let Some(siblings) = json.get("siblings").and_then(|s| s.as_array()) else {
         bail!("{repo}: no file list in API response");
@@ -137,6 +158,32 @@ pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
         }
     }
     Ok(out)
+}
+
+/// Close matches for a repo id the API rejected — search scoped to the
+/// author when the id has one. Best-effort: network errors yield nothing.
+fn suggest_repos(repo: &str, token: Option<&str>) -> Vec<String> {
+    let (author, name) = repo.split_once('/').unwrap_or(("", repo));
+    let mut url = format!(
+        "https://huggingface.co/api/models?search={}&limit=5",
+        name.replace(' ', "+")
+    );
+    if !author.is_empty() {
+        url.push_str(&format!("&author={author}"));
+    }
+    with_auth(agent().get(&url), token)
+        .call()
+        .ok()
+        .and_then(|r| r.into_json::<serde_json::Value>().ok())
+        .and_then(|j| {
+            j.as_array().map(|models| {
+                models
+                    .iter()
+                    .filter_map(|m| m.get("id").and_then(|i| i.as_str()).map(str::to_string))
+                    .collect()
+            })
+        })
+        .unwrap_or_default()
 }
 
 /// Where a fetched file lands: `<shelf>/<repo-last-segment>/<filename>`,

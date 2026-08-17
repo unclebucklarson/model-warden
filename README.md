@@ -35,8 +35,10 @@ warden dedup [--hardlink]  collapse same-fs duplicates (dry run by default)
 warden report            disk usage by model family
 warden fetch <org/repo> [pattern] [--token T]
                          download from HF: split sets fetched together,
-                         Range resume, gated repos via --token/$HF_TOKEN/
-                         the hf CLI's saved login
+                         Range resume, gated repos via --token
+                         [--save-token], the GUI token field, config
+                         hf_token, $HF_TOKEN, or the hf CLI's saved login.
+                         Wrong repo ids get did-you-mean suggestions
 ```
 
 Write operations take a single-instance lock (`state/warden.lock`) so two

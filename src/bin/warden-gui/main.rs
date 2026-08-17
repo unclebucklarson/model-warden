@@ -82,6 +82,8 @@ struct App {
     demote_remove: bool,
     show_fetch: bool,
     fetch_repo: String,
+    fetch_token: String,
+    fetch_token_remember: bool,
     fetch_files: Option<Vec<modelwarden::core::acquire::RemoteFile>>,
 }
 
@@ -112,6 +114,8 @@ impl App {
             demote_remove: false,
             show_fetch: false,
             fetch_repo: String::new(),
+            fetch_token: String::new(),
+            fetch_token_remember: false,
             fetch_files: None,
         };
         if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
@@ -838,9 +842,10 @@ impl App {
         }
     }
 
-    fn spawn_list_remote(&mut self, repo: String) {
+    fn spawn_list_remote(&mut self, repo: String, explicit_token: Option<String>) {
         self.spawn("listing repo files", move |tx| {
-            let token = modelwarden::core::acquire::resolve_token(None);
+            let cfg = settings::AppConfig::load(&settings::config_file());
+            let token = modelwarden::core::acquire::resolve_token(explicit_token, &cfg);
             match modelwarden::core::acquire::list_files(&repo, token.as_deref()) {
                 Ok(files) => {
                     let n = files.len();
@@ -854,7 +859,7 @@ impl App {
         });
     }
 
-    fn spawn_fetch(&mut self, repo: String, parts: Vec<String>) {
+    fn spawn_fetch(&mut self, repo: String, parts: Vec<String>, explicit_token: Option<String>) {
         self.spawn("downloading", move |tx| {
             use modelwarden::core::acquire;
             let cfg = settings::AppConfig::load(&settings::config_file());
@@ -870,7 +875,8 @@ impl App {
                     return;
                 }
             };
-            let token = acquire::resolve_token(None);
+            let cfg2 = settings::AppConfig::load(&settings::config_file());
+            let token = acquire::resolve_token(explicit_token, &cfg2);
             let mut summary = Vec::new();
             for filename in &parts {
                 if let Ok(dest) = acquire::dest_for(&shelf_root, &repo, filename)
@@ -953,6 +959,16 @@ impl App {
                         list = Some(self.fetch_repo.trim().to_string());
                     }
                 });
+                ui.horizontal(|ui| {
+                    ui.label("Token (gated repos):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.fetch_token)
+                            .password(true)
+                            .hint_text("blank = config / $HF_TOKEN / hf login"),
+                    );
+                    ui.checkbox(&mut self.fetch_token_remember, "Remember")
+                        .on_hover_text("Save to warden's config.json (plain text, like hf's own token file)");
+                });
                 if let Some(files) = &self.fetch_files {
                     ui.separator();
                     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
@@ -975,9 +991,23 @@ impl App {
                     });
                 }
             });
+        let explicit_token = (!self.fetch_token.trim().is_empty())
+            .then(|| self.fetch_token.trim().to_string());
+        if self.fetch_token_remember
+            && let Some(t) = &explicit_token
+        {
+            let mut cfg = settings::AppConfig::load(&settings::config_file());
+            if cfg.hf_token.as_deref() != Some(t.as_str()) {
+                cfg.hf_token = Some(t.clone());
+                match cfg.save(&settings::config_file()) {
+                    Ok(()) => self.activity.push("token saved to config".into()),
+                    Err(e) => self.activity.push(format!("error saving token: {e:#}")),
+                }
+            }
+        }
         if let Some(repo) = list {
             self.fetch_files = None;
-            self.spawn_list_remote(repo);
+            self.spawn_list_remote(repo, explicit_token.clone());
         }
         if let Some((repo, filename)) = download {
             let parts = self
@@ -990,7 +1020,7 @@ impl App {
                     if parts.len() > 1 {
                         self.activity.push(format!("split model: {} parts", parts.len()));
                     }
-                    self.spawn_fetch(repo, parts);
+                    self.spawn_fetch(repo, parts, explicit_token.clone());
                     open = false;
                 }
                 Err(e) => self.activity.push(format!("error: {e:#}")),

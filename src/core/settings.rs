@@ -20,6 +20,10 @@ pub struct AppConfig {
     /// Auto-discover the Ollama stores and HF hub cache (default). Off means
     /// warden only looks at `scan_dirs` and registered roots.
     pub discover_stores: bool,
+    /// HuggingFace token for gated/private repos. Stored plainly, like the
+    /// hf CLI's own `~/.cache/huggingface/token`; leave unset to fall back
+    /// to $HF_TOKEN or that file.
+    pub hf_token: Option<String>,
 }
 
 /// A root the user registered with `warden roots add` (or the GUI dialog).
@@ -44,6 +48,7 @@ impl Default for AppConfig {
             scan_dirs,
             roots: Vec::new(),
             discover_stores: true,
+            hf_token: None,
         }
     }
 }

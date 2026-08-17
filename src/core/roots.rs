@@ -239,6 +239,7 @@ mod tests {
             scan_dirs: vec![],
             roots: vec![],
             discover_stores: false,
+            hf_token: None,
         };
         cfg.roots.push(crate::core::settings::RegisteredRoot {
             id: "ext-cafe0123".into(),

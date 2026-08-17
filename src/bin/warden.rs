@@ -30,7 +30,7 @@ Commands (landing per ROADMAP.md milestone):
   dedup [--hardlink]               collapse same-fs duplicate copies in owned
                                    roots (default: dry run report)
   report [--json]                  disk usage grouped by model family
-  fetch <org/repo> [pattern] [--token T]
+  fetch <org/repo> [pattern] [--token T [--save-token]]
                                    list a repo's GGUFs; with a pattern
                                    matching one file (or one split set),
                                    download to the shelf: Range-resume,
@@ -691,7 +691,17 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
         .iter()
         .position(|a| a == "--token")
         .and_then(|i| args.get(i + 1).cloned());
-    let token = acquire::resolve_token(cli_token);
+    let mut cfg_for_token = settings::AppConfig::load(&settings::config_file());
+    if let Some(t) = &cli_token
+        && args.iter().any(|a| a == "--save-token")
+    {
+        cfg_for_token.hf_token = Some(t.clone());
+        match cfg_for_token.save(&settings::config_file()) {
+            Ok(()) => eprintln!("token saved to config"),
+            Err(e) => eprintln!("warden: saving token: {e:#}"),
+        }
+    }
+    let token = acquire::resolve_token(cli_token, &cfg_for_token);
 
     let files = match acquire::list_files(repo, token.as_deref()) {
         Ok(f) => f,
