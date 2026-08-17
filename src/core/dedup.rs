@@ -174,11 +174,20 @@ fn reclaim_group(
 /// Replace `victim` with a hardlink to `survivor` atomically: link to a
 /// temp name, rename over. The path never goes missing; the old inode is
 /// freed when its last reference drops.
+///
+/// The survivor is canonicalized first: `hard_link` does NOT follow
+/// symlinks, and an HF snapshot path IS a symlink into blobs/ — linking it
+/// raw would plant a relative symlink that dangles from the victim's
+/// directory (found the hard way on real data). Link the bytes, never the
+/// pointer.
 fn relink(survivor: &std::path::Path, victim: &std::path::Path) -> Result<()> {
     use anyhow::Context;
+    let real = survivor
+        .canonicalize()
+        .with_context(|| format!("resolving {}", survivor.display()))?;
     let tmp = victim.with_extension("gguf.wardenlink");
-    std::fs::hard_link(survivor, &tmp)
-        .with_context(|| format!("linking {} → {}", survivor.display(), tmp.display()))?;
+    std::fs::hard_link(&real, &tmp)
+        .with_context(|| format!("linking {} → {}", real.display(), tmp.display()))?;
     std::fs::rename(&tmp, victim).with_context(|| format!("replacing {}", victim.display()))
 }
 
@@ -254,6 +263,71 @@ mod tests {
         // Unrelated file untouched, no temp litter.
         assert!(shelf.path().join("A/other.gguf").is_file());
         assert!(!shelf.path().join("B/copy.gguf.wardenlink").exists());
+    }
+
+    #[test]
+    fn relink_through_a_symlink_survivor_links_the_bytes_not_the_pointer() {
+        use std::os::unix::fs::MetadataExt;
+        // Regression: real-data incident. The survivor's catalog path was an
+        // HF snapshot SYMLINK; hard_link doesn't follow symlinks, so the
+        // victim became a dangling relative symlink. relink must resolve to
+        // the real bytes first.
+        let world = tempfile::tempdir().unwrap();
+        let bytes = synthetic_gguf("qwen3", 4096, 15);
+        // hub-style: blob + snapshot symlink with a RELATIVE target.
+        let repo = world.path().join("hub/models--org--R");
+        std::fs::create_dir_all(repo.join("blobs")).unwrap();
+        std::fs::create_dir_all(repo.join("snapshots/rev1")).unwrap();
+        std::fs::write(repo.join("blobs/bee"), &bytes).unwrap();
+        std::os::unix::fs::symlink("../../blobs/bee", repo.join("snapshots/rev1/m.gguf"))
+            .unwrap();
+        // shelf: an independent duplicate copy (the victim-to-be), plus an
+        // archived hardlink of the blob — that makes the blob's inode the
+        // most-shared (survivor), with the HF SYMLINK path listed first
+        // among its locations, exactly the real-data shape.
+        let shelf = world.path().join("shelf");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::write(shelf.join("m-copy.gguf"), &bytes).unwrap();
+        std::fs::hard_link(repo.join("blobs/bee"), shelf.join("m-archived.gguf")).unwrap();
+
+        let specs = [
+            RootSpec {
+                id: "hf-test".into(),
+                kind: RootKind::HfHub,
+                path: world.path().join("hub"),
+                label: None,
+            },
+            RootSpec {
+                id: "shelf-test".into(),
+                kind: RootKind::Shelf,
+                path: shelf.clone(),
+                label: None,
+            },
+        ];
+        let mut manifests: Vec<_> = specs.iter().map(|s| build_root_manifest(s, None)).collect();
+        for m in &mut manifests {
+            let root = m.root.path.clone();
+            for f in &mut m.files {
+                f.sha256 = Some(
+                    identity::sha256_file(&root.join(&f.rel_path), |_, _| {}).unwrap(),
+                );
+            }
+        }
+        let inv = merge(&manifests);
+        let report = reclaim(&inv, false, |_| {}).unwrap();
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.relinked.len(), 1);
+        let victim = &report.relinked[0];
+        let md = std::fs::symlink_metadata(victim).unwrap();
+        assert!(
+            md.file_type().is_file(),
+            "victim must be a regular hardlink, not a symlink: {victim:?}"
+        );
+        assert_eq!(
+            md.ino(),
+            std::fs::metadata(repo.join("blobs/bee")).unwrap().ino(),
+            "and it must share the blob's inode"
+        );
     }
 
     #[test]

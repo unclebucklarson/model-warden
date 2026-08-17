@@ -19,8 +19,11 @@ Commands (landing per ROADMAP.md milestone):
   roots list [--json]              all roots incl. offline drives
   roots add <path> [--label X]     register a drive/NAS mount by fs UUID
   where <query> [--json]           locate a model across roots, incl. offline
-  backup <path> [--label X]        copy every hashed content to a target,
-                                   read-back verified; registers the target
+  backup <path> [query…] [--label X]
+                                   verified copy to a target (registered as a
+                                   root). No query = everything; queries pick
+                                   models, each expanded to its full bundle
+                                   (split parts, vision projectors)
   verify <path|root-id>            re-hash a root against its manifest
   archive <query>                  promote a cache-owned model to the shelf
   archive demote <query> --to <path|id> [--remove-source]
@@ -498,7 +501,7 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         };
         let remove_source = args.iter().any(|a| a == "--remove-source");
-        let (key, entry) = match resolve_one(&inv, query) {
+        let (key, _entry) = match resolve_one(&inv, query) {
             Ok(m) => m,
             Err(code) => return code,
         };
@@ -514,30 +517,44 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             Ok(l) => l,
             Err(code) => return code,
         };
-        match modelwarden::core::archive::demote(&inv, key, entry, &target, remove_source, &mut |ev| {
-            print_backup_event(&ev)
-        }) {
-            Ok(out) => {
-                println!("demoted to {}", out.dest.display());
-                if let Some(src) = out.removed_source {
-                    println!("removed shelf copy {} (verified on cold storage first)", src.display());
-                } else {
-                    println!("shelf copy kept (pass --remove-source to free it)");
-                }
-                rerun_hash_quietly();
-                ExitCode::SUCCESS
+        let mut failed = false;
+        for k in manifest::bundle_for(&inv, key) {
+            let Some(e) = inv.models.get(&k) else { continue };
+            let on_shelf = e.locations.iter().any(|l| {
+                l.kind == modelwarden::core::roots::RootKind::Shelf && inv.live_accessible(l)
+            });
+            if !on_shelf {
+                continue;
             }
-            Err(e) => {
-                eprintln!("warden: {e:#}");
-                ExitCode::FAILURE
+            match modelwarden::core::archive::demote(&inv, &k, e, &target, remove_source, &mut |ev| {
+                print_backup_event(&ev)
+            }) {
+                Ok(out) => {
+                    println!("demoted {} to {}", e.display_name, out.dest.display());
+                    if let Some(src) = out.removed_source {
+                        println!(
+                            "removed shelf copy {} (verified on cold storage first)",
+                            src.display()
+                        );
+                    }
+                }
+                Err(err) => {
+                    eprintln!("warden: {}: {err:#}", e.display_name);
+                    failed = true;
+                }
             }
         }
+        if !remove_source {
+            println!("shelf copies kept (pass --remove-source to free them)");
+        }
+        rerun_hash_quietly();
+        if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
     } else {
         let Some(query) = args.get(1).filter(|a| !a.starts_with("--")) else {
             eprintln!("usage: warden archive <query>  (or: warden archive demote …)");
             return ExitCode::from(2);
         };
-        let (key, entry) = match resolve_one(&inv, query) {
+        let (key, _entry) = match resolve_one(&inv, query) {
             Ok(m) => m,
             Err(code) => return code,
         };
@@ -549,19 +566,26 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             Ok(l) => l,
             Err(code) => return code,
         };
-        match modelwarden::core::archive::promote(&inv, key, entry, shelf_root, &mut |ev| {
-            print_backup_event(&ev)
-        }) {
-            Ok(dest) => {
-                println!("archived to {}", dest.display());
-                rerun_hash_quietly();
-                ExitCode::SUCCESS
+        // The whole bundle comes: split parts and projectors are not
+        // optional extras, they are what the model needs to run.
+        let mut failed = false;
+        for k in manifest::bundle_for(&inv, key) {
+            let Some(e) = inv.models.get(&k) else { continue };
+            if modelwarden::core::archive::promotable_location(&inv, e).is_none() {
+                continue;
             }
-            Err(e) => {
-                eprintln!("warden: {e:#}");
-                ExitCode::FAILURE
+            match modelwarden::core::archive::promote(&inv, &k, e, shelf_root, &mut |ev| {
+                print_backup_event(&ev)
+            }) {
+                Ok(dest) => println!("archived {} to {}", e.display_name, dest.display()),
+                Err(err) => {
+                    eprintln!("warden: {}: {err:#}", e.display_name);
+                    failed = true;
+                }
             }
         }
+        rerun_hash_quietly();
+        if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
     }
 }
 
@@ -649,7 +673,7 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         eprintln!("warden: no inventory yet — run `warden hash` first");
         return ExitCode::from(2);
     };
-    let (key, entry) = match resolve_one(&inv, query) {
+    let (key, _entry) = match resolve_one(&inv, query) {
         Ok(m) => m,
         Err(code) => return code,
     };
@@ -665,19 +689,27 @@ fn cmd_restore(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match modelwarden::core::archive::restore(&inv, key, entry, &shelf_root, &mut |ev| {
-        print_backup_event(&ev)
-    }) {
-        Ok(dest) => {
-            println!("restored to {}", dest.display());
-            rerun_hash_quietly();
-            ExitCode::SUCCESS
+    let mut failed = false;
+    for k in manifest::bundle_for(&inv, key) {
+        let Some(e) = inv.models.get(&k) else { continue };
+        let on_shelf = e.locations.iter().any(|l| {
+            l.kind == modelwarden::core::roots::RootKind::Shelf && inv.live_accessible(l)
+        });
+        if on_shelf {
+            continue;
         }
-        Err(e) => {
-            eprintln!("warden: {e:#}");
-            ExitCode::FAILURE
+        match modelwarden::core::archive::restore(&inv, &k, e, &shelf_root, &mut |ev| {
+            print_backup_event(&ev)
+        }) {
+            Ok(dest) => println!("restored {} to {}", e.display_name, dest.display()),
+            Err(err) => {
+                eprintln!("warden: {}: {err:#}", e.display_name);
+                failed = true;
+            }
         }
     }
+    rerun_hash_quietly();
+    if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
 fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
@@ -913,13 +945,40 @@ fn print_backup_event(ev: &backup::BackupEvent) {
 
 fn cmd_backup(args: &[String], json: bool) -> ExitCode {
     let Some(path) = args.get(1).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: warden backup <path> [--label X]");
+        eprintln!("usage: warden backup <path> [query…] [--label X]");
         return ExitCode::from(2);
     };
     let state = settings::state_dir();
     let Some(inv) = manifest::load_inventory(&state) else {
         eprintln!("warden: no inventory yet — run `warden hash` first");
         return ExitCode::from(2);
+    };
+    // Positional queries after the path; skip flags and their values.
+    let mut queries: Vec<&String> = Vec::new();
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--label" => i += 2,
+            a if a.starts_with("--") => i += 1,
+            _ => {
+                queries.push(&args[i]);
+                i += 1;
+            }
+        }
+    }
+    let selection: Option<Vec<String>> = if queries.is_empty() {
+        None
+    } else {
+        let mut keys = Vec::new();
+        for q in &queries {
+            let matches = modelwarden::core::archive::find(&inv, q);
+            if matches.is_empty() {
+                eprintln!("warden: nothing matching \"{q}\" in the catalog");
+                return ExitCode::from(1);
+            }
+            keys.extend(matches.into_iter().map(|(k, _)| k.clone()));
+        }
+        Some(keys)
     };
     let mut cfg = settings::AppConfig::load(&settings::config_file());
     let target_path = std::path::Path::new(path);
@@ -965,7 +1024,9 @@ fn cmd_backup(args: &[String], json: bool) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    match backup::backup(&inv, &tspec, |ev| print_backup_event(&ev)) {
+    match backup::backup(&inv, &tspec, selection.as_deref(), |ev| {
+        print_backup_event(&ev)
+    }) {
         Ok((man, report)) => {
             let save = manifest::save_json(&man, &backup::target_manifest_path(&tspec.path))
                 .and_then(|()| {

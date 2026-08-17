@@ -41,14 +41,23 @@ pub fn target_manifest_path(target: &Path) -> PathBuf {
     target.join(".modelwarden/manifest.json")
 }
 
-/// Back up every hashed, reachable content that isn't on the target yet.
-/// Returns the updated target manifest (caller persists it to the state dir
-/// AND the target itself) plus the report.
+/// Back up hashed, reachable contents that aren't on the target yet.
+/// `selection`: catalog keys to back up — each is expanded to its full
+/// bundle (split parts, mmproj/projector companions), because a fragment of
+/// a model is not a backup. `None` backs up everything. Returns the updated
+/// target manifest (caller persists it to the state dir AND the target
+/// itself) plus the report.
 pub fn backup(
     inv: &Inventory,
     target: &RootSpec,
+    selection: Option<&[String]>,
     mut on: impl FnMut(BackupEvent),
 ) -> Result<(RootManifest, BackupReport)> {
+    let expanded: Option<std::collections::BTreeSet<String>> = selection.map(|keys| {
+        keys.iter()
+            .flat_map(|k| manifest::bundle_for(inv, k))
+            .collect()
+    });
     if !target.kind.owned() {
         bail!("backup target must be an owned root, not {}", target.kind.label());
     }
@@ -69,6 +78,11 @@ pub fn backup(
 
     let mut report = BackupReport::default();
     for (key, entry) in &inv.models {
+        if let Some(sel) = &expanded
+            && !sel.contains(key)
+        {
+            continue;
+        }
         let Some(hash) = key.strip_prefix("sha256:") else {
             on(BackupEvent::Skipped {
                 label: entry.display_name.clone(),
@@ -391,7 +405,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let tspec = target_spec(target.path());
 
-        let (man, report) = backup(&inv, &tspec, |_| {}).unwrap();
+        let (man, report) = backup(&inv, &tspec, None, |_| {}).unwrap();
         assert_eq!(report.copied, 1);
         assert_eq!(report.failed, 0);
         let dest = target.path().join("Fam/model.gguf");
@@ -402,7 +416,7 @@ mod tests {
 
         // Second run: the manifest knows this content — nothing recopied.
         manifest::save_json(&man, &target_manifest_path(target.path())).unwrap();
-        let (_man2, report2) = backup(&inv, &tspec, |_| {}).unwrap();
+        let (_man2, report2) = backup(&inv, &tspec, None, |_| {}).unwrap();
         assert_eq!(report2.copied, 0);
         assert_eq!(report2.skipped_already, 1);
     }
@@ -417,7 +431,7 @@ mod tests {
         )
         .unwrap();
         let target = tempfile::tempdir().unwrap();
-        let (_, report) = backup(&inv, &target_spec(target.path()), |_| {}).unwrap();
+        let (_, report) = backup(&inv, &target_spec(target.path()), None, |_| {}).unwrap();
         assert_eq!(report.copied, 0);
         assert_eq!(report.failed, 1);
         assert!(
@@ -434,7 +448,7 @@ mod tests {
         let (_shelf, _spec, inv) = shelf_with_model();
         let target = tempfile::tempdir().unwrap();
         let tspec = target_spec(target.path());
-        let (mut man, _) = backup(&inv, &tspec, |_| {}).unwrap();
+        let (mut man, _) = backup(&inv, &tspec, None, |_| {}).unwrap();
 
         let ok = verify(&mut man, |_| {}).unwrap();
         assert_eq!(ok.ok, 1);
@@ -448,11 +462,72 @@ mod tests {
     }
 
     #[test]
+    fn selection_backs_up_the_bundle_not_the_world() {
+        use crate::core::identity;
+        use crate::core::manifest::{build_root_manifest, merge};
+        let shelf = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(shelf.path().join("Vision")).unwrap();
+        std::fs::create_dir_all(shelf.path().join("Other")).unwrap();
+        std::fs::write(
+            shelf.path().join("Vision/model-Q4_K_M.gguf"),
+            crate::core::gguf::tests::synthetic_gguf("qwen3", 4096, 15),
+        )
+        .unwrap();
+        std::fs::write(
+            shelf.path().join("Vision/mmproj-F16.gguf"),
+            crate::core::gguf::tests::synthetic_gguf("clip", 0, 1),
+        )
+        .unwrap();
+        std::fs::write(
+            shelf.path().join("Other/unrelated.gguf"),
+            crate::core::gguf::tests::synthetic_gguf("llama", 1024, 1),
+        )
+        .unwrap();
+        let spec = RootSpec {
+            id: "shelf-test".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        };
+        let mut man = build_root_manifest(&spec, None);
+        for f in &mut man.files {
+            f.sha256 =
+                Some(identity::sha256_file(&spec.path.join(&f.rel_path), |_, _| {}).unwrap());
+        }
+        let inv = merge(&[man]);
+        let model_key = inv
+            .models
+            .iter()
+            .find(|(_, e)| e.display_name == "model-Q4_K_M")
+            .map(|(k, _)| k.clone())
+            .unwrap();
+
+        let target = tempfile::tempdir().unwrap();
+        let (_, report) = backup(
+            &inv,
+            &target_spec(target.path()),
+            Some(&[model_key]),
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(report.copied, 2, "the model AND its projector");
+        assert!(target.path().join("Vision/model-Q4_K_M.gguf").is_file());
+        assert!(
+            target.path().join("Vision/mmproj-F16.gguf").is_file(),
+            "vision projector rides along"
+        );
+        assert!(
+            !target.path().join("Other/unrelated.gguf").exists(),
+            "selection stays a selection"
+        );
+    }
+
+    #[test]
     fn refuses_foreign_targets() {
         let (_shelf, _spec, inv) = shelf_with_model();
         let target = tempfile::tempdir().unwrap();
         let mut tspec = target_spec(target.path());
         tspec.kind = RootKind::HfHub;
-        assert!(backup(&inv, &tspec, |_| {}).is_err());
+        assert!(backup(&inv, &tspec, None, |_| {}).is_err());
     }
 }

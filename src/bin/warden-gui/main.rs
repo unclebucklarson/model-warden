@@ -55,6 +55,7 @@ enum Pane {
 enum RowAction {
     Promote(String),
     DemoteDialog(String),
+    BackupDialog(String),
 }
 
 struct App {
@@ -75,6 +76,7 @@ struct App {
     show_backup: bool,
     backup_path: String,
     backup_label: String,
+    backup_filter: String,
     show_reclaim: bool,
     /// Demote dialog state: which content, to which root, remove source?
     demote_key: Option<String>,
@@ -108,6 +110,7 @@ impl App {
             show_backup: false,
             backup_path: String::new(),
             backup_label: String::new(),
+            backup_filter: String::new(),
             show_reclaim: false,
             demote_key: None,
             demote_target: String::new(),
@@ -228,19 +231,23 @@ impl App {
                 let _ = tx.send(Msg::Error("no shelf configured (scan_dirs is empty)".into()));
                 return;
             };
+            let _ = entry;
             let mut on = event_to_progress(tx.clone());
-            match modelwarden::core::archive::promote(&inv, &key, entry, &shelf_root, &mut on) {
-                Ok(dest) => {
-                    let done = format!("archived to {}", dest.display());
-                    if let Some(inv) = Self::refresh_catalog(tx) {
-                        let _ = tx.send(Msg::Refreshed(inv));
-                    }
-                    let _ = tx.send(Msg::Finished(done));
+            let mut lines = Vec::new();
+            for k in manifest::bundle_for(&inv, &key) {
+                let Some(e) = inv.models.get(&k) else { continue };
+                if modelwarden::core::archive::promotable_location(&inv, e).is_none() {
+                    continue;
                 }
-                Err(e) => {
-                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                match modelwarden::core::archive::promote(&inv, &k, e, &shelf_root, &mut on) {
+                    Ok(dest) => lines.push(format!("archived {} → {}", e.display_name, dest.display())),
+                    Err(err) => lines.push(format!("FAILED {}: {err:#}", e.display_name)),
                 }
             }
+            if let Some(inv) = Self::refresh_catalog(tx) {
+                let _ = tx.send(Msg::Refreshed(inv));
+            }
+            let _ = tx.send(Msg::Finished(lines.join("; ")));
         });
     }
 
@@ -270,27 +277,35 @@ impl App {
                 let _ = tx.send(Msg::Error(format!("root {root_id} not found")));
                 return;
             };
+            let _ = entry;
             let mut on = event_to_progress(tx.clone());
-            match modelwarden::core::archive::demote(&inv, &key, entry, &target, remove_source, &mut on)
-            {
-                Ok(out) => {
-                    let done = match out.removed_source {
+            let mut lines = Vec::new();
+            for k in manifest::bundle_for(&inv, &key) {
+                let Some(e) = inv.models.get(&k) else { continue };
+                let on_shelf = e.locations.iter().any(|l| {
+                    l.kind == RootKind::Shelf && inv.live_accessible(l)
+                });
+                if !on_shelf {
+                    continue;
+                }
+                match modelwarden::core::archive::demote(&inv, &k, e, &target, remove_source, &mut on)
+                {
+                    Ok(out) => lines.push(match out.removed_source {
                         Some(src) => format!(
-                            "demoted to {} — removed {} (verified first)",
+                            "demoted {} → {} — removed {} (verified first)",
+                            e.display_name,
                             out.dest.display(),
                             src.display()
                         ),
-                        None => format!("demoted to {} — shelf copy kept", out.dest.display()),
-                    };
-                    if let Some(inv) = Self::refresh_catalog(tx) {
-                        let _ = tx.send(Msg::Refreshed(inv));
-                    }
-                    let _ = tx.send(Msg::Finished(done));
-                }
-                Err(e) => {
-                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                        None => format!("demoted {} → {}", e.display_name, out.dest.display()),
+                    }),
+                    Err(err) => lines.push(format!("FAILED {}: {err:#}", e.display_name)),
                 }
             }
+            if let Some(inv) = Self::refresh_catalog(tx) {
+                let _ = tx.send(Msg::Refreshed(inv));
+            }
+            let _ = tx.send(Msg::Finished(lines.join("; ")));
         });
     }
 
@@ -338,7 +353,7 @@ impl App {
         });
     }
 
-    fn spawn_backup(&mut self, path: String, label: String) {
+    fn spawn_backup(&mut self, path: String, label: String, selection: Option<Vec<String>>) {
         self.spawn("backing up", move |tx| {
             use modelwarden::core::{backup, roots};
             let state = settings::state_dir();
@@ -377,7 +392,7 @@ impl App {
                 label: reg.label,
             };
             let mut on = event_to_progress(tx.clone());
-            match backup::backup(&inv, &tspec, &mut on) {
+            match backup::backup(&inv, &tspec, selection.as_deref(), &mut on) {
                 Ok((man, report)) => {
                     let save = manifest::save_json(&man, &backup::target_manifest_path(&tspec.path))
                         .and_then(|()| {
@@ -628,6 +643,15 @@ impl App {
                             {
                                 actions.push(RowAction::DemoteDialog(key.clone()));
                             }
+                            if key.starts_with("sha256:")
+                                && !offline_only
+                                && ui
+                                    .small_button("Back up…")
+                                    .on_hover_text("Back up this model (and everything it needs) to a drive")
+                                    .clicked()
+                            {
+                                actions.push(RowAction::BackupDialog(key.clone()));
+                            }
                         });
                         ui.end_row();
                     }
@@ -639,6 +663,13 @@ impl App {
                 RowAction::DemoteDialog(key) => {
                     self.demote_key = Some(key);
                     self.demote_remove = false;
+                }
+                RowAction::BackupDialog(key) => {
+                    self.backup_filter = key
+                        .strip_prefix("sha256:")
+                        .map(|h| h[..12].to_string())
+                        .unwrap_or(key);
+                    self.show_backup = true;
                 }
             }
         }
@@ -1073,29 +1104,84 @@ impl App {
             return;
         }
         let mut open = self.show_backup;
-        let mut start: Option<(String, String)> = None;
+        let mut start: Option<(String, String, Option<Vec<String>>)> = None;
         egui::Window::new("Back Up")
             .collapsible(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("Verified copy of every hashed content to a target directory.");
-                ui.label("A copy only counts once the target read back the right hash.");
+                ui.label("Verified copy to a target directory — a copy only counts once");
+                ui.label("the target read back the right hash. Selected models bring their");
+                ui.label("whole bundle: split parts and vision projectors travel together.");
                 ui.horizontal(|ui| {
                     ui.label("Target:");
                     ui.text_edit_singleline(&mut self.backup_path);
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.backup_path = dir.display().to_string();
+                    }
                     ui.label("Label:");
                     ui.text_edit_singleline(&mut self.backup_label);
                 });
-                let ready = !self.backup_path.trim().is_empty();
+                ui.horizontal(|ui| {
+                    ui.label("Models (blank = all):");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.backup_filter)
+                            .hint_text("name, path, or sha256 prefix"),
+                    );
+                });
+                let selection: Option<Vec<String>> = if self.backup_filter.trim().is_empty() {
+                    None
+                } else {
+                    self.inv.as_ref().map(|inv| {
+                        modelwarden::core::archive::find(inv, self.backup_filter.trim())
+                            .into_iter()
+                            .map(|(k, _)| k.clone())
+                            .collect()
+                    })
+                };
+                let preview = match (&selection, &self.inv) {
+                    (Some(keys), Some(inv)) => {
+                        let expanded: std::collections::BTreeSet<String> = keys
+                            .iter()
+                            .flat_map(|k| manifest::bundle_for(inv, k))
+                            .collect();
+                        let bytes: u64 = expanded
+                            .iter()
+                            .filter_map(|k| inv.models.get(k))
+                            .map(|e| e.size)
+                            .sum();
+                        format!(
+                            "{} matched, {} with bundles — {}",
+                            keys.len(),
+                            expanded.len(),
+                            human_size(bytes)
+                        )
+                    }
+                    (Some(_), None) => "no catalog yet".into(),
+                    (None, Some(inv)) => {
+                        let bytes: u64 = inv.models.values().map(|e| e.size).sum();
+                        format!("everything: {} contents, {}", inv.models.len(), human_size(bytes))
+                    }
+                    (None, None) => "no catalog yet".into(),
+                };
+                ui.label(preview);
+                let matched_nothing =
+                    matches!(&selection, Some(keys) if keys.is_empty());
+                let ready = !self.backup_path.trim().is_empty() && !matched_nothing;
                 if ui
                     .add_enabled(ready, egui::Button::new("Start backup"))
                     .clicked()
                 {
-                    start = Some((self.backup_path.clone(), self.backup_label.clone()));
+                    start = Some((
+                        self.backup_path.clone(),
+                        self.backup_label.clone(),
+                        selection,
+                    ));
                 }
             });
-        if let Some((path, label)) = start {
-            self.spawn_backup(path, label);
+        if let Some((path, label, selection)) = start {
+            self.spawn_backup(path, label, selection);
             open = false;
         }
         self.show_backup = open;
@@ -1142,6 +1228,11 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Path:");
                     ui.text_edit_singleline(&mut self.roots_add_path);
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.roots_add_path = dir.display().to_string();
+                    }
                     ui.label("Label:");
                     ui.text_edit_singleline(&mut self.roots_add_label);
                     if ui.button("Add").clicked() {

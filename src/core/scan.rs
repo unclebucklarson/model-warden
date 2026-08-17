@@ -254,50 +254,68 @@ pub fn ollama_models(store: &Path) -> Vec<ModelFile> {
             let path = e.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if let Some(m) = ollama_model_from_manifest(store, &manifests, &path) {
-                out.push(m);
+            } else {
+                ollama_models_from_manifest(store, &manifests, &path, &mut out);
             }
         }
     }
     out
 }
 
-fn ollama_model_from_manifest(
+fn ollama_models_from_manifest(
     store: &Path,
     manifests_root: &Path,
     manifest: &Path,
-) -> Option<ModelFile> {
-    let json: serde_json::Value =
-        serde_json::from_str(&std::fs::read_to_string(manifest).ok()?).ok()?;
-    let digest = json.get("layers")?.as_array()?.iter().find_map(|l| {
-        l.get("mediaType")?
-            .as_str()?
-            .ends_with("image.model")
-            .then(|| l.get("digest")?.as_str().map(str::to_string))?
-    })?;
-    let blob = store.join("blobs").join(digest.replace(':', "-"));
-
+    out: &mut Vec<ModelFile>,
+) {
+    let Some(json) = std::fs::read_to_string(manifest)
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return;
+    };
     // manifests/<host>/<namespace>/<name>/<tag> → "name:tag" (or
     // "namespace/name:tag" for non-library namespaces).
-    let rel = manifest.strip_prefix(manifests_root).ok()?;
+    let Ok(rel) = manifest.strip_prefix(manifests_root) else {
+        return;
+    };
     let parts: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
     let name = match parts.as_slice() {
         [_host, ns, name, tag] if ns == "library" => format!("{name}:{tag}"),
         [_host, ns, name, tag] => format!("{ns}/{name}:{tag}"),
-        _ => return None,
+        _ => return,
     };
-
-    // A manifest naming a blob that's gone is the same incident class as a
-    // pruned HF snapshot: list it, honestly inaccessible.
-    let accessible = blob.is_file();
-    let file_size = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
-    Some(ModelFile {
-        meta: gguf::read_meta(&blob).ok(),
-        path: blob,
-        file_size,
-        source: Source::Ollama { name },
-        accessible,
-    })
+    let Some(layers) = json.get("layers").and_then(|l| l.as_array()) else {
+        return;
+    };
+    // The weights blob plus, for vision models, the projector blob — both
+    // are bytes the model needs to run, so both are inventory. The
+    // projector's `+projector` name suffix ties it to its model (bundles
+    // group by the base name).
+    for (suffix, media_suffix) in [("", "image.model"), ("+projector", "image.projector")] {
+        let Some(digest) = layers.iter().find_map(|l| {
+            l.get("mediaType")?
+                .as_str()?
+                .ends_with(media_suffix)
+                .then(|| l.get("digest")?.as_str().map(str::to_string))?
+        }) else {
+            continue;
+        };
+        let blob = store.join("blobs").join(digest.replace(':', "-"));
+        // A manifest naming a blob that's gone is the same incident class
+        // as a pruned HF snapshot: list it, honestly inaccessible.
+        let accessible = blob.is_file();
+        let file_size = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+        out.push(ModelFile {
+            meta: gguf::read_meta(&blob).ok(),
+            path: blob,
+            file_size,
+            source: Source::Ollama {
+                name: format!("{name}{suffix}"),
+            },
+            accessible,
+        });
+    }
 }
 
 #[cfg(test)]
@@ -391,6 +409,42 @@ mod tests {
             Some(131_072)
         );
         assert!(models[0].path.ends_with("blobs/sha256-abc123"));
+    }
+
+    #[test]
+    fn ollama_projector_layers_are_inventoried_with_tied_names() {
+        let store = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(store.path().join("blobs")).unwrap();
+        std::fs::write(
+            store.path().join("blobs/sha256-model1"),
+            synthetic_gguf("qwen3", 4096, 15),
+        )
+        .unwrap();
+        std::fs::write(
+            store.path().join("blobs/sha256-proj1"),
+            synthetic_gguf("clip", 0, 1),
+        )
+        .unwrap();
+        let mdir = store
+            .path()
+            .join("manifests/registry.ollama.ai/library/vision");
+        std::fs::create_dir_all(&mdir).unwrap();
+        std::fs::write(
+            mdir.join("latest"),
+            r#"{"layers":[
+                {"mediaType":"application/vnd.ollama.image.model","digest":"sha256:model1","size":100},
+                {"mediaType":"application/vnd.ollama.image.projector","digest":"sha256:proj1","size":50}
+            ]}"#,
+        )
+        .unwrap();
+        let models = ollama_models(store.path());
+        assert_eq!(models.len(), 2, "weights AND projector");
+        assert!(models.iter().any(|m| m.display_name() == "vision:latest"));
+        assert!(
+            models
+                .iter()
+                .any(|m| m.display_name() == "vision:latest+projector")
+        );
     }
 
     #[test]

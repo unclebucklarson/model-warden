@@ -387,6 +387,90 @@ pub struct DupGroup {
     pub reclaimable: u64,
 }
 
+/// Everything a selected model needs to run, as catalog keys: the model
+/// itself, its split siblings (`-NNNNN-of-NNNNN` parts are useless alone),
+/// any `mmproj` vision projector kept beside it, and — for Ollama — the
+/// projector blob its manifest ties to it (`<name>+projector`). Every
+/// operation that moves models moves the whole bundle.
+///
+/// Deliberately asymmetric: selecting a projector does NOT drag in every
+/// quant that shares its directory.
+pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    keys.insert(key.to_string());
+    let Some(entry) = inv.models.get(key) else {
+        return keys.into_iter().collect();
+    };
+    for loc in &entry.locations {
+        match loc.kind {
+            RootKind::Ollama => {
+                let base = ollama_base(&entry.display_name);
+                for (k2, e2) in &inv.models {
+                    if k2 != key
+                        && e2.locations.iter().any(|l2| {
+                            l2.kind == RootKind::Ollama && l2.root_id == loc.root_id
+                        })
+                        && ollama_base(&e2.display_name) == base
+                    {
+                        keys.insert(k2.clone());
+                    }
+                }
+            }
+            _ => {
+                let container = container_of(loc.kind, &loc.rel_path);
+                let fname = file_name_of(&loc.rel_path);
+                let my_split =
+                    crate::core::acquire::split_parts(&fname).map(|(p, _, c)| (p.to_string(), c));
+                let i_am_projector = fname.to_lowercase().contains("mmproj");
+                for (k2, e2) in &inv.models {
+                    if k2 == key {
+                        continue;
+                    }
+                    let companion = e2.locations.iter().any(|l2| {
+                        if l2.root_id != loc.root_id
+                            || container_of(l2.kind, &l2.rel_path) != container
+                        {
+                            return false;
+                        }
+                        let f2 = file_name_of(&l2.rel_path);
+                        let same_split = my_split.as_ref().is_some_and(|(p, c)| {
+                            crate::core::acquire::split_parts(&f2)
+                                .is_some_and(|(p2, _, c2)| p2 == p && c2 == *c)
+                        });
+                        same_split
+                            || (!i_am_projector && f2.to_lowercase().contains("mmproj"))
+                    });
+                    if companion {
+                        keys.insert(k2.clone());
+                    }
+                }
+            }
+        }
+    }
+    keys.into_iter().collect()
+}
+
+fn ollama_base(name: &str) -> &str {
+    name.strip_suffix("+projector").unwrap_or(name)
+}
+
+fn file_name_of(rel: &Path) -> String {
+    rel.file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default()
+}
+
+/// The scope inside which files count as "kept beside each other": for the
+/// HF hub cache, the snapshot revision (mmproj at snapshot root pairs with
+/// a quant in a split subfolder); elsewhere, the parent directory.
+fn container_of(kind: RootKind, rel: &Path) -> PathBuf {
+    match kind {
+        // models--org--name/snapshots/<rev>/...
+        RootKind::HfHub => rel.components().take(3).collect(),
+        _ => rel.parent().map(Path::to_path_buf).unwrap_or_default(),
+    }
+}
+
 /// Disk usage grouped by model family — `<architecture> <size_label>` when
 /// the GGUF header offers them, else the display name's leading token.
 #[derive(Debug, Clone, Serialize)]
@@ -669,6 +753,85 @@ mod tests {
         let entry = &inv.models["sha256:dd"];
         assert_eq!(entry.locations.len(), 1);
         assert!(!entry.locations[0].accessible, "offline, not gone");
+    }
+
+    #[test]
+    fn bundles_group_splits_mmproj_and_ollama_projectors() {
+        let loc = |kind: RootKind, root: &str, rel: &str| Location {
+            root_id: root.into(),
+            kind,
+            rel_path: rel.into(),
+            accessible: true,
+            dev: 1,
+            ino: 1,
+        };
+        let entry = |name: &str, locs: Vec<Location>| ModelEntry {
+            size: 1,
+            display_name: name.into(),
+            meta: None,
+            locations: locs,
+        };
+        let mut models = BTreeMap::new();
+        // HF snapshot: split quant in a subfolder + mmproj at snapshot root.
+        models.insert(
+            "sha256:part1".to_string(),
+            entry("unsloth/Big-GGUF", vec![loc(
+                RootKind::HfHub, "hf",
+                "models--unsloth--Big-GGUF/snapshots/rev1/UD/big-00001-of-00002.gguf",
+            )]),
+        );
+        models.insert(
+            "sha256:part2".to_string(),
+            entry("unsloth/Big-GGUF", vec![loc(
+                RootKind::HfHub, "hf",
+                "models--unsloth--Big-GGUF/snapshots/rev1/UD/big-00002-of-00002.gguf",
+            )]),
+        );
+        models.insert(
+            "sha256:proj".to_string(),
+            entry("unsloth/Big-GGUF", vec![loc(
+                RootKind::HfHub, "hf",
+                "models--unsloth--Big-GGUF/snapshots/rev1/mmproj-F16.gguf",
+            )]),
+        );
+        // A different quant in the same snapshot: NOT part of the bundle.
+        models.insert(
+            "sha256:otherquant".to_string(),
+            entry("unsloth/Big-GGUF", vec![loc(
+                RootKind::HfHub, "hf",
+                "models--unsloth--Big-GGUF/snapshots/rev1/big-Q2_K.gguf",
+            )]),
+        );
+        // Ollama model + projector tied by name.
+        models.insert(
+            "sha256:omodel".to_string(),
+            entry("vision:latest", vec![loc(RootKind::Ollama, "ol", "blobs/sha256-m")]),
+        );
+        models.insert(
+            "sha256:oproj".to_string(),
+            entry("vision:latest+projector", vec![loc(RootKind::Ollama, "ol", "blobs/sha256-p")]),
+        );
+        let inv = Inventory {
+            schema_version: SCHEMA_VERSION,
+            generated_unix: 0,
+            roots: vec![],
+            models,
+        };
+        // Picking one split part pulls the other part and the projector,
+        // but not the unrelated quant.
+        let b = bundle_for(&inv, "sha256:part1");
+        assert_eq!(b, vec!["sha256:part1", "sha256:part2", "sha256:proj"]);
+        // Picking the projector does not drag every quant along.
+        assert_eq!(bundle_for(&inv, "sha256:proj"), vec!["sha256:proj"]);
+        // Ollama model pulls its projector (and vice versa).
+        assert_eq!(
+            bundle_for(&inv, "sha256:omodel"),
+            vec!["sha256:omodel", "sha256:oproj"]
+        );
+        assert_eq!(
+            bundle_for(&inv, "sha256:oproj"),
+            vec!["sha256:omodel", "sha256:oproj"]
+        );
     }
 
     #[test]

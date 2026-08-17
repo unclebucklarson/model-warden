@@ -87,7 +87,7 @@ fn token_from_file(path: &Path) -> Option<String> {
 
 /// llama.cpp split convention: `<name>-00001-of-00003.gguf`. Returns the
 /// stem-with-set (`<name>`, part index, part count) when it matches.
-fn split_parts(filename: &str) -> Option<(&str, u32, u32)> {
+pub(crate) fn split_parts(filename: &str) -> Option<(&str, u32, u32)> {
     let stem = filename.strip_suffix(".gguf")?;
     // <prefix>-NNNNN-of-NNNNN
     let (rest, count) = stem.rsplit_once("-of-")?;

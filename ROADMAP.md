@@ -96,14 +96,25 @@ backed up, which are the same bytes — without ever losing bytes.**
   Remember-to-config, CLI --token --save-token, config `hf_token`, then
   env/hf-login fallbacks.
 
+- **M9** — bundles, selective backup, native browse; dedup symlink fix.
+  `bundle_for()` defines "everything the model needs to run": split
+  `-NNNNN-of-NNNNN` siblings, `mmproj` vision projectors kept beside the
+  model (same HF snapshot / same dir), and Ollama projector blobs (now
+  inventoried, tied by `+projector` name). Backup, archive, demote, and
+  restore all move whole bundles — never fragments; no tar needed, plain
+  files keep the layout human-rescuable. `warden backup <path> [query…]`
+  backs up selected models; GUI Back Up dialog gains Browse… (native
+  picker via rfd), a model filter with live bundle/size preview, and a
+  per-row Back up… action. Critical fix from the user's real run:
+  dedup's relink hardlinked an HF snapshot SYMLINK instead of the bytes
+  (hard_link doesn't follow symlinks), leaving a dangling shelf path —
+  relink now canonicalizes the survivor; regression test proven to catch
+  it; the damaged path was repaired in place. 53 tests green.
+
 ## Smaller items (fold in opportunistically)
 
 - `--json` output on every read command from the moment it exists (scan: done).
 - Activity log lines mirror between CLI verbose mode and GUI panel.
-- Ollama projector layers: manifests can carry `image.projector` blobs
-  alongside `image.model`; inventory them like HF mmproj files.
-- Track mmproj ↔ parent-model companionship so archival/backup of a vision
-  model brings its projector along.
 - `warden backup --repair`: re-copy backup files that failed verify (today a
   corrupted target copy is reported but refuses overwrite; the user deletes
   it manually first).

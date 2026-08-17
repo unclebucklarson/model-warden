@@ -26,7 +26,10 @@ warden dups              hash-identical duplicates + reclaimable bytes
 warden doctor            store health: dangling refs, orphans, partial downloads
 warden roots add|list    register drives/NAS by fs UUID (+ marker file)
 warden where <query>     locate by name, path, or sha256 prefix — incl. offline drives
-warden backup <path>     verified copy of every content to a target drive
+warden backup <path> [query…]  verified copy to a target drive; queries
+                         select models (blank = all), each expanded to its
+                         full bundle — split parts and vision projectors
+                         always travel together
 warden verify <path|id>  re-hash a root against its manifest (bit-rot check)
 warden archive <query>   promote a cache-owned model to the shelf
 warden archive demote <query> --to <root> [--remove-source]
