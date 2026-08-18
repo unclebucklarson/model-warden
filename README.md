@@ -80,3 +80,4 @@ The hash-path crates are optimized even in dev profiles (see Cargo.toml).
 
 Design authority: [PLAN.md](PLAN.md). Status: [ROADMAP.md](ROADMAP.md).
 Spike results that shaped the design: [docs/spikes.md](docs/spikes.md).
+Project overview for readers outside the repo: [docs/overview.md](docs/overview.md).
