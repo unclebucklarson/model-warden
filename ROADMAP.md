@@ -123,13 +123,24 @@ backed up, which are the same bytes — without ever losing bytes.**
   loses. Owner CLIs detected on PATH; manual fallbacks when absent.
   56 tests green.
 
+## Next candidates (pick up here)
+
+1. **llamacppCodeConf reads `inventory.json`** — the schema-v1 payoff; work
+   happens in the sibling repo (`~/src2/llamacppCodeConf`), not here. The
+   serving tool gets storage truth (incl. offline-drive locations) without
+   scanning anything itself.
+2. **Scheduled scrub** — a systemd timer running `warden verify` against the
+   backup drive (exit 1 on mismatch makes it alert-friendly). Makes sense now
+   that a real backup exists on "Archive 2".
+3. **`warden backup --repair`** — re-copy backup files that failed verify
+   (today a corrupted target copy is reported but refuses overwrite; the
+   user deletes it manually first).
+4. **Provenance surfacing** — fetch records repo/revision/etag by content
+   hash in `state/provenance.json`; `where`/`status` don't display it yet.
+
 ## Smaller items (fold in opportunistically)
 
-- `--json` output on every read command from the moment it exists (scan: done).
 - Activity log lines mirror between CLI verbose mode and GUI panel.
-- `warden backup --repair`: re-copy backup files that failed verify (today a
-  corrupted target copy is reported but refuses overwrite; the user deletes
-  it manually first).
 
 ## Sibling project: llamacppCodeConf (`~/src2/llamacppCodeConf`)
 

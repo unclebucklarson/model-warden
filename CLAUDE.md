@@ -17,7 +17,7 @@ update it when milestones land.
 
 - `cargo build` / `cargo test` — core is headless and fully testable.
 - `cargo run` — opens the GUI (`default-run = "warden-gui"`).
-- `cargo run --bin warden -- <scan|hash|status|dups|roots|where|backup|archive|dedup|fetch>` — CLI.
+- `cargo run --bin warden -- <scan|hash|status|dups|doctor|roots|where|backup|verify|archive|restore|dedup|report|fetch>` — CLI; `--json` on all read commands.
 - Config: `~/.config/modelwarden/config.json` (records only what the user changed).
 - State (manifests, merged inventory): `~/.local/state/modelwarden/`.
 
@@ -28,9 +28,11 @@ Single crate, strict core/ui split: `src/core/` is GUI-free and testable;
 menus) render over it and must never be dependencies of it.
 
 Core modules: `gguf` (header reader), `scan` (store scanners + inode dedupe),
-`identity` (fingerprint + SHA-256 worker), `manifest` (per-root JSON + merged
-view), `roots` (storage-root registry, removable-media identity), `backup`,
-`archive`, `dedup`, `acquire` (HF downloads, M7), `settings`.
+`identity` (fingerprint + SHA-256 worker), `lock` (single-instance write
+lock), `manifest` (per-root JSON + merged view + bundles), `roots`
+(storage-root registry, removable-media identity), `backup`, `archive`
+(promote/demote/restore), `dedup`, `doctor` (health + remedies), `acquire`
+(HF downloads), `settings`.
 
 Non-obvious constraints that shape the code:
 
@@ -38,7 +40,12 @@ Non-obvious constraints that shape the code:
   only detects change; it is never identity across stores.
 - **Never write inside a store another tool owns** (Ollama, HF cache,
   llama.cpp cache). Their manifests live under warden's state dir; dedup there
-  is report-only, always.
+  is report-only, always. Doctor cleanup routes through the owning tool's own
+  CLI (`hf cache rm`, `ollama rm`) on explicit user action; sole direct-delete
+  exception is `*.incomplete` download debris (guarded).
+- **Operations move bundles, not files.** Backup/archive/demote/restore carry
+  everything a model needs to run: split `-NNNNN-of-NNNNN` parts, mmproj
+  projectors beside the model, Ollama `+projector` blobs (`bundle_for`).
 - **Never delete model bytes.** The only reclaim is hardlinking, after
   hash-verifying both files, via temp-link+rename.
 - **All copies go .partial → verify hash → rename.** A half-copy must never be

@@ -60,8 +60,10 @@ had a fuzzy seam and got merged. This split survives only if the seam stays cris
 ```
 modelwarden/
   Cargo.toml                 edition 2024; anyhow, serde/serde_json, thiserror,
-                             sha2, eframe = "=0.36.1" (pinned to match harvest
-                             source), env_logger; ureq later (M7); dev: tempfile
+                             sha2, ureq (HF API/downloads), rfd (native file
+                             dialogs), eframe = "=0.36.1" (pinned to match
+                             harvest source), env_logger; dev: tempfile.
+                             Hash-path crates build opt-level=3 even in dev
   src/
     lib.rs                   pub mod core;
     core.rs                  module list; rule: GUI-free and testable
@@ -76,24 +78,35 @@ modelwarden/
                               minus serving-side router_cache_id/alias_suggestion]
       identity.rs            Fingerprint{size,mtime,dev,ino} + lazy SHA-256;
                              background hash worker with mpsc progress
-      doctor.rs              store health, read-only: dangling refs, pruned
-                             husks, orphan blobs, incomplete downloads,
-                             manifests naming missing blobs
+      lock.rs                single-instance write lock: pid file, stale-
+                             steal; every write command takes it
+      doctor.rs              store health: dangling refs, pruned husks,
+                             orphan blobs, incomplete downloads, manifests
+                             naming missing blobs — each finding explained
+                             (what/loss) with a remedy: owner-tool command
+                             (hf cache rm / ollama rm), *.incomplete debris
+                             removal (guarded), or exact manual command
       manifest.rs            per-root manifest read/write (atomic temp+rename,
-                             schema_version), merged Inventory view
+                             schema_version), merged Inventory view,
+                             bundle_for() (split parts + mmproj/projector
+                             companions), dup_groups, family_usage
       roots.rs               storage-root registry: kind (shelf/ollama/hf/
                              removable/nas), UUID identity, accessibility
       backup.rs              copy → verify-by-hash → record {target, hash, when}
-      archive.rs             generalized archive-to-shelf + cold-storage demotion
+      archive.rs             promote (archive-to-shelf), demote (verified
+                             move to cold storage), restore (drive → shelf)
                              [harvest: archive_to_shelf from library.rs]
       dedup.rs               group by sha256, report; hardlink reclaim
                              (owned roots only)
-      acquire.rs             HF downloads (M7; Range-resume via .partial)
+      acquire.rs             HF downloads: Range-resume via .partial, split
+                             sets, gated-repo tokens, 401 did-you-mean,
+                             provenance recorded by content hash
       settings.rs            config: #[serde(default)] + infallible load
                              [harvest: llamacppCodeConf src/core/settings.rs,
                               minus overrides field; XDG helpers re-implemented]
-  src/bin/warden.rs          thin CLI: scan/hash/status/dups/roots/where/backup/
-                             archive/dedup/fetch, --json flags
+  src/bin/warden.rs          thin CLI: scan/hash/status/dups/doctor[--fix]/
+                             roots/where/backup/verify/archive/restore/dedup/
+                             report/fetch; --json on all read commands
   src/bin/warden-gui/        egui shell [pattern from llamacppCodeConf src/ui.rs,
                              re-typed not copied]: Msg enum, spawn(label, job)
                              single-job worker, deferred row actions, menu bar,
@@ -141,6 +154,14 @@ in `docs/spikes.md`.
 
 ## Milestones
 
+> **Status 2026-08-17: all milestones complete** — M0–M7 as planned below,
+> plus M8 (restore, split-GGUF + gated downloads, write lock), M8.1 (HF
+> token management, 401 did-you-mean), M9 (bundles — every operation moves
+> everything a model needs to run; selective backup; native folder pickers),
+> and M10 (doctor remedies: owner-mediated cleanup via `hf cache rm` /
+> `ollama rm`, full explanations + loss statements per finding). Details
+> and per-milestone results in ROADMAP.md.
+
 - **M0 — plan + scaffold + spikes.** This document, CLAUDE.md, ROADMAP.md, a
   compiling scaffold (both bins runnable), and the four spikes run with verdicts
   recorded.
@@ -173,7 +194,7 @@ usable from the CLI one milestone before the GUI exposes them.
 ## Known risks (watched, not blocking)
 
 - mtime fragility on NAS mounts → fingerprint mismatch causes a rehash storm;
-  safe but slow. Spike 1 measures; mitigation is a throttled worker.
+  safe but slow (measured ~680 MB/s cold, ~1.2 GB/s warm).
 - HF cache concurrency: a pull running during a scan can present half-written
   blobs; the scanner must tolerate dangling symlinks and skip partial files.
 - Committing schema_version 1 (M6) makes the merged inventory a contract;
