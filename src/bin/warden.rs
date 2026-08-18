@@ -29,7 +29,14 @@ Commands (landing per ROADMAP.md milestone):
                                    root). No query = everything; queries pick
                                    models, each expanded to its full bundle
                                    (split parts, vision projectors)
-  verify <path|root-id>            re-hash a root against its manifest
+  verify <path|root-id> [--repair]
+  verify --all [--repair]          re-hash roots against their manifests;
+                                   --all covers every online owned root,
+                                   --repair re-copies mismatched/missing
+                                   files from a live source elsewhere
+  scrub install [--daily|--weekly|--monthly]
+                                   write a systemd user timer that runs
+                                   `hash && verify --all` on a schedule
   archive <query>                  promote a cache-owned model to the shelf
   archive demote <query> --to <path|id> [--remove-source]
                                    verified copy to cold storage; the shelf
@@ -65,6 +72,7 @@ fn main() -> ExitCode {
         Some("where") => cmd_where(&args, json),
         Some("backup") => cmd_backup(&args, json),
         Some("verify") => cmd_verify(&args, json),
+        Some("scrub") => cmd_scrub(&args),
         Some("archive") => cmd_archive(&args),
         Some("restore") => cmd_restore(&args),
         Some("dedup") => cmd_dedup(&args, json),
@@ -460,12 +468,25 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
         println!("nothing matching \"{query}\" in the catalog");
         return ExitCode::from(1);
     }
+    let provenance = modelwarden::core::acquire::load_provenance(&state);
     for (key, e) in &matches {
         let ident = key
             .strip_prefix("sha256:")
             .map(|h| &h[..12])
             .unwrap_or("unhashed");
         println!("{}  {}  ({})", ident, e.display_name, human_size(e.size));
+        if let Some(p) = key
+            .strip_prefix("sha256:")
+            .and_then(|h| provenance.get(h))
+        {
+            println!(
+                "    origin: {}/{} @ {} — fetched {}",
+                p.repo,
+                p.filename,
+                p.revision.as_deref().map(|r| &r[..12.min(r.len())]).unwrap_or("?"),
+                ago(p.fetched_unix)
+            );
+        }
         for l in &e.locations {
             println!(
                 "    [{}] {}  — {}",
@@ -1097,70 +1118,168 @@ fn cmd_backup(args: &[String], json: bool) -> ExitCode {
 }
 
 fn cmd_verify(args: &[String], json: bool) -> ExitCode {
-    let Some(which) = args.get(1).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: warden verify <path|root-id>");
-        return ExitCode::from(2);
-    };
+    let all = args.iter().any(|a| a == "--all");
+    let do_repair = args.iter().any(|a| a == "--repair");
     let state = settings::state_dir();
-    let canonical = std::path::Path::new(which).canonicalize().ok();
-    let mut man = match manifest::load_all_manifests(&state).into_iter().find(|m| {
-        m.root.id == *which || Some(&m.root.path) == canonical.as_ref()
-    }) {
-        Some(m) => m,
-        None => {
-            // Maybe a drive that carries its own manifest but was never
-            // cataloged on this machine.
-            let Some(c) = &canonical else {
-                eprintln!("warden: no manifest for {which}");
-                return ExitCode::from(2);
-            };
-            match manifest::load_manifest(&backup::target_manifest_path(c)) {
-                Some(mut m) => {
-                    m.root.path = c.clone();
-                    m
-                }
-                None => {
-                    eprintln!("warden: no manifest for {which}");
-                    return ExitCode::from(2);
-                }
+
+    let mut targets: Vec<manifest::RootManifest> = Vec::new();
+    let mut skipped_offline = Vec::new();
+    if all {
+        for m in manifest::load_all_manifests(&state) {
+            if !m.root.kind.owned() {
+                continue;
+            }
+            if m.root.path.is_dir() {
+                targets.push(m);
+            } else {
+                skipped_offline.push(m.root.id.clone());
             }
         }
-    };
+        if targets.is_empty() {
+            eprintln!("warden: no online owned roots with manifests to verify");
+            return ExitCode::from(2);
+        }
+    } else {
+        let Some(which) = args.get(1).filter(|a| !a.starts_with("--")) else {
+            eprintln!("usage: warden verify <path|root-id> [--repair]  |  warden verify --all [--repair]");
+            return ExitCode::from(2);
+        };
+        let canonical = std::path::Path::new(which).canonicalize().ok();
+        let man = match manifest::load_all_manifests(&state)
+            .into_iter()
+            .find(|m| m.root.id == *which || Some(&m.root.path) == canonical.as_ref())
+        {
+            Some(m) => m,
+            None => {
+                // Maybe a drive that carries its own manifest but was never
+                // cataloged on this machine.
+                let Some(c) = &canonical else {
+                    eprintln!("warden: no manifest for {which}");
+                    return ExitCode::from(2);
+                };
+                match manifest::load_manifest(&backup::target_manifest_path(c)) {
+                    Some(mut m) => {
+                        m.root.path = c.clone();
+                        m
+                    }
+                    None => {
+                        eprintln!("warden: no manifest for {which}");
+                        return ExitCode::from(2);
+                    }
+                }
+            }
+        };
+        targets.push(man);
+    }
+
     let _lock = match take_write_lock(&state) {
         Ok(l) => l,
         Err(code) => return code,
     };
-    match backup::verify(&mut man, |ev| print_backup_event(&ev)) {
-        Ok(report) => {
-            let _ = manifest::save_json(&man, &manifest::manifest_path(&state, &man.root.id));
-            if man.root.kind.owned() {
-                let _ = manifest::save_json(&man, &backup::target_manifest_path(&man.root.path));
+    let inv = manifest::load_inventory(&state);
+    let mut reports = Vec::new();
+    let mut bad = 0usize;
+    for man in &mut targets {
+        eprintln!("verifying {} ({})", man.root.id, man.root.path.display());
+        let mut report = match backup::verify(man, |ev| print_backup_event(&ev)) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("warden: {}: {e:#}", man.root.id);
+                bad += 1;
+                continue;
             }
-            if json {
-                return print_json(&report);
-            }
-            println!(
-                "{} ok, {} mismatched, {} missing, {} unhashed",
-                report.ok,
-                report.mismatched.len(),
-                report.missing.len(),
-                report.unhashed
-            );
-            for p in &report.mismatched {
-                println!("  MISMATCH: {}", p.display());
-            }
-            for p in &report.missing {
-                println!("  MISSING:  {}", p.display());
-            }
-            if report.mismatched.is_empty() && report.missing.is_empty() {
-                ExitCode::SUCCESS
+        };
+        let failures = report.mismatched.len() + report.missing.len();
+        if failures > 0 && do_repair {
+            if let Some(inv) = &inv {
+                match backup::repair(inv, man, &report, |ev| print_backup_event(&ev)) {
+                    Ok(rep) => {
+                        println!(
+                            "  repaired {} of {failures}; {} unrepairable",
+                            rep.repaired,
+                            rep.unrepairable.len()
+                        );
+                        // What matters now is what is STILL wrong.
+                        report = match backup::verify(man, |_| {}) {
+                            Ok(r) => r,
+                            Err(_) => report,
+                        };
+                    }
+                    Err(e) => eprintln!("warden: repair {}: {e:#}", man.root.id),
+                }
             } else {
-                ExitCode::FAILURE
+                eprintln!("warden: --repair needs an inventory — run `warden hash` first");
             }
         }
-        Err(e) => {
-            eprintln!("warden: {e:#}");
-            ExitCode::FAILURE
+        bad += report.mismatched.len() + report.missing.len();
+        let _ = manifest::save_json(man, &manifest::manifest_path(&state, &man.root.id));
+        if man.root.kind.owned() && man.root.path.is_dir() {
+            let _ = manifest::save_json(man, &backup::target_manifest_path(&man.root.path));
+        }
+        println!(
+            "{}: {} ok, {} mismatched, {} missing, {} unhashed",
+            man.root.id,
+            report.ok,
+            report.mismatched.len(),
+            report.missing.len(),
+            report.unhashed
+        );
+        for p in &report.mismatched {
+            println!("  MISMATCH: {}", p.display());
+        }
+        for p in &report.missing {
+            println!("  MISSING:  {}", p.display());
+        }
+        reports.push((man.root.id.clone(), report));
+    }
+    for id in &skipped_offline {
+        println!("{id}: OFFLINE — plug it in to verify");
+    }
+    if json {
+        let owned: std::collections::BTreeMap<_, _> = reports.into_iter().collect();
+        return print_json(&owned);
+    }
+    if bad > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+fn cmd_scrub(args: &[String]) -> ExitCode {
+    match args.get(1).map(String::as_str) {
+        Some("install") => {
+            let calendar = if args.iter().any(|a| a == "--daily") {
+                "daily"
+            } else if args.iter().any(|a| a == "--monthly") {
+                "monthly"
+            } else {
+                "weekly"
+            };
+            match modelwarden::core::scrub::install(calendar) {
+                Ok((paths, enable)) => {
+                    for p in paths {
+                        println!("wrote {}", p.display());
+                    }
+                    if std::env::current_exe()
+                        .map(|p| p.components().any(|c| c.as_os_str() == "target"))
+                        .unwrap_or(false)
+                    {
+                        println!(
+                            "\nnote: the unit points at this dev build — after `cargo build` moves\n\
+                             or you install warden elsewhere, re-run `warden scrub install`"
+                        );
+                    }
+                    println!("\nunits written but NOT enabled — starting services is your call:");
+                    println!("    {enable}");
+                    println!("check later with: systemctl --user status modelwarden-scrub.timer");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("warden: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: warden scrub install [--daily|--weekly|--monthly]");
+            ExitCode::from(2)
         }
     }
 }

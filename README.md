@@ -32,7 +32,12 @@ warden backup <path> [query…]  verified copy to a target drive; queries
                          select models (blank = all), each expanded to its
                          full bundle — split parts and vision projectors
                          always travel together
-warden verify <path|id>  re-hash a root against its manifest (bit-rot check)
+warden verify <path|id|--all> [--repair]
+                         re-hash roots against their manifests (bit-rot
+                         check); --repair re-copies bad files from a live
+                         source, replacing them atomically
+warden scrub install     systemd user timer: hash && verify --all on a
+                         schedule (weekly default); written, never enabled
 warden archive <query>   promote a cache-owned model to the shelf
 warden archive demote <query> --to <root> [--remove-source]
 warden restore <query>   verified copy from a drive back to the shelf

@@ -63,6 +63,7 @@ struct App {
     rx: Receiver<Msg>,
     pane: Pane,
     inv: Option<manifest::Inventory>,
+    provenance: std::collections::BTreeMap<String, modelwarden::core::acquire::Provenance>,
     dups: Vec<DupGroup>,
     usage: Vec<FamilyUsage>,
     findings: Option<Vec<Finding>>,
@@ -98,6 +99,7 @@ impl App {
             rx,
             pane: Pane::default(),
             inv: None,
+            provenance: Default::default(),
             dups: Vec::new(),
             usage: Vec::new(),
             findings: None,
@@ -130,6 +132,8 @@ impl App {
     }
 
     fn set_inventory(&mut self, inv: manifest::Inventory) {
+        self.provenance =
+            modelwarden::core::acquire::load_provenance(&settings::state_dir());
         self.dups = manifest::dup_groups(&inv);
         self.usage = manifest::family_usage(&inv);
         self.inv = Some(inv);
@@ -607,20 +611,26 @@ impl App {
                                 egui::RichText::new(s)
                             }
                         };
-                        ui.label(text(entry.display_name.clone())).on_hover_text(
-                            entry
-                                .locations
-                                .iter()
-                                .map(|l| {
-                                    format!(
-                                        "[{}] {}",
-                                        l.kind.label(),
-                                        l.rel_path.display()
-                                    )
-                                })
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        );
+                        let mut hover: Vec<String> = entry
+                            .locations
+                            .iter()
+                            .map(|l| {
+                                format!("[{}] {}", l.kind.label(), l.rel_path.display())
+                            })
+                            .collect();
+                        if let Some(p) = key
+                            .strip_prefix("sha256:")
+                            .and_then(|h| self.provenance.get(h))
+                        {
+                            hover.push(format!(
+                                "origin: {}/{} @ {}",
+                                p.repo,
+                                p.filename,
+                                p.revision.as_deref().map(|r| &r[..12.min(r.len())]).unwrap_or("?")
+                            ));
+                        }
+                        ui.label(text(entry.display_name.clone()))
+                            .on_hover_text(hover.join("\n"));
                         ui.label(text(
                             entry
                                 .meta

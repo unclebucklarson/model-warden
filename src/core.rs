@@ -14,4 +14,5 @@ pub mod lock;
 pub mod manifest;
 pub mod roots;
 pub mod scan;
+pub mod scrub;
 pub mod settings;

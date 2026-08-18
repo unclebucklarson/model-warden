@@ -123,20 +123,27 @@ backed up, which are the same bytes — without ever losing bytes.**
   loses. Owner CLIs detected on PATH; manual fallbacks when absent.
   56 tests green.
 
+- **M11** — operations hardening: scrub, repair, provenance. `warden
+  verify --all` covers every online owned root (offline drives noted, not
+  failed); `--repair` re-copies mismatched/missing files from a live source
+  elsewhere in the catalog — the corrupt copy is never deleted first, the
+  verified replacement lands by atomic rename, and content with no live
+  source anywhere is reported unrepairable, never silently dropped.
+  `warden scrub install [--daily|--weekly|--monthly]` writes systemd user
+  units running `hash && verify --all` (hash-first means legitimate edits
+  re-hash and pass; bytes changed under an unchanged fingerprint — the
+  bit-rot signature — fail the unit); units are written, never enabled —
+  the enable command is printed. Provenance (repo/file@revision, fetch
+  date) now shows in `warden where` and the GUI row tooltip. Proven
+  end-to-end: corrupt → verify exit 1 → --repair → verify exit 0.
+  58 tests green.
+
 ## Next candidates (pick up here)
 
 1. **llamacppCodeConf reads `inventory.json`** — the schema-v1 payoff; work
    happens in the sibling repo (`~/src2/llamacppCodeConf`), not here. The
    serving tool gets storage truth (incl. offline-drive locations) without
-   scanning anything itself.
-2. **Scheduled scrub** — a systemd timer running `warden verify` against the
-   backup drive (exit 1 on mismatch makes it alert-friendly). Makes sense now
-   that a real backup exists on "Archive 2".
-3. **`warden backup --repair`** — re-copy backup files that failed verify
-   (today a corrupted target copy is reported but refuses overwrite; the
-   user deletes it manually first).
-4. **Provenance surfacing** — fetch records repo/revision/etag by content
-   hash in `state/provenance.json`; `where`/`status` don't display it yet.
+   scanning anything itself. **Best done as a session in that repo.**
 
 ## Smaller items (fold in opportunistically)
 

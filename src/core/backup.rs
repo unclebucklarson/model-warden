@@ -295,6 +295,94 @@ pub struct VerifyReport {
     pub unhashed: usize,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RepairReport {
+    pub repaired: usize,
+    pub unrepairable: Vec<PathBuf>,
+}
+
+/// Re-copy a root's mismatched/missing files from a live source elsewhere
+/// in the catalog. A corrupt copy is never deleted first: the verified
+/// replacement lands via `.partial` and an atomic rename over it — if the
+/// repair fails at any point, the old bytes (however bad) are still there.
+/// Files whose content no live root holds are reported unrepairable.
+pub fn repair(
+    inv: &Inventory,
+    man: &mut RootManifest,
+    report: &VerifyReport,
+    mut on: impl FnMut(BackupEvent),
+) -> Result<RepairReport> {
+    if !man.root.kind.owned() {
+        bail!("refusing to repair inside a foreign store");
+    }
+    let mut out = RepairReport::default();
+    let broken: Vec<PathBuf> = report
+        .mismatched
+        .iter()
+        .chain(report.missing.iter())
+        .cloned()
+        .collect();
+    for rel in broken {
+        let Some(rec) = man.files.iter_mut().find(|f| f.rel_path == rel) else {
+            continue;
+        };
+        let Some(hash) = rec.sha256.clone() else {
+            out.unrepairable.push(rel);
+            continue;
+        };
+        let label = rec
+            .name
+            .clone()
+            .unwrap_or_else(|| rel.display().to_string());
+        // A live copy of the same content, anywhere but this root.
+        let source = inv
+            .models
+            .get(&format!("sha256:{hash}"))
+            .and_then(|entry| {
+                entry
+                    .locations
+                    .iter()
+                    .find(|l| l.root_id != man.root.id && inv.live_accessible(l))
+                    .and_then(|l| inv.root(&l.root_id).map(|r| r.path.join(&l.rel_path)))
+            });
+        let Some(src) = source else {
+            on(BackupEvent::Skipped {
+                label,
+                reason: "no live copy of this content anywhere else".into(),
+            });
+            out.unrepairable.push(rel);
+            continue;
+        };
+        let dest = man.root.path.join(&rel);
+        on(BackupEvent::FileStart {
+            label: label.clone(),
+            size: rec.size,
+        });
+        let started = std::time::Instant::now();
+        match copy_verified(&src, &dest, &hash, rec.size, &label, &mut on) {
+            Ok(fingerprint) => {
+                rec.fingerprint = Some(fingerprint);
+                rec.accessible = true;
+                rec.verified_unix = Some(manifest::now_unix());
+                out.repaired += 1;
+                on(BackupEvent::FileDone {
+                    label,
+                    secs: started.elapsed().as_secs_f32(),
+                });
+            }
+            Err(e) => {
+                out.unrepairable.push(rel);
+                on(BackupEvent::Failed {
+                    label,
+                    error: format!("{e:#}"),
+                });
+            }
+        }
+    }
+    man.generated_unix = manifest::now_unix();
+    Ok(out)
+}
+
 /// Re-hash every file a root's manifest records and compare against the
 /// stored identities. Updates `verified_unix` on matches. The caller
 /// persists the manifest.
@@ -459,6 +547,47 @@ mod tests {
         let bad = verify(&mut man, |_| {}).unwrap();
         assert_eq!(bad.ok, 0);
         assert_eq!(bad.mismatched, vec![PathBuf::from("Fam/model.gguf")]);
+    }
+
+    #[test]
+    fn repair_replaces_corrupt_backup_copies_from_a_live_source() {
+        let (_shelf, _spec, inv) = shelf_with_model();
+        let target = tempfile::tempdir().unwrap();
+        let tspec = target_spec(target.path());
+        let (mut man, _) = backup(&inv, &tspec, None, |_| {}).unwrap();
+
+        // Bit-rot the backup copy; verify flags it; repair heals it.
+        std::fs::write(target.path().join("Fam/model.gguf"), b"rotten").unwrap();
+        let bad = verify(&mut man, |_| {}).unwrap();
+        assert_eq!(bad.mismatched.len(), 1);
+        let rep = repair(&inv, &mut man, &bad, |_| {}).unwrap();
+        assert_eq!(rep.repaired, 1);
+        assert!(rep.unrepairable.is_empty());
+        let again = verify(&mut man, |_| {}).unwrap();
+        assert_eq!(again.ok, 1);
+        assert!(again.mismatched.is_empty());
+
+        // A missing file heals the same way.
+        std::fs::remove_file(target.path().join("Fam/model.gguf")).unwrap();
+        let gone = verify(&mut man, |_| {}).unwrap();
+        assert_eq!(gone.missing.len(), 1);
+        let rep2 = repair(&inv, &mut man, &gone, |_| {}).unwrap();
+        assert_eq!(rep2.repaired, 1);
+
+        // Content with no live source anywhere: reported, not silently lost.
+        man.files.push(FileRecord {
+            rel_path: "Fam/ghost.gguf".into(),
+            size: 5,
+            fingerprint: None,
+            sha256: Some("no-such-content".into()),
+            name: None,
+            meta: None,
+            accessible: true,
+            verified_unix: None,
+        });
+        let gone2 = verify(&mut man, |_| {}).unwrap();
+        let rep3 = repair(&inv, &mut man, &gone2, |_| {}).unwrap();
+        assert_eq!(rep3.unrepairable, vec![PathBuf::from("Fam/ghost.gguf")]);
     }
 
     #[test]
