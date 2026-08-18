@@ -23,7 +23,9 @@ warden scan              live view of every store (no writes)
 warden hash              update the catalog: rescan, hash new/changed
 warden status            roots, identity coverage, duplicates, backup state
 warden dups              hash-identical duplicates + reclaimable bytes
-warden doctor            store health: dangling refs, orphans, partial downloads
+warden doctor [--fix]    store health, each finding explained with a remedy;
+                         --fix runs the owning tool's own cleanup commands
+                         (hf cache rm, ollama rm) and clears download debris
 warden roots add|list    register drives/NAS by fs UUID (+ marker file)
 warden where <query>     locate by name, path, or sha256 prefix — incl. offline drives
 warden backup <path> [query…]  verified copy to a target drive; queries
@@ -51,7 +53,10 @@ detected and stolen.
 ## Safety model
 
 - **Never write inside a store another tool owns** (Ollama, HF cache):
-  those are scanned and reported, never touched.
+  scanned and reported; cleanup routes through the owning tool's own CLI,
+  run only on explicit request. Sole exception: `*.incomplete` download
+  debris, removed with an active-download guard. Orphan blobs (real bytes)
+  are always left to the human.
 - **Every copy is verified**: `.partial` temp name → source-read hash must
   match the catalog → destination read back and re-hashed → rename.
 - **The only reclaim is hardlinking** (same filesystem, owned roots only),

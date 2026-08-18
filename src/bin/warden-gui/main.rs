@@ -82,6 +82,7 @@ struct App {
     demote_key: Option<String>,
     demote_target: String,
     demote_remove: bool,
+    fix_confirm: Option<usize>,
     show_fetch: bool,
     fetch_repo: String,
     fetch_token: String,
@@ -115,6 +116,7 @@ impl App {
             demote_key: None,
             demote_target: String::new(),
             demote_remove: false,
+            fix_confirm: None,
             show_fetch: false,
             fetch_repo: String::new(),
             fetch_token: String::new(),
@@ -205,6 +207,30 @@ impl App {
             let n = findings.len();
             let _ = tx.send(Msg::Doctor(findings));
             let _ = tx.send(Msg::Finished(format!("doctor: {n} findings")));
+        });
+    }
+
+    fn spawn_fix(&mut self, remedy: modelwarden::core::doctor::Remedy, subject: String) {
+        self.spawn("cleaning up", move |tx| {
+            match modelwarden::core::doctor::apply(&remedy) {
+                Ok(msg) => {
+                    // Re-check so the Health pane shows the store as it is now.
+                    let cfg = settings::AppConfig::load(&settings::config_file());
+                    use modelwarden::core::scan;
+                    let ollama = if cfg.discover_stores {
+                        scan::default_ollama_stores()
+                    } else {
+                        Vec::new()
+                    };
+                    let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
+                    let findings = modelwarden::core::doctor::check(&ollama, hub.as_deref());
+                    let _ = tx.send(Msg::Doctor(findings));
+                    let _ = tx.send(Msg::Finished(format!("{subject}: {msg}")));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{subject}: {e:#}")));
+                }
+            }
         });
     }
 
@@ -766,6 +792,7 @@ impl App {
             }
         ));
         ui.separator();
+        let mut fix: Option<usize> = None;
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("health")
                 .striped(true)
@@ -775,9 +802,14 @@ impl App {
                     ui.strong("Repo / model");
                     ui.strong("Detail");
                     ui.strong("Size");
+                    ui.strong("Remedy");
                     ui.end_row();
-                    for f in findings {
-                        ui.label(f.kind.label());
+                    for (i, f) in findings.iter().enumerate() {
+                        ui.label(f.kind.label()).on_hover_text(format!(
+                            "{}\n\nFixing loses: {}",
+                            f.kind.explanation(),
+                            f.kind.loss()
+                        ));
                         ui.label(&f.subject);
                         ui.label(&f.detail);
                         ui.label(if f.bytes > 0 {
@@ -785,10 +817,61 @@ impl App {
                         } else {
                             String::new()
                         });
+                        if f.remedy.executable() {
+                            if ui
+                                .small_button("Clean up…")
+                                .on_hover_text(f.remedy.display())
+                                .clicked()
+                            {
+                                fix = Some(i);
+                            }
+                        } else {
+                            ui.monospace(f.remedy.display())
+                                .on_hover_text("No owner-tool command for this; run it yourself");
+                        }
                         ui.end_row();
                     }
                 });
         });
+        if fix.is_some() {
+            self.fix_confirm = fix;
+        }
+    }
+
+    fn fix_dialog(&mut self, ctx: &egui::Context) {
+        let Some(i) = self.fix_confirm else { return };
+        let Some(f) = self.findings.as_ref().and_then(|fs| fs.get(i)).cloned() else {
+            self.fix_confirm = None;
+            return;
+        };
+        let mut open = true;
+        let mut go = false;
+        egui::Window::new("Clean Up")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.strong(format!("{} — {}", f.kind.label(), f.subject));
+                ui.label(f.kind.explanation());
+                ui.add_space(4.0);
+                ui.label("Warden will run the owning tool's own command:");
+                ui.monospace(f.remedy.display());
+                ui.label(format!("This loses: {}.", f.kind.loss()));
+                ui.horizontal(|ui| {
+                    if ui.button("Run it").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        self.fix_confirm = None;
+                    }
+                });
+            });
+        if go {
+            self.fix_confirm = None;
+            self.spawn_fix(f.remedy.clone(), f.subject.clone());
+        } else if !open {
+            self.fix_confirm = None;
+        }
     }
 
     fn demote_dialog(&mut self, ctx: &egui::Context) {
@@ -1337,6 +1420,7 @@ impl eframe::App for App {
         self.demote_dialog(ui.ctx());
         self.reclaim_dialog(ui.ctx());
         self.fetch_dialog(ui.ctx());
+        self.fix_dialog(ui.ctx());
 
         if self.show_about {
             egui::Window::new("About")

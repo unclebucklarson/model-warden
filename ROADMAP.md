@@ -111,6 +111,18 @@ backed up, which are the same bytes — without ever losing bytes.**
   relink now canonicalizes the survivor; regression test proven to catch
   it; the damaged path was repaired in place. 53 tests green.
 
+- **M10** — doctor remedies + owner-mediated cleanup (user-requested).
+  Every finding now carries an explanation (what this is), a loss statement
+  (what fixing costs), and a remedy: an owner-tool command (`hf cache rm
+  <repo> -y`, `ollama rm <name:tag>`) that warden executes on explicit
+  request, `*.incomplete` debris warden removes itself (the one narrow
+  exception — guarded against active downloads and non-debris paths), or
+  the exact manual command for what must stay human (orphan blobs = real
+  bytes). CLI: `warden doctor --fix`; GUI: per-finding Clean up… button
+  with a confirm dialog showing the command, what it means, and what it
+  loses. Owner CLIs detected on PATH; manual fallbacks when absent.
+  56 tests green.
+
 ## Smaller items (fold in opportunistically)
 
 - `--json` output on every read command from the moment it exists (scan: done).

@@ -15,7 +15,12 @@ Commands (landing per ROADMAP.md milestone):
   hash [--json]     update manifests; compute missing SHA-256 identities
   status [--json]   manifest + identity summary
   dups [--json]     hash-identical duplicates and reclaimable bytes
-  doctor [--json]   store health: dangling refs, orphans, interrupted downloads
+  doctor [--fix] [--json]
+                    store health: dangling refs, orphans, interrupted
+                    downloads — each finding explained, with a remedy.
+                    --fix executes owner-tool remedies (hf cache rm,
+                    ollama rm) and removes *.incomplete debris; manual
+                    remedies are printed for you
   roots list [--json]              all roots incl. offline drives
   roots add <path> [--label X]     register a drive/NAS mount by fs UUID
   where <query> [--json]           locate a model across roots, incl. offline
@@ -55,7 +60,7 @@ fn main() -> ExitCode {
         Some("hash") => cmd_hash(json),
         Some("status") => cmd_status(json),
         Some("dups") => cmd_dups(json),
-        Some("doctor") => cmd_doctor(json),
+        Some("doctor") => cmd_doctor(&args, json),
         Some("roots") => cmd_roots(&args, json),
         Some("where") => cmd_where(&args, json),
         Some("backup") => cmd_backup(&args, json),
@@ -284,11 +289,15 @@ fn cmd_dups(json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_doctor(json: bool) -> ExitCode {
-    let findings = doctor::check(
-        &scan::default_ollama_stores(),
-        scan::default_hf_hub().as_deref(),
-    );
+fn cmd_doctor(args: &[String], json: bool) -> ExitCode {
+    let cfg = settings::AppConfig::load(&settings::config_file());
+    let ollama = if cfg.discover_stores {
+        scan::default_ollama_stores()
+    } else {
+        Vec::new()
+    };
+    let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
+    let findings = doctor::check(&ollama, hub.as_deref());
     if json {
         return print_json(&findings);
     }
@@ -296,29 +305,56 @@ fn cmd_doctor(json: bool) -> ExitCode {
         println!("all stores healthy");
         return ExitCode::SUCCESS;
     }
+    let fix = args.iter().any(|a| a == "--fix");
+    let mut manual = Vec::new();
+    let mut failed = 0usize;
     for f in &findings {
         println!(
-            "{:<24} {:<45} {}{}",
+            "{} — {}{}",
             f.kind.label(),
-            truncate(&f.subject, 45),
-            f.detail,
+            f.subject,
             if f.bytes > 0 {
                 format!("  ({})", human_size(f.bytes))
             } else {
                 String::new()
             }
         );
-    }
-    let waste: u64 = findings.iter().map(|f| f.bytes).sum();
-    println!(
-        "\n{} findings{}",
-        findings.len(),
-        if waste > 0 {
-            format!(", {} in orphaned/partial blobs", human_size(waste))
-        } else {
-            String::new()
+        println!("    what:  {}", f.kind.explanation());
+        println!("    where: {}", f.detail);
+        println!("    fix:   {}  — loses {}", f.remedy.display(), f.kind.loss());
+        if fix {
+            if f.remedy.executable() {
+                match doctor::apply(&f.remedy) {
+                    Ok(msg) => println!("    FIXED: {msg}"),
+                    Err(e) => {
+                        println!("    FAILED: {e:#}");
+                        failed += 1;
+                    }
+                }
+            } else {
+                manual.push(f);
+            }
         }
-    );
+        println!();
+    }
+    if fix {
+        if !manual.is_empty() {
+            println!("left for you (warden never deletes real bytes in foreign stores):");
+            for f in &manual {
+                println!("    {}", f.remedy.display());
+            }
+        }
+        println!("re-run `warden doctor` to confirm the stores are healthy");
+        if failed > 0 {
+            return ExitCode::FAILURE;
+        }
+    } else {
+        let executable = findings.iter().filter(|f| f.remedy.executable()).count();
+        println!(
+            "{} findings; `warden doctor --fix` can resolve {executable} via the owning tools",
+            findings.len()
+        );
+    }
     ExitCode::SUCCESS
 }
 
