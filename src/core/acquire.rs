@@ -122,6 +122,18 @@ pub fn split_set(all: &[RemoteFile], chosen: &str) -> Result<Vec<String>> {
 /// a 401 gets a diagnosis: close-match suggestions when the id looks
 /// mistyped, token guidance when it doesn't.
 pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
+    let json = repo_api_json(repo, token)?;
+    files_from_siblings(repo, &json, true)
+}
+
+/// Every file a repo offers — the listing behind whole-snapshot downloads
+/// of safetensors-style repos.
+pub fn list_all_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
+    let json = repo_api_json(repo, token)?;
+    files_from_siblings(repo, &json, false)
+}
+
+fn repo_api_json(repo: &str, token: Option<&str>) -> Result<serde_json::Value> {
     let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
     let resp = match with_auth(agent().get(&url), token).call() {
         Ok(r) => r,
@@ -141,7 +153,14 @@ pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
         }
         Err(e) => return Err(e).with_context(|| format!("querying {repo}")),
     };
-    let json: serde_json::Value = resp.into_json().context("parsing repo metadata")?;
+    resp.into_json().context("parsing repo metadata")
+}
+
+fn files_from_siblings(
+    repo: &str,
+    json: &serde_json::Value,
+    gguf_only: bool,
+) -> Result<Vec<RemoteFile>> {
     let Some(siblings) = json.get("siblings").and_then(|s| s.as_array()) else {
         bail!("{repo}: no file list in API response");
     };
@@ -150,7 +169,7 @@ pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
         let Some(name) = s.get("rfilename").and_then(|n| n.as_str()) else {
             continue;
         };
-        if name.to_lowercase().ends_with(".gguf") {
+        if !gguf_only || name.to_lowercase().ends_with(".gguf") {
             out.push(RemoteFile {
                 filename: name.to_string(),
                 size: s.get("size").and_then(|z| z.as_u64()),
@@ -158,6 +177,16 @@ pub fn list_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>> {
         }
     }
     Ok(out)
+}
+
+/// The whole-snapshot download set: every listed file except git
+/// housekeeping — any path with a dot-leading component, mirroring the
+/// scanner, which never catalogs dotfiles.
+pub fn snapshot_set(all: &[RemoteFile]) -> Vec<RemoteFile> {
+    all.iter()
+        .filter(|f| !f.filename.split('/').any(|c| c.starts_with('.')))
+        .cloned()
+        .collect()
 }
 
 /// Close matches for a repo id the API rejected — search scoped to the
@@ -201,6 +230,15 @@ pub fn dest_for(shelf_root: &Path, repo: &str, filename: &str) -> Result<PathBuf
     Ok(shelf_root.join(family).join(rel))
 }
 
+/// Temp name for an in-flight download, always `.partial`-suffixed so an
+/// interrupted transfer can never be scanned as a model.
+fn partial_path(dest: &Path) -> PathBuf {
+    match dest.extension() {
+        Some(e) => dest.with_extension(format!("{}.partial", e.to_string_lossy())),
+        None => dest.with_extension("partial"),
+    }
+}
+
 /// Download one file with Range resume. Returns (final path, provenance).
 pub fn fetch(
     repo: &str,
@@ -216,12 +254,7 @@ pub fn fetch(
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let tmp = dest.with_extension(format!(
-        "{}.partial",
-        dest.extension()
-            .map(|e| e.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "gguf".into())
-    ));
+    let tmp = partial_path(&dest);
     let mut resume_from = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
 
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
@@ -395,6 +428,58 @@ mod tests {
         // Five-digit discipline: near-misses are not splits.
         assert!(split_parts("model-001-of-003.gguf").is_none());
         assert!(split_parts("model-00001-of-00003.txt").is_none());
+    }
+
+    #[test]
+    fn sibling_listing_separates_gguf_from_snapshot_views() {
+        let json: serde_json::Value = serde_json::json!({
+            "siblings": [
+                {"rfilename": "model.safetensors", "size": 133},
+                {"rfilename": "config.json", "size": 7},
+                {"rfilename": "1_Pooling/config.json", "size": 3},
+                {"rfilename": ".gitattributes", "size": 1},
+                {"rfilename": "sub/model-Q4.gguf", "size": 99},
+            ]
+        });
+        let ggufs = files_from_siblings("org/repo", &json, true).unwrap();
+        assert_eq!(ggufs.len(), 1);
+        assert_eq!(ggufs[0].filename, "sub/model-Q4.gguf");
+
+        let all = files_from_siblings("org/repo", &json, false).unwrap();
+        assert_eq!(all.len(), 5, "the all-files view holds everything");
+
+        // Snapshot set: everything except dotfile paths.
+        let snap = snapshot_set(&all);
+        let names: Vec<_> = snap.iter().map(|f| f.filename.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "model.safetensors",
+                "config.json",
+                "1_Pooling/config.json",
+                "sub/model-Q4.gguf"
+            ]
+        );
+
+        // No siblings array at all is an error, not an empty repo.
+        assert!(files_from_siblings("org/repo", &serde_json::json!({}), false).is_err());
+    }
+
+    #[test]
+    fn partial_names_never_shadow_models() {
+        assert_eq!(
+            partial_path(Path::new("/s/r/model.gguf")),
+            PathBuf::from("/s/r/model.gguf.partial")
+        );
+        assert_eq!(
+            partial_path(Path::new("/s/r/config.json")),
+            PathBuf::from("/s/r/config.json.partial")
+        );
+        // Extension-less files get a plain .partial, not a fake .gguf.
+        assert_eq!(
+            partial_path(Path::new("/s/r/LICENSE")),
+            PathBuf::from("/s/r/LICENSE.partial")
+        );
     }
 
     #[test]

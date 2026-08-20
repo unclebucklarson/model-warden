@@ -54,6 +54,7 @@ had a fuzzy seam and got merged. This split survives only if the seam stays cris
 | Foreign-store cleanup (2026-08-17) | Warden never deletes real bytes in a foreign store itself. Doctor remedies route through the owning tool's own CLI (`hf cache rm`, `ollama rm`), executed only on explicit user action (`doctor --fix`, GUI Clean up button). One narrow exception: `*.incomplete` download debris — no owner command targets it, so warden may remove those files itself, refusing anything not named `*.incomplete` and anything modified recently (active-download guard). Orphan blobs (real unreferenced bytes) stay manual, always. |
 | Demotion refinement (2026-08-16) | A demote is a *verified move*: copy → read-back hash on cold storage → record in the drive's carried manifest → only then, and only with an explicit `--remove-source`, delete the shelf copy. Default keeps both. This is the one sanctioned deletion, because the bytes are provably preserved first. |
 | Beyond GGUF (2026-08-17, M12) | Non-GGUF weights (`.safetensors/.bin/.pt/.pth/.onnx`) are not self-contained: the model is the *directory* — weights plus tokenizer/config companions. One weights file makes its whole container (HF snapshot revision / shelf directory subtree) a cataloged bundle; every operation moves it whole. Applies to all roots. Weights metadata comes from the adjacent `config.json` (model_type, context window). Acquisition of non-GGUF repos deliberately deferred. |
+| Snapshot fetch (2026-08-20, M13) | Acquisition catches up with M12: `warden fetch --snapshot` (and the GUI's whole-snapshot button, offered automatically when a repo has no GGUFs) downloads a repo's entire snapshot into one shelf directory — dotfiles excluded, mirroring the scanner. GGUF repos keep the per-file/pattern flow; the snapshot is the unit only where the directory is the model. |
 | Milestone ordering | Spikes before building; downloads (acquisition) deliberately last, after inventory/dedup/backup/archival mature. |
 
 ## Architecture
@@ -155,13 +156,16 @@ in `docs/spikes.md`.
 
 ## Milestones
 
-> **Status 2026-08-17: all milestones complete** — M0–M7 as planned below,
+> **Status 2026-08-20: all milestones complete** — M0–M7 as planned below,
 > plus M8 (restore, split-GGUF + gated downloads, write lock), M8.1 (HF
 > token management, 401 did-you-mean), M9 (bundles — every operation moves
 > everything a model needs to run; selective backup; native folder pickers),
-> and M10 (doctor remedies: owner-mediated cleanup via `hf cache rm` /
-> `ollama rm`, full explanations + loss statements per finding). Details
-> and per-milestone results in ROADMAP.md.
+> M10 (doctor remedies: owner-mediated cleanup via `hf cache rm` /
+> `ollama rm`, full explanations + loss statements per finding), M11
+> (scrub timer, verify --repair, provenance surfaced), M12 (safetensors
+> model directories as whole-container bundles), and M13 (whole-snapshot
+> fetch for non-GGUF repos). Details and per-milestone results in
+> ROADMAP.md.
 
 - **M0 — plan + scaffold + spikes.** This document, CLAUDE.md, ROADMAP.md, a
   compiling scaffold (both bins runnable), and the four spikes run with verdicts

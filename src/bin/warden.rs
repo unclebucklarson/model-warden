@@ -52,6 +52,10 @@ Commands (landing per ROADMAP.md milestone):
                                    split parts fetched together, provenance
                                    recorded. Token: --token, $HF_TOKEN, or
                                    the hf CLI's saved login
+  fetch <org/repo> --snapshot      download the repo's whole snapshot —
+                                   for safetensors-style repos, where the
+                                   directory is the model (weights,
+                                   tokenizer, configs, subdirs together)
 ";
 
 fn main() -> ExitCode {
@@ -791,6 +795,11 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
         }
     }
     let token = acquire::resolve_token(cli_token, &cfg_for_token);
+    let snapshot = args.iter().any(|a| a == "--snapshot");
+
+    if snapshot {
+        return cmd_fetch_snapshot(repo, token.as_deref());
+    }
 
     let files = match acquire::list_files(repo, token.as_deref()) {
         Ok(f) => f,
@@ -800,8 +809,36 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
         }
     };
     if files.is_empty() {
-        eprintln!("warden: {repo} offers no GGUF files");
-        return ExitCode::from(1);
+        // Not a GGUF repo — show what IS there and point at snapshot mode.
+        let all = match acquire::list_all_files(repo, token.as_deref()) {
+            Ok(f) => acquire::snapshot_set(&f),
+            Err(e) => {
+                eprintln!("warden: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        };
+        if all.is_empty() {
+            eprintln!("warden: {repo} offers no files");
+            return ExitCode::from(1);
+        }
+        if json {
+            return print_json(&all);
+        }
+        for f in &all {
+            println!(
+                "{:>10}  {}",
+                f.size.map(human_size).unwrap_or_default(),
+                f.filename
+            );
+        }
+        let total: u64 = all.iter().filter_map(|f| f.size).sum();
+        println!(
+            "\nno GGUFs — {} files, {} total. `warden fetch {repo} --snapshot` \
+             downloads the whole snapshot (the directory is the model).",
+            all.len(),
+            human_size(total)
+        );
+        return ExitCode::SUCCESS;
     }
     let matches: Vec<_> = match pattern {
         Some(p) => {
@@ -860,6 +897,42 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     };
 
+    if parts.len() > 1 {
+        eprintln!("split model: {} parts", parts.len());
+    }
+    download_files(repo, &parts, token.as_deref())
+}
+
+/// Whole-snapshot download: every non-dotfile the repo lists, into one
+/// shelf directory — the M12 rule (weights make the directory the model)
+/// applied to acquisition.
+fn cmd_fetch_snapshot(repo: &str, token: Option<&str>) -> ExitCode {
+    use modelwarden::core::acquire;
+    let files = match acquire::list_all_files(repo, token) {
+        Ok(f) => acquire::snapshot_set(&f),
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if files.is_empty() {
+        eprintln!("warden: {repo} offers no files");
+        return ExitCode::from(1);
+    }
+    let total: u64 = files.iter().filter_map(|f| f.size).sum();
+    eprintln!(
+        "snapshot: {} files, {} total",
+        files.len(),
+        human_size(total)
+    );
+    let names: Vec<String> = files.into_iter().map(|f| f.filename).collect();
+    download_files(repo, &names, token)
+}
+
+/// The shared download leg: shelf + write lock, then each file streamed,
+/// hashed, and its provenance recorded; already-present files skipped.
+fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode {
+    use modelwarden::core::acquire;
     let cfg = settings::AppConfig::load(&settings::config_file());
     let Some(shelf_root) = cfg.scan_dirs.first().cloned() else {
         eprintln!("warden: no shelf configured (scan_dirs is empty)");
@@ -870,11 +943,8 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
         Ok(l) => l,
         Err(code) => return code,
     };
-    if parts.len() > 1 {
-        eprintln!("split model: {} parts", parts.len());
-    }
     let mut failed = false;
-    for filename in &parts {
+    for filename in parts {
         match acquire::dest_for(&shelf_root, repo, filename) {
             Ok(dest) if dest.exists() => {
                 eprintln!("  {filename}: already present, skipping");
@@ -887,7 +957,7 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
             }
             Ok(_) => {}
         }
-        let result = acquire::fetch(repo, filename, &shelf_root, token.as_deref(), |ev| match ev {
+        let result = acquire::fetch(repo, filename, &shelf_root, token, |ev| match ev {
             acquire::FetchEvent::Start {
                 label,
                 total,

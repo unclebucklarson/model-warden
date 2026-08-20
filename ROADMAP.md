@@ -152,6 +152,19 @@ backed up, which are the same bytes — without ever losing bytes.**
   round-trip backup → demote --remove-source → restore, layout intact,
   proven. 63 tests green.
 
+- **M13** — snapshot fetch (closes M12's deferred acquisition gap). `warden
+  fetch <org/repo> --snapshot` downloads a repo's whole snapshot into one
+  shelf directory — the M12 rule (weights make the directory the model)
+  applied to acquisition: all files land together, dotfiles excluded
+  (mirroring the scanner), each streamed via .partial + Range resume, hashed,
+  provenance recorded. A GGUF-less repo now lists its files with sizes, a
+  total, and the --snapshot hint instead of erroring; the GUI's HF dialog
+  detects the same case and offers one "Download whole snapshot (N files,
+  size)" button in place of per-file downloads. Extension-less files (LICENSE)
+  now get a plain `.partial`, not a fake `.gguf.partial`. Proven live:
+  prajjwal1/bert-tiny (4 files) fetched, cataloged whole, and a selective
+  backup of just the weights pulled the entire bundle. 65 tests green.
+
 ## Next candidates (pick up here)
 
 1. **llamacppCodeConf reads `inventory.json`** — the schema-v1 payoff; work
@@ -178,5 +191,3 @@ manages storage; warden never serves or edits configs. Keep the seam crisp.
 - Scheduled scrub: periodic re-verify of backups by hash (manual `warden
   verify` lands in M4).
 - Model-family grouping heuristics beyond name prefixes (use GGUF metadata).
-- `warden fetch` for non-GGUF repos (pull a whole snapshot); deferred by
-  the M12 scope decision.

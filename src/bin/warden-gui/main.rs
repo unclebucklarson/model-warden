@@ -35,6 +35,8 @@ enum Msg {
     /// Replaces the busy label's detail line (hash/copy progress).
     Progress(String),
     RemoteFiles(Vec<modelwarden::core::acquire::RemoteFile>),
+    /// A GGUF-less repo: the whole-snapshot listing (dotfiles excluded).
+    RemoteSnapshot(Vec<modelwarden::core::acquire::RemoteFile>),
     Refreshed(manifest::Inventory),
     Doctor(Vec<Finding>),
     Finished(String),
@@ -89,6 +91,9 @@ struct App {
     fetch_token: String,
     fetch_token_remember: bool,
     fetch_files: Option<Vec<modelwarden::core::acquire::RemoteFile>>,
+    /// True when `fetch_files` is a whole-snapshot listing (no GGUFs) —
+    /// the download unit is then the entire directory, never one file.
+    fetch_snapshot: bool,
 }
 
 impl App {
@@ -124,6 +129,7 @@ impl App {
             fetch_token: String::new(),
             fetch_token_remember: false,
             fetch_files: None,
+            fetch_snapshot: false,
         };
         if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
             app.set_inventory(inv);
@@ -455,7 +461,14 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Progress(line) => self.progress = Some(line),
-                Msg::RemoteFiles(files) => self.fetch_files = Some(files),
+                Msg::RemoteFiles(files) => {
+                    self.fetch_files = Some(files);
+                    self.fetch_snapshot = false;
+                }
+                Msg::RemoteSnapshot(files) => {
+                    self.fetch_files = Some(files);
+                    self.fetch_snapshot = true;
+                }
                 Msg::Refreshed(inv) => self.set_inventory(inv),
                 Msg::Doctor(findings) => {
                     self.findings = Some(findings);
@@ -970,7 +983,25 @@ impl App {
         self.spawn("listing repo files", move |tx| {
             let cfg = settings::AppConfig::load(&settings::config_file());
             let token = modelwarden::core::acquire::resolve_token(explicit_token, &cfg);
-            match modelwarden::core::acquire::list_files(&repo, token.as_deref()) {
+            use modelwarden::core::acquire;
+            match acquire::list_files(&repo, token.as_deref()) {
+                Ok(files) if files.is_empty() => {
+                    // No GGUFs — a safetensors-style repo. List the whole
+                    // snapshot instead: the directory is the model.
+                    match acquire::list_all_files(&repo, token.as_deref()) {
+                        Ok(all) => {
+                            let snap = acquire::snapshot_set(&all);
+                            let n = snap.len();
+                            let _ = tx.send(Msg::RemoteSnapshot(snap));
+                            let _ = tx.send(Msg::Finished(format!(
+                                "{repo}: no GGUFs — {n} files, downloads as a whole snapshot"
+                            )));
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Msg::Error(format!("{e:#}")));
+                        }
+                    }
+                }
                 Ok(files) => {
                     let n = files.len();
                     let _ = tx.send(Msg::RemoteFiles(files));
@@ -1065,6 +1096,7 @@ impl App {
         let mut open = self.show_fetch;
         let mut list: Option<String> = None;
         let mut download: Option<(String, String)> = None;
+        let mut download_snapshot: Option<String> = None;
         egui::Window::new("Download from HuggingFace")
             .collapsible(false)
             .open(&mut open)
@@ -1095,10 +1127,27 @@ impl App {
                 });
                 if let Some(files) = &self.fetch_files {
                     ui.separator();
+                    if self.fetch_snapshot {
+                        let total: u64 = files.iter().filter_map(|f| f.size).sum();
+                        ui.label(
+                            "No GGUFs here — this repo downloads as a whole snapshot: \
+                             the directory is the model (weights, tokenizer, configs).",
+                        );
+                        if ui
+                            .button(format!(
+                                "Download whole snapshot ({} files, {})",
+                                files.len(),
+                                human_size(total)
+                            ))
+                            .clicked()
+                        {
+                            download_snapshot = Some(self.fetch_repo.trim().to_string());
+                        }
+                    }
                     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                         for f in files {
                             ui.horizontal(|ui| {
-                                if ui.small_button("Download").clicked() {
+                                if !self.fetch_snapshot && ui.small_button("Download").clicked() {
                                     download = Some((
                                         self.fetch_repo.trim().to_string(),
                                         f.filename.clone(),
@@ -1131,7 +1180,23 @@ impl App {
         }
         if let Some(repo) = list {
             self.fetch_files = None;
+            self.fetch_snapshot = false;
             self.spawn_list_remote(repo, explicit_token.clone());
+        }
+        if let Some(repo) = download_snapshot {
+            let parts: Vec<String> = self
+                .fetch_files
+                .as_deref()
+                .unwrap_or_default()
+                .iter()
+                .map(|f| f.filename.clone())
+                .collect();
+            if !parts.is_empty() {
+                self.activity
+                    .push(format!("snapshot: {} files", parts.len()));
+                self.spawn_fetch(repo, parts, explicit_token.clone());
+                open = false;
+            }
         }
         if let Some((repo, filename)) = download {
             let parts = self

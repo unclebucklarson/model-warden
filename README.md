@@ -49,6 +49,10 @@ warden fetch <org/repo> [pattern] [--token T]
                          [--save-token], the GUI token field, config
                          hf_token, $HF_TOKEN, or the hf CLI's saved login.
                          Wrong repo ids get did-you-mean suggestions
+warden fetch <org/repo> --snapshot
+                         whole-snapshot download for safetensors-style
+                         repos (no GGUFs): every file lands together in
+                         one shelf directory — the directory is the model
 ```
 
 Write operations take a single-instance lock (`state/warden.lock`) so two
