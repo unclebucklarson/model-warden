@@ -69,3 +69,8 @@ Non-obvious constraints that shape the code:
   so the harvested GUI shell compiles unchanged.
 - Boundary contract with llamacppCodeConf is in PLAN.md — the seam must stay
   crisp; neither tool reaches across.
+- **The inventory.json integration (ROADMAP next-candidate #1) is owned by
+  the Claude instance working in `~/src2/llamacppCodeConf`** — it will pick
+  the work up after its in-flight updates land. Do NOT start that
+  integration from this repo; warden's side of the contract
+  (docs/inventory-schema.md, schema v1) is published and frozen.
