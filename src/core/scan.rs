@@ -20,6 +20,48 @@ use crate::core::gguf::{self, GgufMeta};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
+/// Weight-file formats beyond GGUF. Unlike a GGUF, these are not
+/// self-contained: the model is the *directory* — weights plus tokenizer/
+/// config companions — so one weights file makes its whole container a
+/// cataloged bundle (M12 decision).
+const WEIGHT_EXTS: [&str; 5] = ["safetensors", "bin", "pt", "pth", "onnx"];
+
+pub fn is_weights_filename(name: &str) -> bool {
+    name.rsplit_once('.')
+        .is_some_and(|(_, ext)| WEIGHT_EXTS.iter().any(|w| ext.eq_ignore_ascii_case(w)))
+}
+
+fn is_weights(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|f| is_weights_filename(&f.to_string_lossy()))
+}
+
+fn is_gguf(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
+}
+
+/// Best-effort metadata for a weights file from the `config.json` beside it
+/// (transformers convention): model_type → architecture, context window.
+fn weights_meta(weights: &Path) -> Option<GgufMeta> {
+    let config = weights.parent()?.join("config.json");
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(config).ok()?).ok()?;
+    let mut meta = GgufMeta::default();
+    meta.architecture = json
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    meta.name = json
+        .get("_name_or_path")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    meta.context_length = json
+        .get("max_position_embeddings")
+        .and_then(|v| v.as_u64());
+    (meta != GgufMeta::default()).then_some(meta)
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Source {
@@ -111,15 +153,56 @@ pub fn hf_hub_models(hub: &Path) -> Vec<ModelFile> {
             continue;
         };
         for rev in revs.flatten() {
-            walk_snapshot(&rev.path(), 0, &repo, &mut out);
+            // Two passes per revision: GGUFs are always cataloged; when the
+            // snapshot holds a non-GGUF weights file, the WHOLE snapshot is
+            // the model — every companion (tokenizer, configs) is cataloged
+            // so the bundle stays runnable.
+            let mut ggufs = Vec::new();
+            let mut others = Vec::new();
+            let mut has_weights = false;
+            collect_snapshot(&rev.path(), 0, &mut ggufs, &mut others, &mut has_weights);
+            for path in ggufs {
+                out.push(hf_entry(&path, &repo, gguf::read_meta(&path).ok()));
+            }
+            if has_weights {
+                for path in others {
+                    let meta = is_weights(&path).then(|| weights_meta(&path)).flatten();
+                    out.push(hf_entry(&path, &repo, meta));
+                }
+            }
         }
     }
     out
 }
 
-/// Collect `*.gguf` under one snapshot revision, a few levels deep
-/// (split-quant repos use `<quant>/<file>.gguf` subfolders).
-fn walk_snapshot(dir: &Path, depth: usize, repo: &str, out: &mut Vec<ModelFile>) {
+fn hf_entry(path: &Path, repo: &str, meta: Option<GgufMeta>) -> ModelFile {
+    // Snapshot entries are usually symlinks into blobs/; metadata() follows
+    // them, so it fails when the blob has been pruned even though the
+    // symlink is still there. That file is listed as inaccessible, not
+    // skipped.
+    let accessible = std::fs::metadata(path).is_ok();
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    ModelFile {
+        meta,
+        path: path.to_path_buf(),
+        file_size,
+        source: Source::HfHub {
+            repo: repo.to_string(),
+        },
+        accessible,
+    }
+}
+
+/// Walk one snapshot revision a few levels deep (split-quant repos use
+/// `<quant>/<file>.gguf` subfolders; safetensors repos keep companions in
+/// subfolders like `1_Pooling/`).
+fn collect_snapshot(
+    dir: &Path,
+    depth: usize,
+    ggufs: &mut Vec<PathBuf>,
+    others: &mut Vec<PathBuf>,
+    has_weights: &mut bool,
+) {
     if depth > 3 {
         return;
     }
@@ -129,26 +212,14 @@ fn walk_snapshot(dir: &Path, depth: usize, repo: &str, out: &mut Vec<ModelFile>)
     for f in entries.flatten() {
         let path = f.path();
         if path.is_dir() {
-            walk_snapshot(&path, depth + 1, repo, out);
-        } else if path
-            .extension()
-            .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
-        {
-            // Snapshot entries are usually symlinks into blobs/; metadata()
-            // follows them, so it fails when the blob has been pruned even
-            // though the symlink is still there. That file is listed as
-            // inaccessible, not skipped.
-            let accessible = std::fs::metadata(&path).is_ok();
-            let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            out.push(ModelFile {
-                meta: gguf::read_meta(&path).ok(),
-                path,
-                file_size,
-                source: Source::HfHub {
-                    repo: repo.to_string(),
-                },
-                accessible,
-            });
+            collect_snapshot(&path, depth + 1, ggufs, others, has_weights);
+        } else if is_gguf(&path) {
+            ggufs.push(path);
+        } else {
+            if is_weights(&path) {
+                *has_weights = true;
+            }
+            others.push(path);
         }
     }
 }
@@ -207,9 +278,45 @@ pub fn shelf_models(dir: &Path) -> Vec<ModelFile> {
     out
 }
 
-/// Depth-limited recursive walk collecting `*.gguf`. The shelf layout here
-/// is `~/models/<ModelName>/<file>.gguf`, so a few levels is plenty.
+/// Depth-limited recursive walk. GGUFs are collected wherever they are; a
+/// directory that directly holds a non-GGUF weights file IS a model — its
+/// whole subtree is cataloged (weights + tokenizer/config companions) so
+/// the bundle stays runnable.
 fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let entries: Vec<_> = entries.flatten().collect();
+    if entries.iter().any(|e| {
+        let p = e.path();
+        p.is_file() && is_weights(&p)
+    }) {
+        emit_dir_as_model(dir, 0, out);
+        return;
+    }
+    for e in entries {
+        let path = e.path();
+        if path.is_dir() {
+            walk_gguf(&path, depth + 1, out);
+        } else if is_gguf(&path) {
+            let file_size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            out.push(ModelFile {
+                meta: gguf::read_meta(&path).ok(),
+                path,
+                file_size,
+                source: Source::Shelf,
+                accessible: true,
+            });
+        }
+    }
+}
+
+/// Every file under a weights-model directory, skipping warden's own
+/// metadata and dotfiles.
+fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
     if depth > 3 {
         return;
     }
@@ -218,15 +325,23 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
     };
     for e in entries.flatten() {
         let path = e.path();
+        let name = e.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
-            walk_gguf(&path, depth + 1, out);
-        } else if path
-            .extension()
-            .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
-        {
+            emit_dir_as_model(&path, depth + 1, out);
+        } else if path.is_file() {
+            let meta = if is_gguf(&path) {
+                gguf::read_meta(&path).ok()
+            } else if is_weights(&path) {
+                weights_meta(&path)
+            } else {
+                None
+            };
             let file_size = e.metadata().map(|m| m.len()).unwrap_or(0);
             out.push(ModelFile {
-                meta: gguf::read_meta(&path).ok(),
+                meta,
                 path,
                 file_size,
                 source: Source::Shelf,
@@ -513,6 +628,69 @@ mod tests {
         assert_eq!(models.len(), 1, "pruned ≠ invisible");
         assert!(!models[0].accessible);
         assert!(models[0].meta.is_none());
+    }
+
+    #[test]
+    fn a_safetensors_snapshot_is_cataloged_whole() {
+        let hub = tempfile::tempdir().unwrap();
+        let snap = hub.path().join("models--org--Embed/snapshots/rev1");
+        std::fs::create_dir_all(snap.join("1_Pooling")).unwrap();
+        std::fs::write(snap.join("model.safetensors"), b"weights").unwrap();
+        std::fs::write(
+            snap.join("config.json"),
+            r#"{"model_type":"bert","max_position_embeddings":512}"#,
+        )
+        .unwrap();
+        std::fs::write(snap.join("tokenizer.json"), b"tok").unwrap();
+        std::fs::write(snap.join("1_Pooling/config.json"), b"{}").unwrap();
+
+        let models = hf_hub_models(hub.path());
+        assert_eq!(models.len(), 4, "weights + every companion: {models:?}");
+        let weights = models
+            .iter()
+            .find(|m| m.path.ends_with("model.safetensors"))
+            .unwrap();
+        let meta = weights.meta.as_ref().expect("config.json meta");
+        assert_eq!(meta.architecture.as_deref(), Some("bert"));
+        assert_eq!(meta.context_length, Some(512));
+    }
+
+    #[test]
+    fn gguf_only_snapshots_do_not_drag_in_readmes() {
+        let hub = tempfile::tempdir().unwrap();
+        let snap = hub.path().join("models--org--Quant/snapshots/rev1");
+        std::fs::create_dir_all(&snap).unwrap();
+        std::fs::write(snap.join("m.gguf"), synthetic_gguf("llama", 1024, 15)).unwrap();
+        std::fs::write(snap.join("README.md"), b"docs").unwrap();
+        let models = hf_hub_models(hub.path());
+        assert_eq!(models.len(), 1, "no weights file → companions stay out");
+    }
+
+    #[test]
+    fn a_shelf_dir_with_weights_is_a_whole_model() {
+        let shelf = shelf_with(&[
+            ("Embedder/model.safetensors", b"weights" as &[u8]),
+            ("Embedder/tokenizer.json", b"tok"),
+            ("Embedder/sub/extra.json", b"{}"),
+            ("Embedder/.hidden", b"x"),
+            ("Plain/only.txt", b"not a model dir"),
+        ]);
+        let models = scan(&[shelf.path().to_path_buf()], &[], None);
+        let names: Vec<String> = models
+            .iter()
+            .map(|m| m.path.strip_prefix(shelf.path()).unwrap().display().to_string())
+            .collect();
+        assert!(names.contains(&"Embedder/model.safetensors".to_string()));
+        assert!(names.contains(&"Embedder/tokenizer.json".to_string()));
+        assert!(names.contains(&"Embedder/sub/extra.json".to_string()));
+        assert!(
+            !names.iter().any(|n| n.contains(".hidden")),
+            "dotfiles stay out"
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("only.txt")),
+            "a dir without weights is not a model: {names:?}"
+        );
     }
 
     #[test]

@@ -179,12 +179,16 @@ fn dest_layout(entry: &ModelEntry, loc: &Location) -> PathBuf {
                 .next()
                 .unwrap_or("model")
                 .to_string();
-            let file = loc
-                .rel_path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "model.gguf".into());
-            PathBuf::from(family).join(file)
+            // Keep the path relative to the snapshot revision (skip
+            // models--x/snapshots/<rev>) — flattening to the filename would
+            // collide when a bundle holds e.g. config.json in two subdirs.
+            let sub: PathBuf = loc.rel_path.components().skip(3).collect();
+            let sub = if sub.as_os_str().is_empty() {
+                PathBuf::from("model.gguf")
+            } else {
+                sub
+            };
+            PathBuf::from(family).join(sub)
         }
     }
 }
@@ -648,6 +652,40 @@ mod tests {
         assert!(
             !target.path().join("Other/unrelated.gguf").exists(),
             "selection stays a selection"
+        );
+    }
+
+    #[test]
+    fn hf_bundles_keep_their_snapshot_layout_on_the_target() {
+        use crate::core::manifest::{build_root_manifest, merge};
+        let hub = tempfile::tempdir().unwrap();
+        let snap = hub.path().join("models--org--Embed/snapshots/rev1");
+        std::fs::create_dir_all(snap.join("1_Pooling")).unwrap();
+        std::fs::write(snap.join("model.safetensors"), b"weights").unwrap();
+        std::fs::write(snap.join("config.json"), b"{}").unwrap();
+        std::fs::write(snap.join("1_Pooling/config.json"), b"{-}").unwrap();
+        let spec = RootSpec {
+            id: "hf-test".into(),
+            kind: RootKind::HfHub,
+            path: hub.path().to_path_buf(),
+            label: None,
+        };
+        let mut man = build_root_manifest(&spec, None);
+        for f in &mut man.files {
+            f.sha256 = Some(
+                identity::sha256_file(&spec.path.join(&f.rel_path), |_, _| {}).unwrap(),
+            );
+        }
+        let inv = merge(&[man]);
+        let target = tempfile::tempdir().unwrap();
+        let (_, report) = backup(&inv, &target_spec(target.path()), None, |_| {}).unwrap();
+        assert_eq!(report.copied, 3);
+        assert_eq!(report.failed, 0, "the two config.json must not collide");
+        assert!(target.path().join("Embed/model.safetensors").is_file());
+        assert!(target.path().join("Embed/config.json").is_file());
+        assert!(
+            target.path().join("Embed/1_Pooling/config.json").is_file(),
+            "subdir layout preserved"
         );
     }
 

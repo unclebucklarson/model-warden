@@ -422,14 +422,25 @@ pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
                 let my_split =
                     crate::core::acquire::split_parts(&fname).map(|(p, _, c)| (p.to_string(), c));
                 let i_am_projector = fname.to_lowercase().contains("mmproj");
+                // A non-GGUF weights file isn't self-contained: the model is
+                // the whole container (tokenizer, configs, everything).
+                let i_am_weights = crate::core::scan::is_weights_filename(&fname);
                 for (k2, e2) in &inv.models {
                     if k2 == key {
                         continue;
                     }
                     let companion = e2.locations.iter().any(|l2| {
-                        if l2.root_id != loc.root_id
-                            || container_of(l2.kind, &l2.rel_path) != container
-                        {
+                        if l2.root_id != loc.root_id {
+                            return false;
+                        }
+                        // Weights make the whole subtree the model — the
+                        // same rule the shelf scanner applies — so subdir
+                        // companions (1_Pooling/config.json) come too.
+                        if i_am_weights {
+                            return !container.as_os_str().is_empty()
+                                && l2.rel_path.starts_with(&container);
+                        }
+                        if container_of(l2.kind, &l2.rel_path) != container {
                             return false;
                         }
                         let f2 = file_name_of(&l2.rel_path);
@@ -832,6 +843,55 @@ mod tests {
             bundle_for(&inv, "sha256:oproj"),
             vec!["sha256:omodel", "sha256:oproj"]
         );
+    }
+
+    #[test]
+    fn a_weights_file_bundles_its_whole_container() {
+        let loc = |rel: &str| Location {
+            root_id: "hf".into(),
+            kind: RootKind::HfHub,
+            rel_path: rel.into(),
+            accessible: true,
+            dev: 1,
+            ino: 1,
+        };
+        let entry = |locs: Vec<Location>| ModelEntry {
+            size: 1,
+            display_name: "org/Embed".into(),
+            meta: None,
+            locations: locs,
+        };
+        let mut models = BTreeMap::new();
+        models.insert(
+            "sha256:weights".to_string(),
+            entry(vec![loc("models--org--Embed/snapshots/rev1/model.safetensors")]),
+        );
+        models.insert(
+            "sha256:tok".to_string(),
+            entry(vec![loc("models--org--Embed/snapshots/rev1/tokenizer.json")]),
+        );
+        models.insert(
+            "sha256:pool".to_string(),
+            entry(vec![loc("models--org--Embed/snapshots/rev1/1_Pooling/config.json")]),
+        );
+        // Another repo entirely: not part of the bundle.
+        models.insert(
+            "sha256:other".to_string(),
+            entry(vec![loc("models--org--Other/snapshots/rev9/model.safetensors")]),
+        );
+        let inv = Inventory {
+            schema_version: SCHEMA_VERSION,
+            generated_unix: 0,
+            roots: vec![],
+            models,
+        };
+        assert_eq!(
+            bundle_for(&inv, "sha256:weights"),
+            vec!["sha256:pool", "sha256:tok", "sha256:weights"],
+            "weights pull the whole snapshot, subdirs included"
+        );
+        // A companion alone stays alone (asymmetric, like mmproj).
+        assert_eq!(bundle_for(&inv, "sha256:tok"), vec!["sha256:tok"]);
     }
 
     #[test]

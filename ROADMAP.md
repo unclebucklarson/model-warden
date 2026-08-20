@@ -138,6 +138,20 @@ backed up, which are the same bytes — without ever losing bytes.**
   end-to-end: corrupt → verify exit 1 → --repair → verify exit 0.
   58 tests green.
 
+- **M12** — beyond GGUF (user decision: whole model dirs, all roots, fetch
+  later). A weights file (`.safetensors/.bin/.pt/.pth/.onnx`) makes its
+  whole container a model: HF snapshots with weights are cataloged whole
+  (tokenizer/configs included, subdirs too); a shelf/drive directory holding
+  weights is cataloged as one subtree. bundle_for: a weights file bundles
+  everything under its container (matching the scanner's rule; companions
+  alone stay alone, like mmproj). Backup/promote now preserve snapshot
+  subpaths (two config.json in different subdirs no longer collide).
+  Weights meta from the adjacent config.json (model_type → architecture,
+  context window). GGUF-only snapshots don't drag READMEs in. Real machine:
+  unsloth/bge-small-en-v1.5 (127 MiB + 10 companions) cataloged; E2E
+  round-trip backup → demote --remove-source → restore, layout intact,
+  proven. 63 tests green.
+
 ## Next candidates (pick up here)
 
 1. **llamacppCodeConf reads `inventory.json`** — the schema-v1 payoff; work
@@ -164,6 +178,5 @@ manages storage; warden never serves or edits configs. Keep the seam crisp.
 - Scheduled scrub: periodic re-verify of backups by hash (manual `warden
   verify` lands in M4).
 - Model-family grouping heuristics beyond name prefixes (use GGUF metadata).
-- Non-GGUF model files (safetensors in the HF cache, etc.): the hub cache
-  holds them too. Inventory/backup could cover any large file; needs a scope
-  decision from the user before widening past GGUF.
+- `warden fetch` for non-GGUF repos (pull a whole snapshot); deferred by
+  the M12 scope decision.

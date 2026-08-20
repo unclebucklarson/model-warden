@@ -1,7 +1,7 @@
 # modelwarden
 
-**Inventory, backup, and archival for local LLM model files.** The owner of
-200GB+ of GGUFs — scattered across Ollama's blob store, the HuggingFace hub
+**Inventory, backup, and archival for local LLM model files** — GGUFs and
+safetensors-style model directories alike. The owner of 200GB+ of models — scattered across Ollama's blob store, the HuggingFace hub
 cache, shelf directories, NAS mounts, and removable drives — can always
 answer: *what do I have, where is it, is it reachable, is it backed up, and
 which of these are the same bytes?* And nothing warden does can lose bytes.

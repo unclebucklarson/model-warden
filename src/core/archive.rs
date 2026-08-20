@@ -52,19 +52,25 @@ pub fn promote(
             // Ollama blobs are extensionless; give the shelf copy a name.
             (safe.clone(), format!("{safe}.gguf"))
         }
-        RootKind::HfHub => (
-            entry
-                .display_name
-                .rsplit('/')
-                .next()
-                .unwrap_or("model")
-                .to_string(),
-            src_loc
-                .rel_path
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "model.gguf".into()),
-        ),
+        RootKind::HfHub => {
+            // Path relative to the snapshot revision, so companions in
+            // subfolders (1_Pooling/config.json) don't collide on promote.
+            let sub: std::path::PathBuf =
+                src_loc.rel_path.components().skip(3).collect();
+            (
+                entry
+                    .display_name
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("model")
+                    .to_string(),
+                if sub.as_os_str().is_empty() {
+                    "model.gguf".to_string()
+                } else {
+                    sub.display().to_string()
+                },
+            )
+        }
         RootKind::Shelf | RootKind::Removable => unreachable!("guarded above"),
     };
     let dir = shelf_root.join(subdir);

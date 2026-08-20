@@ -61,6 +61,11 @@ Semantics consumers must honor:
 - **`pending:`/`unknown:` keys are transitional** — a later `warden hash`
   resolves them into `sha256:` keys.
 
+Since M12 the catalog also holds non-GGUF model files (safetensors weights
+and their tokenizer/config companions). Consumers must not assume every
+entry is a `.gguf`; filter by file extension of `rel_path` if only GGUFs are
+wanted. Shape and version are unchanged.
+
 Per-root manifests (`~/.local/state/modelwarden/roots/*.json` and
 `<drive>/.modelwarden/manifest.json`) share the version number but are
 warden-internal; consumers should read only the merged inventory.
