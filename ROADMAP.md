@@ -165,16 +165,32 @@ backed up, which are the same bytes — without ever losing bytes.**
   prajjwal1/bert-tiny (4 files) fetched, cataloged whole, and a selective
   backup of just the weights pulled the entire bundle. 65 tests green.
 
-## Next candidates (pick up here)
+## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e)
 
-1. **llamacppCodeConf reads `inventory.json`** — the schema-v1 payoff; work
-   happens in the sibling repo (`~/src2/llamacppCodeConf`), not here. The
-   serving tool gets storage truth (incl. offline-drive locations) without
-   scanning anything itself. **Best done as a session in that repo.**
+**All planned milestones M0–M13 are complete.** 65 tests green, tree clean,
+docs current. The roadmap as originally scoped is done; what remains:
+
+1. **User actions pending (do these first, they're one-liners):**
+   - `warden doctor --fix` — 6 findings, ~2.5–2.9 GiB of HF-cache dead
+     weight, all remediable via owner CLIs.
+   - `warden scrub install` then the printed `systemctl --user enable`
+     command — the bit-rot timer is written but not enabled.
+   - Restart the GUI if it's been running since before M12/M13 (picks up
+     safetensors rows and the whole-snapshot download button).
+2. **Sibling integration** — llamacppCodeConf reads `inventory.json`
+   (schema v1, frozen, docs/inventory-schema.md). **Owned by the Claude
+   instance in `~/src2/llamacppCodeConf`**, to start after its in-flight
+   updates land. Do NOT start from this repo.
+3. **Only unstarted code item here:** activity-log mirror — unify event
+   phrasing between CLI verbose output and the GUI activity panel. Small
+   polish; start it only if asked.
+4. Otherwise: **use-in-anger pass** — let real usage surface the next
+   milestone, as it did for M8.1/M9/M10.
 
 ## Smaller items (fold in opportunistically)
 
-- Activity log lines mirror between CLI verbose mode and GUI panel.
+- Activity log lines mirror between CLI verbose mode and GUI panel
+  (item 3 above).
 
 ## Sibling project: llamacppCodeConf (`~/src2/llamacppCodeConf`)
 
