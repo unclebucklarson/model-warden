@@ -196,7 +196,14 @@ backed up, which are the same bytes — without ever losing bytes.**
   installed-but-disabled is --fix/button-executable (systemctl --user
   enable --now). Non-systemd machines stay quiet. 73 tests green.
 
-- **M14 (in progress) — release pipeline.** Chores landed first (user
+- **M14 — release pipeline. DONE 2026-08-25**: repo pushed to GitHub
+  (unclebucklarson/model-warden), CI workflow (build + test --locked on
+  every push/PR, cargo-cached, green in ~2min), and a tag-triggered
+  release workflow: `git tag vX.Y.Z && git push origin vX.Y.Z` tests,
+  builds --release, and publishes a GitHub Release with a versioned
+  x86_64-linux tarball (both binaries, licenses, README, User's Guide)
+  plus sha256. **v0.1.0 is published**; the artifact was downloaded,
+  checksum-verified, and run as a user would. Earlier chores below. Chores landed first (user
   decision: permissive license, "give back to the community"): dual
   **MIT OR Apache-2.0** (Rust convention; both texts in-repo, README
   License section with the standard contribution clause), Cargo.toml
