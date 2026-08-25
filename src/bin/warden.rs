@@ -68,6 +68,10 @@ fn main() -> ExitCode {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
+        Some("version" | "--version" | "-V") => {
+            println!("warden {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
         Some("scan") => cmd_scan(json),
         Some("hash") => cmd_hash(json),
         Some("status") => cmd_status(json),

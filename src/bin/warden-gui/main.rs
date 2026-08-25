@@ -21,7 +21,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1150.0, 720.0])
-            .with_title("modelwarden"),
+            .with_title(concat!("modelwarden ", env!("CARGO_PKG_VERSION"))),
         ..Default::default()
     };
     eframe::run_native(
@@ -875,7 +875,7 @@ impl App {
                 ui.strong(format!("{} — {}", f.kind.label(), f.subject));
                 ui.label(f.kind.explanation());
                 ui.add_space(4.0);
-                ui.label("Warden will run the owning tool's own command:");
+                ui.label(f.remedy.actor_line());
                 ui.monospace(f.remedy.display());
                 ui.label(format!("This loses: {}.", f.kind.loss()));
                 ui.horizontal(|ui| {

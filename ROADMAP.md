@@ -196,6 +196,17 @@ backed up, which are the same bytes — without ever losing bytes.**
   installed-but-disabled is --fix/button-executable (systemctl --user
   enable --now). Non-systemd machines stay quiet. 73 tests green.
 
+- **M14 (in progress) — release pipeline.** Chores landed first (user
+  decision: permissive license, "give back to the community"): dual
+  **MIT OR Apache-2.0** (Rust convention; both texts in-repo, README
+  License section with the standard contribution clause), Cargo.toml
+  package metadata (description/license/authors), `warden --version` /
+  `-V`, GUI title carries the version, and the fix-dialog now states who
+  acts per remedy kind (`Remedy::actor_line()` — owner tool vs. warden
+  itself vs. you). **Still to build: CI workflow (build+test) and the
+  tag-triggered release workflow (GH Releases with packaged binaries);
+  needs the repo pushed to GitHub — public/private is the user's call.**
+
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 
 **All planned milestones M0–M13.3 are complete.** 73 tests green, tree

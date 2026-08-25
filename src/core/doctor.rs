@@ -160,6 +160,21 @@ impl Remedy {
     pub fn executable(&self) -> bool {
         !matches!(self, Remedy::Manual { .. })
     }
+
+    /// Who actually acts — shown above the command in confirm UIs, so the
+    /// dialog never claims an owner tool is acting when warden is.
+    pub fn actor_line(&self) -> &'static str {
+        match self {
+            Remedy::OwnerCommand { .. } => "Warden will run the owning tool's own command:",
+            Remedy::DebrisFile { .. } => {
+                "Warden will remove this download debris itself (guarded against active downloads):"
+            }
+            Remedy::HuskDir { .. } => {
+                "Warden will remove this husk itself, after re-verifying it holds no content:"
+            }
+            Remedy::Manual { .. } => "Run this yourself:",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]

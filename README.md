@@ -107,3 +107,15 @@ The hash-path crates are optimized even in dev profiles (see Cargo.toml).
 Design authority: [PLAN.md](PLAN.md). Status: [ROADMAP.md](ROADMAP.md).
 Spike results that shaped the design: [docs/spikes.md](docs/spikes.md).
 Project overview for readers outside the repo: [docs/overview.md](docs/overview.md).
+
+## License
+
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE))
+- MIT license ([LICENSE-MIT](LICENSE-MIT))
+
+at your option. Unless you explicitly state otherwise, any contribution
+intentionally submitted for inclusion in this work by you, as defined in the
+Apache-2.0 license, shall be dual licensed as above, without any additional
+terms or conditions.
