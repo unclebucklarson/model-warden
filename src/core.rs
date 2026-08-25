@@ -8,6 +8,7 @@ pub mod archive;
 pub mod backup;
 pub mod dedup;
 pub mod doctor;
+pub mod format;
 pub mod gguf;
 pub mod identity;
 pub mod lock;

@@ -34,6 +34,9 @@ fn main() -> eframe::Result {
 enum Msg {
     /// Replaces the busy label's detail line (hash/copy progress).
     Progress(String),
+    /// A durable activity-panel line — the same words the CLI prints
+    /// (`log_line()` on the core event enums).
+    Activity(String),
     RemoteFiles(Vec<modelwarden::core::acquire::RemoteFile>),
     /// A GGUF-less repo: the whole-snapshot listing (dotfiles excluded).
     RemoteSnapshot(Vec<modelwarden::core::acquire::RemoteFile>),
@@ -165,6 +168,11 @@ impl App {
         let state = settings::state_dir();
         let specs = modelwarden::core::roots::discover_roots(&cfg);
         let result = manifest::refresh(&specs, &state, |ev| {
+            if let Some(line) = ev.log_line() {
+                let _ = tx.send(Msg::Activity(line.clone()));
+                let _ = tx.send(Msg::Progress(line));
+                return;
+            }
             let line = match ev {
                 RefreshEvent::HashStart { label, size } => {
                     format!("hashing {label} ({})", human_size(size))
@@ -172,8 +180,7 @@ impl App {
                 RefreshEvent::HashProgress { label, done, total } => {
                     format!("hashing {label} — {}%", done * 100 / total.max(1))
                 }
-                RefreshEvent::HashDone { label, secs } => format!("hashed {label} in {secs:.0}s"),
-                RefreshEvent::HashFailed { label, error } => format!("FAILED {label}: {error}"),
+                _ => return,
             };
             let _ = tx.send(Msg::Progress(line));
         });
@@ -353,20 +360,10 @@ impl App {
                 return;
             };
             let result = modelwarden::core::dedup::reclaim(&inv, false, |ev| {
-                use modelwarden::core::dedup::ReclaimEvent;
-                let line = match ev {
-                    ReclaimEvent::Group { name, size } => {
-                        format!("group {name} ({})", human_size(size))
-                    }
-                    ReclaimEvent::Verifying { path } => format!("verifying {}", path.display()),
-                    ReclaimEvent::Relinked { path } => format!("relinked {}", path.display()),
-                    ReclaimEvent::SkippedForeign { path } => {
-                        format!("skipped {} (foreign store)", path.display())
-                    }
-                    ReclaimEvent::Failed { path, error } => {
-                        format!("FAILED {}: {error}", path.display())
-                    }
-                };
+                // Every reclaim event is a decision about real bytes —
+                // all of them go to the durable activity log.
+                let line = ev.log_line();
+                let _ = tx.send(Msg::Activity(line.clone()));
                 let _ = tx.send(Msg::Progress(line));
             });
             match result {
@@ -461,6 +458,7 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Progress(line) => self.progress = Some(line),
+                Msg::Activity(line) => self.activity.push(line),
                 Msg::RemoteFiles(files) => {
                     self.fetch_files = Some(files);
                     self.fetch_snapshot = false;
@@ -1043,16 +1041,12 @@ impl App {
                 let txp = tx.clone();
                 let result =
                     acquire::fetch(&repo, filename, &shelf_root, token.as_deref(), move |ev| {
+                        if let Some(line) = ev.log_line() {
+                            let _ = txp.send(Msg::Activity(line.clone()));
+                            let _ = txp.send(Msg::Progress(line));
+                            return;
+                        }
                         let line = match ev {
-                            acquire::FetchEvent::Start { label, total, resumed_from } => format!(
-                                "downloading {label} ({}){}",
-                                total.map(human_size).unwrap_or_else(|| "size unknown".into()),
-                                if resumed_from > 0 {
-                                    format!(", resuming at {}", human_size(resumed_from))
-                                } else {
-                                    String::new()
-                                }
-                            ),
                             acquire::FetchEvent::Progress { label, done, total } => match total {
                                 Some(t) => format!(
                                     "downloading {label} — {} / {} ({}%)",
@@ -1062,7 +1056,7 @@ impl App {
                                 ),
                                 None => format!("downloading {label} — {}", human_size(done)),
                             },
-                            acquire::FetchEvent::Hashing { label } => format!("hashing {label}"),
+                            _ => return,
                         };
                         let _ = txp.send(Msg::Progress(line));
                     });
@@ -1424,12 +1418,19 @@ impl App {
     }
 }
 
-/// Backup/archive events all render the same way in the status bar.
+/// Backup/archive events all render the same way: durable log_line()
+/// events land in the activity panel (mirroring the CLI's output),
+/// transient ticks only update the status bar.
 fn event_to_progress(
     tx: Sender<Msg>,
 ) -> impl FnMut(modelwarden::core::backup::BackupEvent) {
     use modelwarden::core::backup::BackupEvent;
     move |ev| {
+        if let Some(line) = ev.log_line() {
+            let _ = tx.send(Msg::Activity(line.clone()));
+            let _ = tx.send(Msg::Progress(line));
+            return;
+        }
         let line = match ev {
             BackupEvent::FileStart { label, size } => {
                 format!("copying {label} ({})", human_size(size))
@@ -1440,9 +1441,7 @@ fn event_to_progress(
                 done,
                 total,
             } => format!("{phase} {label} — {}%", done * 100 / total.max(1)),
-            BackupEvent::FileDone { label, secs } => format!("verified {label} in {secs:.0}s"),
-            BackupEvent::Skipped { label, reason } => format!("skipped {label}: {reason}"),
-            BackupEvent::Failed { label, error } => format!("FAILED {label}: {error}"),
+            _ => return,
         };
         let _ = tx.send(Msg::Progress(line));
     }
@@ -1522,16 +1521,5 @@ fn ago(unix: u64) -> String {
 }
 
 fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
+    modelwarden::core::format::human_size(bytes)
 }

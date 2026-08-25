@@ -42,6 +42,27 @@ pub enum FetchEvent {
     Hashing { label: String },
 }
 
+impl FetchEvent {
+    /// The durable activity-log line, worded identically in both frontends;
+    /// `None` for transient progress ticks, which are never logged.
+    pub fn log_line(&self) -> Option<String> {
+        use crate::core::format::human_size;
+        match self {
+            Self::Start { label, total, resumed_from } => Some(format!(
+                "downloading {label} ({}){}",
+                total.map(human_size).unwrap_or_else(|| "size unknown".into()),
+                if *resumed_from > 0 {
+                    format!(", resuming at {}", human_size(*resumed_from))
+                } else {
+                    String::new()
+                }
+            )),
+            Self::Progress { .. } => None,
+            Self::Hashing { label } => Some(format!("hashing {label}")),
+        }
+    }
+}
+
 fn agent() -> ureq::Agent {
     ureq::AgentBuilder::new()
         .timeout_connect(std::time::Duration::from_secs(30))
@@ -463,6 +484,21 @@ mod tests {
 
         // No siblings array at all is an error, not an empty repo.
         assert!(files_from_siblings("org/repo", &serde_json::json!({}), false).is_err());
+    }
+
+    #[test]
+    fn log_lines_mirror_the_cli_wording() {
+        let start = FetchEvent::Start {
+            label: "org/repo/m.gguf".into(),
+            total: Some(1024),
+            resumed_from: 512,
+        };
+        assert_eq!(
+            start.log_line().as_deref(),
+            Some("downloading org/repo/m.gguf (1.0 KiB), resuming at 512 B")
+        );
+        let tick = FetchEvent::Progress { label: "x".into(), done: 1, total: None };
+        assert_eq!(tick.log_line(), None);
     }
 
     #[test]

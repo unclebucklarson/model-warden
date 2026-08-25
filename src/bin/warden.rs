@@ -164,7 +164,9 @@ fn cmd_hash(json: bool) -> ExitCode {
         }
         manifest::RefreshEvent::HashProgress { .. } => {}
         manifest::RefreshEvent::HashDone { secs, .. } => {
-            eprintln!("done in {secs:.0}s");
+            // Completes the inline "label (size)… " prefix — same
+            // vocabulary as the shared log_line ("hashed … in Ns").
+            eprintln!("hashed in {secs:.0}s");
             hashed_count += 1;
         }
         manifest::RefreshEvent::HashFailed { error, .. } => eprintln!("FAILED: {error}"),
@@ -677,18 +679,10 @@ fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
     };
     let result = modelwarden::core::dedup::reclaim(&inv, !hardlink, |ev| {
         use modelwarden::core::dedup::ReclaimEvent;
-        match ev {
-            ReclaimEvent::Group { name, size } => {
-                eprintln!("group: {name} ({})", human_size(size))
-            }
-            ReclaimEvent::Verifying { path } => eprintln!("  verifying {}", path.display()),
-            ReclaimEvent::Relinked { path } => eprintln!("  relinked  {}", path.display()),
-            ReclaimEvent::SkippedForeign { path } => {
-                eprintln!("  skipped   {} (foreign store — never touched)", path.display())
-            }
-            ReclaimEvent::Failed { path, error } => {
-                eprintln!("  FAILED    {}: {error}", path.display())
-            }
+        // Shared wording (log_line); groups flush-left, members indented.
+        match &ev {
+            ReclaimEvent::Group { .. } => eprintln!("{}", ev.log_line()),
+            _ => eprintln!("  {}", ev.log_line()),
         }
     });
     match result {
@@ -957,23 +951,12 @@ fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode
             }
             Ok(_) => {}
         }
-        let result = acquire::fetch(repo, filename, &shelf_root, token, |ev| match ev {
-            acquire::FetchEvent::Start {
-                label,
-                total,
-                resumed_from,
-            } => {
-                eprintln!(
-                    "downloading {label} ({}){}",
-                    total.map(human_size).unwrap_or_else(|| "size unknown".into()),
-                    if resumed_from > 0 {
-                        format!(", resuming at {}", human_size(resumed_from))
-                    } else {
-                        String::new()
-                    }
-                );
+        let result = acquire::fetch(repo, filename, &shelf_root, token, |ev| {
+            if let Some(line) = ev.log_line() {
+                eprintln!("{line}");
+                return;
             }
-            acquire::FetchEvent::Progress { done, total, .. } => {
+            if let acquire::FetchEvent::Progress { done, total, .. } = ev {
                 if let Some(t) = total {
                     eprint!(
                         "\r  {} / {} ({}%)   ",
@@ -986,7 +969,6 @@ fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode
                 }
                 let _ = std::io::stderr().flush();
             }
-            acquire::FetchEvent::Hashing { .. } => eprintln!("\n  hashing…"),
         });
         match result {
             Ok((dest, prov)) => {
@@ -1064,9 +1046,14 @@ fn print_backup_event(ev: &backup::BackupEvent) {
             let _ = std::io::stderr().flush();
         }
         backup::BackupEvent::FileProgress { .. } => {}
+        // Completes the inline prefix; same vocabulary as log_line.
         backup::BackupEvent::FileDone { secs, .. } => eprintln!("verified in {secs:.0}s"),
-        backup::BackupEvent::Skipped { label, reason } => eprintln!("  {label}: skipped — {reason}"),
-        backup::BackupEvent::Failed { label, error } => eprintln!("  {label}: FAILED — {error}"),
+        // Standalone lines share log_line's wording exactly.
+        ev => {
+            if let Some(line) = ev.log_line() {
+                eprintln!("  {line}");
+            }
+        }
     }
 }
 
@@ -1379,18 +1366,7 @@ fn ago(unix: u64) -> String {
 }
 
 fn human_size(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
-    let mut v = bytes as f64;
-    let mut u = 0;
-    while v >= 1024.0 && u < UNITS.len() - 1 {
-        v /= 1024.0;
-        u += 1;
-    }
-    if u == 0 {
-        format!("{bytes} B")
-    } else {
-        format!("{v:.1} {}", UNITS[u])
-    }
+    modelwarden::core::format::human_size(bytes)
 }
 
 fn truncate(s: &str, max: usize) -> String {

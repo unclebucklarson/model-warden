@@ -269,6 +269,18 @@ pub enum RefreshEvent {
     HashFailed { label: String, error: String },
 }
 
+impl RefreshEvent {
+    /// The durable activity-log line, worded identically in both frontends;
+    /// `None` for transient progress ticks, which are never logged.
+    pub fn log_line(&self) -> Option<String> {
+        match self {
+            Self::HashStart { .. } | Self::HashProgress { .. } => None,
+            Self::HashDone { label, secs } => Some(format!("hashed {label} in {secs:.0}s")),
+            Self::HashFailed { label, error } => Some(format!("hash FAILED {label}: {error}")),
+        }
+    }
+}
+
 /// The whole M2 write path in one place: rescan the given roots, carry
 /// forward hashes whose fingerprints still match, hash what's missing,
 /// persist per-root manifests, and merge ALL stored manifests (offline roots

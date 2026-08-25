@@ -165,10 +165,20 @@ backed up, which are the same bytes — without ever losing bytes.**
   prajjwal1/bert-tiny (4 files) fetched, cataloged whole, and a selective
   backup of just the weights pulled the entire bundle. 65 tests green.
 
-## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e)
+- **M13.1** — activity-log mirror (the last backlog item). Event phrasing
+  now lives in core (`log_line()` on RefreshEvent/BackupEvent/ReclaimEvent/
+  FetchEvent, `core::format::human_size` shared by both bins): the CLI
+  prints and the GUI activity panel logs the same words for the same event.
+  The GUI's durable gap is closed — per-file "hashed/verified/relinked/
+  downloading" lines now land in the activity panel (new `Msg::Activity`)
+  instead of vanishing with the transient status bar; progress ticks stay
+  status-bar-only in both frontends. 69 tests green.
 
-**All planned milestones M0–M13 are complete.** 65 tests green, tree clean,
-docs current. The roadmap as originally scoped is done; what remains:
+## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1)
+
+**All planned milestones M0–M13.1 are complete.** 69 tests green, tree
+clean, docs current. The roadmap as originally scoped is done; what
+remains:
 
 1. **User actions pending (do these first, they're one-liners):**
    - `warden doctor --fix` — 6 findings, ~2.5–2.9 GiB of HF-cache dead
@@ -181,16 +191,12 @@ docs current. The roadmap as originally scoped is done; what remains:
    (schema v1, frozen, docs/inventory-schema.md). **Owned by the Claude
    instance in `~/src2/llamacppCodeConf`**, to start after its in-flight
    updates land. Do NOT start from this repo.
-3. **Only unstarted code item here:** activity-log mirror — unify event
-   phrasing between CLI verbose output and the GUI activity panel. Small
-   polish; start it only if asked.
-4. Otherwise: **use-in-anger pass** — let real usage surface the next
-   milestone, as it did for M8.1/M9/M10.
+3. Otherwise: **use-in-anger pass** — the backlog is empty; let real usage
+   surface the next milestone, as it did for M8.1/M9/M10.
 
 ## Smaller items (fold in opportunistically)
 
-- Activity log lines mirror between CLI verbose mode and GUI panel
-  (item 3 above).
+- (none — the activity-log mirror landed as M13.1)
 
 ## Sibling project: llamacppCodeConf (`~/src2/llamacppCodeConf`)
 

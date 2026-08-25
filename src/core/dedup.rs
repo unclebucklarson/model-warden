@@ -35,6 +35,24 @@ pub enum ReclaimEvent {
     Failed { path: PathBuf, error: String },
 }
 
+impl ReclaimEvent {
+    /// The durable activity-log line, worded identically in both frontends.
+    /// Every reclaim event is logged — each one records a decision about
+    /// real bytes.
+    pub fn log_line(&self) -> String {
+        use crate::core::format::human_size;
+        match self {
+            Self::Group { name, size } => format!("group {name} ({})", human_size(*size)),
+            Self::Verifying { path } => format!("verifying {}", path.display()),
+            Self::Relinked { path } => format!("relinked {}", path.display()),
+            Self::SkippedForeign { path } => {
+                format!("skipped {} (foreign store — never touched)", path.display())
+            }
+            Self::Failed { path, error } => format!("FAILED {}: {error}", path.display()),
+        }
+    }
+}
+
 /// Hardlink-collapse every reclaimable duplicate group. `dry_run` walks the
 /// same decisions without touching anything (the CLI's default mode).
 pub fn reclaim(
@@ -201,6 +219,14 @@ mod tests {
     use crate::core::gguf::tests::synthetic_gguf;
     use crate::core::manifest::{build_root_manifest, merge};
     use crate::core::roots::{RootKind, RootSpec};
+
+    #[test]
+    fn log_lines_mirror_the_cli_wording() {
+        let g = ReclaimEvent::Group { name: "qwen".into(), size: 1024 };
+        assert_eq!(g.log_line(), "group qwen (1.0 KiB)");
+        let s = ReclaimEvent::SkippedForeign { path: "/o/blob".into() };
+        assert_eq!(s.log_line(), "skipped /o/blob (foreign store — never touched)");
+    }
 
     /// Shelf with the same content twice (independent copies) and one
     /// unrelated file.

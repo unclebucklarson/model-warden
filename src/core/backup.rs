@@ -27,6 +27,19 @@ pub enum BackupEvent {
     Failed { label: String, error: String },
 }
 
+impl BackupEvent {
+    /// The durable activity-log line, worded identically in both frontends;
+    /// `None` for transient progress ticks, which are never logged.
+    pub fn log_line(&self) -> Option<String> {
+        match self {
+            Self::FileStart { .. } | Self::FileProgress { .. } => None,
+            Self::FileDone { label, secs } => Some(format!("verified {label} in {secs:.0}s")),
+            Self::Skipped { label, reason } => Some(format!("skipped {label}: {reason}")),
+            Self::Failed { label, error } => Some(format!("FAILED {label}: {error}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct BackupReport {
     pub copied: usize,
@@ -457,6 +470,19 @@ mod tests {
     use super::*;
     use crate::core::gguf::tests::synthetic_gguf;
     use crate::core::manifest::{build_root_manifest, merge};
+
+    #[test]
+    fn log_lines_mirror_the_cli_wording() {
+        // Both frontends log these words verbatim — changing them changes
+        // user-visible output in two places at once, on purpose.
+        let done = BackupEvent::FileDone { label: "m".into(), secs: 3.2 };
+        assert_eq!(done.log_line().as_deref(), Some("verified m in 3s"));
+        let skip = BackupEvent::Skipped { label: "m".into(), reason: "offline".into() };
+        assert_eq!(skip.log_line().as_deref(), Some("skipped m: offline"));
+        // Transient ticks are never logged durably.
+        let start = BackupEvent::FileStart { label: "m".into(), size: 1 };
+        assert_eq!(start.log_line(), None);
+    }
 
     fn shelf_with_model() -> (tempfile::TempDir, RootSpec, Inventory) {
         let shelf = tempfile::tempdir().unwrap();
