@@ -1,0 +1,51 @@
+name: Release
+
+# Tag a version (git tag v0.1.0 && git push origin v0.1.0) and this builds
+# release binaries, packages them with the docs and licenses, and publishes
+# a GitHub Release with the tarball + checksum attached.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        run: cargo test --locked
+
+      - name: Build release binaries
+        run: cargo build --release --locked
+
+      - name: Package
+        run: |
+          NAME="modelwarden-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/${NAME}/docs"
+          cp target/release/warden target/release/warden-gui "dist/${NAME}/"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${NAME}/"
+          cp docs/users-guide.md "dist/${NAME}/docs/"
+          tar -C dist -czf "dist/${NAME}.tar.gz" "${NAME}"
+          (cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256")
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          generate_release_notes: true
