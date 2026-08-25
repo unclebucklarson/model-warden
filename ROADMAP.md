@@ -174,19 +174,29 @@ backed up, which are the same bytes — without ever losing bytes.**
   instead of vanishing with the transient status bar; progress ticks stay
   status-bar-only in both frontends. 69 tests green.
 
-## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1)
+- **M13.2** — doctor honesty fix (found in the field: `doctor --fix`
+  "fixed" the same 4 pruned husks forever). Root cause: `hf cache rm`
+  exits 0 saying "Nothing to delete" for snapshot-less repos — hf's own
+  scanner cannot see husks, so the owner CLI provably cannot remove them,
+  and apply() trusted the exit code. Now: owner-command success is
+  verified (`expect_gone` — the target must actually be gone, or --fix
+  reports failure with the tool's own output), and husks are warden's
+  second guarded direct-delete exception (rationale as `*.incomplete`:
+  no owner command can act) — re-verified at apply time to hold zero
+  content bytes, refusal deletes nothing. Real machine: all 4 husks
+  removed, doctor reports all stores healthy. 71 tests green.
 
-**All planned milestones M0–M13.1 are complete.** 69 tests green, tree
-clean, docs current. The roadmap as originally scoped is done; what
-remains:
+## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2)
 
-1. **User actions pending (do these first, they're one-liners):**
-   - `warden doctor --fix` — 6 findings, ~2.5–2.9 GiB of HF-cache dead
-     weight, all remediable via owner CLIs.
-   - `warden scrub install` then the printed `systemctl --user enable`
-     command — the bit-rot timer is written but not enabled.
+**All planned milestones M0–M13.2 are complete.** 71 tests green, tree
+clean, docs current. Doctor reports **all stores healthy** (husks cleaned
+2026-08-20). The roadmap as originally scoped is done; what remains:
+
+1. **User actions pending (one-liners):**
+   - Enable the scrub timer (units already installed):
+     `systemctl --user enable --now modelwarden-scrub.timer`
    - Restart the GUI if it's been running since before M12/M13 (picks up
-     safetensors rows and the whole-snapshot download button).
+     safetensors rows, whole-snapshot download, durable activity log).
 2. **Sibling integration** — llamacppCodeConf reads `inventory.json`
    (schema v1, frozen, docs/inventory-schema.md). **Owned by the Claude
    instance in `~/src2/llamacppCodeConf`**, to start after its in-flight

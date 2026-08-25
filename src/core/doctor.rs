@@ -107,11 +107,23 @@ impl FindingKind {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Remedy {
-    /// The owning tool cleans its own store; warden only asks.
-    OwnerCommand { program: String, args: Vec<String> },
+    /// The owning tool cleans its own store; warden only asks. When
+    /// `expect_gone` is set, success is verified — the path must actually
+    /// be gone afterwards, because a tool can exit 0 without acting
+    /// (hf's cache scanner ignores what it can't see).
+    OwnerCommand {
+        program: String,
+        args: Vec<String>,
+        expect_gone: Option<PathBuf>,
+    },
     /// `*.incomplete` download debris — no owner command exists; warden may
     /// remove the file itself (guarded against active downloads).
     DebrisFile { path: PathBuf },
+    /// A pruned husk directory: refs skeleton, zero content bytes. The
+    /// owner tool provably cannot remove it (hf's cache scanner ignores
+    /// snapshot-less repos), so warden removes it itself — after
+    /// re-verifying at apply time that it holds no content.
+    HuskDir { path: PathBuf },
     /// No safe automated path: the exact command, for the human to run.
     Manual { command: String },
 }
@@ -119,10 +131,13 @@ pub enum Remedy {
 impl Remedy {
     pub fn display(&self) -> String {
         match self {
-            Remedy::OwnerCommand { program, args } => {
+            Remedy::OwnerCommand { program, args, .. } => {
                 format!("{program} {}", args.join(" "))
             }
             Remedy::DebrisFile { path } => format!("remove {}", path.display()),
+            Remedy::HuskDir { path } => {
+                format!("remove husk directory {} (verified empty first)", path.display())
+            }
             Remedy::Manual { command } => format!("manual: {command}"),
         }
     }
@@ -204,7 +219,11 @@ pub fn apply(remedy: &Remedy) -> Result<String> {
 
 fn apply_with_min_debris_age(remedy: &Remedy, min_age: std::time::Duration) -> Result<String> {
     match remedy {
-        Remedy::OwnerCommand { program, args } => {
+        Remedy::OwnerCommand {
+            program,
+            args,
+            expect_gone,
+        } => {
             let output = std::process::Command::new(program)
                 .args(args)
                 .output()
@@ -213,11 +232,31 @@ fn apply_with_min_debris_age(remedy: &Remedy, min_age: std::time::Duration) -> R
             if !output.status.success() {
                 bail!("{program} failed ({}): {}", output.status, stderr.trim());
             }
+            // Exit 0 is a claim, not proof — hf exits 0 saying "Nothing to
+            // delete" for repos its scanner can't see. Verify the result.
+            if let Some(gone) = expect_gone
+                && gone.exists()
+            {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                bail!(
+                    "{program} exited 0 but {} still exists — it did not act. \
+                     Its output: {}",
+                    gone.display(),
+                    stdout.trim().lines().chain(stderr.trim().lines())
+                        .collect::<Vec<_>>().join(" / ")
+                );
+            }
             Ok(format!(
                 "{} {} — done",
                 program,
                 args.join(" ")
             ))
+        }
+        Remedy::HuskDir { path } => {
+            verify_husk(path)?;
+            std::fs::remove_dir_all(path)
+                .with_context(|| format!("removing {}", path.display()))?;
+            Ok(format!("removed husk {}", path.display()))
         }
         Remedy::DebrisFile { path } => {
             if !path
@@ -248,20 +287,48 @@ fn apply_with_min_debris_age(remedy: &Remedy, min_age: std::time::Duration) -> R
     }
 }
 
-fn hf_repo_remedy(tools: OwnerTools, repo: &str, repo_dir: &Path) -> Remedy {
-    if tools.hf {
-        Remedy::OwnerCommand {
-            program: "hf".into(),
-            args: vec!["cache".into(), "rm".into(), repo.into(), "-y".into()],
-        }
-    } else {
-        Remedy::Manual {
-            command: format!("rm -r '{}'", repo_dir.display()),
-        }
+/// Refuse to treat a directory as a removable husk unless, RIGHT NOW, it
+/// provably holds zero content: an HF `models--*` dir whose only files are
+/// tiny ref/marker files under `refs/` or `.no_exist/`. Any symlink, any
+/// file elsewhere (a blob, a snapshot entry), or anything large means this
+/// is not a husk and warden must not touch it.
+fn verify_husk(path: &Path) -> Result<()> {
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+    if !name.as_deref().is_some_and(|n| n.starts_with("models--")) {
+        bail!("refusing: {} is not an HF cache repo directory", path.display());
     }
+    fn walk(dir: &Path, in_marker_dir: bool) -> Result<()> {
+        for entry in std::fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let entry = entry?;
+            let p = entry.path();
+            let md = std::fs::symlink_metadata(&p)?;
+            if md.file_type().is_symlink() {
+                bail!("refusing: {} contains a snapshot link ({})", dir.display(), p.display());
+            }
+            if md.is_dir() {
+                let marker = in_marker_dir
+                    || entry.file_name() == "refs"
+                    || entry.file_name() == ".no_exist";
+                walk(&p, marker)?;
+            } else {
+                if !in_marker_dir {
+                    bail!("refusing: {} holds content ({})", dir.display(), p.display());
+                }
+                if md.len() > 4096 {
+                    bail!(
+                        "refusing: {} is {} bytes — too large for a ref marker",
+                        p.display(),
+                        md.len()
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+    walk(path, false)
 }
 
-fn check_hf_hub(hub: &Path, tools: OwnerTools, out: &mut Vec<Finding>) {
+fn check_hf_hub(hub: &Path, _tools: OwnerTools, out: &mut Vec<Finding>) {
     let Ok(repos) = std::fs::read_dir(hub) else {
         return;
     };
@@ -317,7 +384,10 @@ fn check_hf_hub(hub: &Path, tools: OwnerTools, out: &mut Vec<Finding>) {
                         .join(", ")
                 ),
                 bytes: 0,
-                remedy: hf_repo_remedy(tools, &repo, &path),
+                // Not an owner command: hf's cache scanner ignores
+                // snapshot-less repos, so `hf cache rm` exits 0 without
+                // acting. Warden removes the husk itself, re-verified empty.
+                remedy: Remedy::HuskDir { path: path.clone() },
             });
         } else {
             for (name, rev) in &refs {
@@ -457,6 +527,8 @@ fn check_ollama(store: &Path, tools: OwnerTools, out: &mut Vec<Finding>) {
                         Remedy::OwnerCommand {
                             program: "ollama".into(),
                             args: vec!["rm".into(), name.clone()],
+                            // `ollama rm` must actually drop the manifest.
+                            expect_gone: Some(path.clone()),
                         }
                     } else {
                         Remedy::Manual {
@@ -546,25 +618,69 @@ mod tests {
     }
 
     #[test]
-    fn remedies_prefer_owner_tools_and_fall_back_to_manual() {
+    fn husk_remedy_is_wardens_own_guarded_removal() {
+        // hf's cache scanner cannot see snapshot-less repos, so `hf cache
+        // rm` exits 0 without acting — the remedy must not depend on it,
+        // with or without owner tools present.
         let hub = tempfile::tempdir().unwrap();
         let husk = hub.path().join("models--org--Husk");
         std::fs::create_dir_all(husk.join("refs")).unwrap();
         std::fs::write(husk.join("refs/main"), "deadbeef00").unwrap();
 
-        let with = check_with_tools(&[], Some(hub.path()), ALL_TOOLS);
-        assert_eq!(
-            with[0].remedy,
-            Remedy::OwnerCommand {
-                program: "hf".into(),
-                args: vec!["cache".into(), "rm".into(), "org/Husk".into(), "-y".into()],
-            }
-        );
-        let without = check_with_tools(&[], Some(hub.path()), NO_TOOLS);
-        match &without[0].remedy {
-            Remedy::Manual { command } => assert!(command.starts_with("rm -r ")),
-            other => panic!("expected manual fallback, got {other:?}"),
+        for tools in [ALL_TOOLS, NO_TOOLS] {
+            let findings = check_with_tools(&[], Some(hub.path()), tools);
+            assert_eq!(findings[0].remedy, Remedy::HuskDir { path: husk.clone() });
         }
+    }
+
+    #[test]
+    fn husk_removal_verifies_emptiness_at_apply_time() {
+        let hub = tempfile::tempdir().unwrap();
+
+        // A real husk (refs only, tiny files): removed.
+        let husk = hub.path().join("models--org--Husk");
+        std::fs::create_dir_all(husk.join("refs")).unwrap();
+        std::fs::write(husk.join("refs/main"), "deadbeef00").unwrap();
+        apply(&Remedy::HuskDir { path: husk.clone() }).unwrap();
+        assert!(!husk.exists());
+
+        // A blob appeared since the scan (a download started): refused.
+        let busy = hub.path().join("models--org--Busy");
+        std::fs::create_dir_all(busy.join("refs")).unwrap();
+        std::fs::create_dir_all(busy.join("blobs")).unwrap();
+        std::fs::write(busy.join("refs/main"), "deadbeef00").unwrap();
+        std::fs::write(busy.join("blobs/b1"), b"model bytes").unwrap();
+        assert!(apply(&Remedy::HuskDir { path: busy.clone() }).is_err());
+        assert!(busy.join("blobs/b1").exists(), "nothing may be deleted on refusal");
+
+        // Not an HF repo dir at all: refused outright.
+        let stray = hub.path().join("some-directory");
+        std::fs::create_dir_all(&stray).unwrap();
+        assert!(apply(&Remedy::HuskDir { path: stray.clone() }).is_err());
+        assert!(stray.exists());
+    }
+
+    #[test]
+    fn owner_command_success_is_verified_not_trusted() {
+        // A tool exiting 0 without acting (hf's "Nothing to delete") must
+        // be reported as a failure when the target visibly still exists.
+        let dir = tempfile::tempdir().unwrap();
+        let still_there = dir.path().join("manifest");
+        std::fs::write(&still_there, b"x").unwrap();
+        let err = apply(&Remedy::OwnerCommand {
+            program: "true".into(),
+            args: vec![],
+            expect_gone: Some(still_there.clone()),
+        })
+        .unwrap_err();
+        assert!(format!("{err}").contains("still exists"), "{err}");
+        // With no expectation attached, exit 0 still passes.
+        apply(&Remedy::OwnerCommand {
+            program: "true".into(),
+            args: vec![],
+            expect_gone: None,
+        })
+        .unwrap();
     }
 
     #[test]
@@ -586,6 +702,7 @@ mod tests {
             Remedy::OwnerCommand {
                 program: "ollama".into(),
                 args: vec!["rm".into(), "ghost:latest".into()],
+                expect_gone: Some(mdir.join("latest")),
             }
         );
     }

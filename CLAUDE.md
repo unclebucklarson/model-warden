@@ -41,8 +41,12 @@ Non-obvious constraints that shape the code:
 - **Never write inside a store another tool owns** (Ollama, HF cache,
   llama.cpp cache). Their manifests live under warden's state dir; dedup there
   is report-only, always. Doctor cleanup routes through the owning tool's own
-  CLI (`hf cache rm`, `ollama rm`) on explicit user action; sole direct-delete
-  exception is `*.incomplete` download debris (guarded).
+  CLI (`hf cache rm`, `ollama rm`) on explicit user action, and owner-command
+  success is verified (`expect_gone`), never trusted — hf exits 0 without
+  acting on repos its scanner can't see. Two guarded direct-delete
+  exceptions: `*.incomplete` download debris, and pruned husk directories
+  (refs-only, re-verified to hold zero content bytes at apply time — the
+  owner CLI provably cannot remove them).
 - **Operations move bundles, not files.** Backup/archive/demote/restore carry
   everything a model needs to run: split `-NNNNN-of-NNNNN` parts, mmproj
   projectors beside the model, Ollama `+projector` blobs (`bundle_for`).
