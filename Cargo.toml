@@ -1,6 +1,6 @@
 [package]
 name = "modelwarden"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "Inventory, backup, and archival for local LLM model files — GGUFs and safetensors directories across Ollama, HF cache, shelves, and removable drives"
 license = "MIT OR Apache-2.0"
