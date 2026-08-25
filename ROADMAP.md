@@ -232,6 +232,18 @@ backed up, which are the same bytes — without ever losing bytes.**
   choosing the projector alone stays alone). Backup/archive/demote/
   restore already bundled projectors since M9. 74 tests green.
 
+- **Inventory as models, not files (2026-08-25, user proposal) + crates.io
+  prep.** GUI Inventory: filter box (name/quant/location/hash, matching a
+  companion keeps its whole group visible) and companion grouping —
+  contents that ride in another model's bundle while their own bundle
+  stays alone (mmproj projectors, Ollama +projector blobs, safetensors
+  tokenizer/config companions) render indented under the model that needs
+  them with a "required by <models>" note; bundle_for is the single source
+  of truth, no new relation invented. crates.io: Cargo.toml carries
+  repository/readme/keywords/categories; `cargo publish --dry-run`
+  validates. Publishing awaits the user's `cargo login` token; after
+  first publish, add CARGO_REGISTRY_TOKEN to the release workflow.
+
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 
 **All planned milestones M0–M13.3 are complete.** 73 tests green, tree

@@ -103,6 +103,7 @@ struct App {
     fix_confirm: Option<usize>,
     inv_sort_col: InvCol,
     inv_sort_asc: bool,
+    inv_filter: String,
     show_fetch: bool,
     fetch_repo: String,
     fetch_token: String,
@@ -143,6 +144,7 @@ impl App {
             fix_confirm: None,
             inv_sort_col: InvCol::Name,
             inv_sort_asc: true,
+            inv_filter: String::new(),
             show_fetch: false,
             fetch_repo: String::new(),
             fetch_token: String::new(),
@@ -647,6 +649,70 @@ impl App {
             let ord = if sort_asc { ord } else { ord.reverse() };
             ord.then_with(|| a.1.display_name.cmp(&b.1.display_name))
         });
+
+        // Companions: a content that rides in another model's bundle while
+        // its own bundle stays alone (mmproj projectors, Ollama +projector
+        // blobs, safetensors tokenizer/config files). That asymmetry IS the
+        // "required by" relation — bundle_for is the single source of truth.
+        use std::collections::BTreeMap;
+        let mut parents_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (k, _, _) in &rows {
+            for m in manifest::bundle_for(inv, k) {
+                if &m != *k
+                    && !manifest::bundle_for(inv, &m).iter().any(|x| x == *k)
+                {
+                    parents_of.entry(m).or_default().push((*k).clone());
+                }
+            }
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Filter:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.inv_filter)
+                    .hint_text("name, quant, location, hash…")
+                    .desired_width(280.0),
+            );
+            if !self.inv_filter.is_empty() && ui.small_button("✕").clicked() {
+                self.inv_filter.clear();
+            }
+        });
+        let filter = self.inv_filter.trim().to_lowercase();
+        let row_matches = |k: &String, e: &manifest::ModelEntry| {
+            filter.is_empty()
+                || e.display_name.to_lowercase().contains(&filter)
+                || quant_of(e).to_lowercase().contains(&filter)
+                || where_of(e).to_lowercase().contains(&filter)
+                || k.to_lowercase().contains(&filter)
+        };
+
+        // Final display order: each primary model followed by its indented
+        // companions (a companion shows under its first parent in sort
+        // order). A group shows if the model OR any companion matches.
+        let mut display: Vec<(&String, &manifest::ModelEntry, usize, Option<String>)> = Vec::new();
+        for (k, e, live) in &rows {
+            if parents_of.contains_key(*k) {
+                continue; // rendered under its parent below
+            }
+            let children: Vec<_> = rows
+                .iter()
+                .filter(|(ck, _, _)| {
+                    parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
+                })
+                .collect();
+            if !row_matches(k, e) && !children.iter().any(|(ck, ce, _)| row_matches(ck, ce)) {
+                continue;
+            }
+            display.push((k, e, *live, None));
+            for (ck, ce, clive) in children {
+                let req: Vec<&str> = parents_of[*ck]
+                    .iter()
+                    .filter_map(|p| inv.models.get(p).map(|pe| pe.display_name.as_str()))
+                    .collect();
+                display.push((ck, ce, *clive, Some(format!("required by {}", req.join(", ")))));
+            }
+        }
+
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("inventory")
                 .striped(true)
@@ -678,7 +744,7 @@ impl App {
                     header(ui, "State", InvCol::State);
                     ui.strong("");
                     ui.end_row();
-                    for (key, entry, live) in rows {
+                    for (key, entry, live, required_by) in display {
                         let offline_only = live == 0;
                         let text = |s: String| {
                             if offline_only {
@@ -705,8 +771,19 @@ impl App {
                                 p.revision.as_deref().map(|r| &r[..12.min(r.len())]).unwrap_or("?")
                             ));
                         }
-                        ui.label(text(entry.display_name.clone()))
-                            .on_hover_text(hover.join("\n"));
+                        match &required_by {
+                            Some(note) => {
+                                ui.vertical(|ui| {
+                                    ui.label(text(format!("    ↳ {}", entry.display_name)))
+                                        .on_hover_text(format!("{note}\n{}", hover.join("\n")));
+                                    ui.weak(format!("       {note}"));
+                                });
+                            }
+                            None => {
+                                ui.label(text(entry.display_name.clone()))
+                                    .on_hover_text(hover.join("\n"));
+                            }
+                        }
                         ui.label(text(quant_of(entry)));
                         ui.label(text(human_size(entry.size)));
                         ui.label(text(where_of(entry)));

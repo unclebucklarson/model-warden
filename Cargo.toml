@@ -5,6 +5,10 @@ edition = "2024"
 description = "Inventory, backup, and archival for local LLM model files — GGUFs and safetensors directories across Ollama, HF cache, shelves, and removable drives"
 license = "MIT OR Apache-2.0"
 authors = ["Scott Larson"]
+repository = "https://github.com/unclebucklarson/model-warden"
+readme = "README.md"
+keywords = ["llm", "gguf", "ollama", "huggingface", "backup"]
+categories = ["command-line-utilities", "filesystem"]
 default-run = "warden-gui"
 
 [dependencies]

@@ -285,11 +285,16 @@ Launch `warden-gui`. The window has a menu bar, four tabs, an activity log
 
 ### 4.1 The Inventory tab 📦
 
-One row per model file in the catalog, across *all* roots: name,
-architecture, quantization, size, and where it lives. Rows for models on an
-unplugged drive appear greyed with the drive's label — offline, not gone.
-Hover a row for details, including **provenance** if warden downloaded it
-(which repo, revision, and when).
+One row per model in the catalog, across *all* roots: name, quantization,
+size, and where it lives. Click a **column heading** to sort by it (click
+again to reverse), and use the **filter box** to narrow the list by name,
+quant, location, or hash. Files that exist only to serve another model —
+a vision `mmproj` projector, a safetensors model's tokenizer and config
+companions — appear **indented under the model that needs them**, marked
+"required by …", so the list reads as models, not as loose files. Rows for
+models on an unplugged drive appear greyed with the drive's label —
+offline, not gone. Hover a row for details, including **provenance** if
+warden downloaded it (which repo, revision, and when).
 
 Row actions:
 
