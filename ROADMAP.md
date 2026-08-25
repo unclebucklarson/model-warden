@@ -186,15 +186,26 @@ backed up, which are the same bytes — without ever losing bytes.**
   content bytes, refusal deletes nothing. Real machine: all 4 husks
   removed, doctor reports all stores healthy. 71 tests green.
 
-## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2)
+- **M13.3** — release-readiness: the scrub-enable prompt (user question:
+  "how will a GH-release user know to run the systemctl enable?"). Three
+  legs: README gains a Setting up section (scan → hash → scrub install
+  --enable → doctor); `warden scrub install --enable` collapses install+
+  start into one consented step; and doctor now carries a machine-level
+  advisory — `scrub timer off` — that keeps nagging (CLI and GUI Health
+  pane) until the timer runs: not-installed hands over the one-liner,
+  installed-but-disabled is --fix/button-executable (systemctl --user
+  enable --now). Non-systemd machines stay quiet. 73 tests green.
 
-**All planned milestones M0–M13.2 are complete.** 71 tests green, tree
-clean, docs current. Doctor reports **all stores healthy** (husks cleaned
-2026-08-20). The roadmap as originally scoped is done; what remains:
+## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
+
+**All planned milestones M0–M13.3 are complete.** 73 tests green, tree
+clean, docs current. Stores are healthy (husks cleaned 2026-08-20); the
+one open doctor finding is the scrub-timer advisory, by design. What
+remains:
 
 1. **User actions pending (one-liners):**
-   - Enable the scrub timer (units already installed):
-     `systemctl --user enable --now modelwarden-scrub.timer`
+   - Enable the scrub timer: `warden doctor --fix` now does it, or
+     `systemctl --user enable --now modelwarden-scrub.timer`.
    - Restart the GUI if it's been running since before M12/M13 (picks up
      safetensors rows, whole-snapshot download, durable activity log).
 2. **Sibling integration** — llamacppCodeConf reads `inventory.json`

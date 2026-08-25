@@ -75,9 +75,72 @@ pub fn install(calendar: &str) -> Result<(Vec<PathBuf>, String)> {
     ))
 }
 
+/// Where the scrub stands on this machine — the doctor advisory's input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimerState {
+    /// No systemctl on PATH: not a systemd machine, nothing to advise.
+    NoSystemd,
+    NotInstalled,
+    /// Units written but the timer isn't enabled — scrubs never run.
+    Disabled,
+    Enabled,
+}
+
+/// Probe the live state: unit file presence + `systemctl --user is-enabled`.
+pub fn timer_state() -> TimerState {
+    let probe = std::process::Command::new("systemctl")
+        .args(["--user", "is-enabled", TIMER_NAME])
+        .output();
+    let Ok(out) = probe else {
+        return TimerState::NoSystemd; // systemctl missing entirely
+    };
+    if String::from_utf8_lossy(&out.stdout).trim().starts_with("enabled") {
+        return TimerState::Enabled;
+    }
+    if unit_dir().join(TIMER_NAME).is_file() {
+        TimerState::Disabled
+    } else {
+        TimerState::NotInstalled
+    }
+}
+
+/// The exact enable invocation, one place only — run by `scrub install
+/// --enable` and by the doctor remedy.
+pub fn enable_command() -> (String, Vec<String>) {
+    (
+        "systemctl".into(),
+        vec!["--user".into(), "enable".into(), "--now".into(), TIMER_NAME.into()],
+    )
+}
+
+/// Enable and start the timer. Only ever called on an explicit user
+/// request (`--enable`, `doctor --fix`, the GUI button).
+pub fn enable() -> Result<String> {
+    let (program, args) = enable_command();
+    let out = std::process::Command::new(&program)
+        .args(&args)
+        .output()
+        .with_context(|| format!("running {program}"))?;
+    if !out.status.success() {
+        anyhow::bail!(
+            "{program} failed ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(format!("{TIMER_NAME} enabled and started"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn enable_command_targets_the_user_timer() {
+        let (program, args) = enable_command();
+        assert_eq!(program, "systemctl");
+        assert_eq!(args, ["--user", "enable", "--now", TIMER_NAME]);
+    }
 
     #[test]
     fn units_wire_the_binary_and_calendar_through() {

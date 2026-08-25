@@ -34,9 +34,10 @@ Commands (landing per ROADMAP.md milestone):
                                    --all covers every online owned root,
                                    --repair re-copies mismatched/missing
                                    files from a live source elsewhere
-  scrub install [--daily|--weekly|--monthly]
+  scrub install [--daily|--weekly|--monthly] [--enable]
                                    write a systemd user timer that runs
-                                   `hash && verify --all` on a schedule
+                                   `hash && verify --all` on a schedule;
+                                   --enable also starts it
   archive <query>                  promote a cache-owned model to the shelf
   archive demote <query> --to <path|id> [--remove-source]
                                    verified copy to cold storage; the shelf
@@ -353,7 +354,7 @@ fn cmd_doctor(args: &[String], json: bool) -> ExitCode {
     }
     if fix {
         if !manual.is_empty() {
-            println!("left for you (warden never deletes real bytes in foreign stores):");
+            println!("left for you (steps warden won't take on its own):");
             for f in &manual {
                 println!("    {}", f.remedy.display());
             }
@@ -1323,9 +1324,26 @@ fn cmd_scrub(args: &[String]) -> ExitCode {
                              or you install warden elsewhere, re-run `warden scrub install`"
                         );
                     }
+                    if args.iter().any(|a| a == "--enable") {
+                        match modelwarden::core::scrub::enable() {
+                            Ok(msg) => {
+                                println!("{msg}");
+                                println!(
+                                    "check with: systemctl --user status modelwarden-scrub.timer"
+                                );
+                                return ExitCode::SUCCESS;
+                            }
+                            Err(e) => {
+                                eprintln!("warden: enabling: {e:#}");
+                                eprintln!("run it yourself: {enable}");
+                                return ExitCode::FAILURE;
+                            }
+                        }
+                    }
                     println!("\nunits written but NOT enabled — starting services is your call:");
                     println!("    {enable}");
-                    println!("check later with: systemctl --user status modelwarden-scrub.timer");
+                    println!("or rerun with --enable; check later with:");
+                    println!("    systemctl --user status modelwarden-scrub.timer");
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
@@ -1335,7 +1353,7 @@ fn cmd_scrub(args: &[String]) -> ExitCode {
             }
         }
         _ => {
-            eprintln!("usage: warden scrub install [--daily|--weekly|--monthly]");
+            eprintln!("usage: warden scrub install [--daily|--weekly|--monthly] [--enable]");
             ExitCode::from(2)
         }
     }

@@ -82,6 +82,23 @@ versioned contract — see [docs/inventory-schema.md](docs/inventory-schema.md).
 Drives carry their own `.modelwarden/manifest.json`, so a backup drive is
 self-describing on any machine.
 
+## Setting up
+
+First run, in order:
+
+```
+warden scan                    # find your stores; check the inventory looks right
+warden hash                    # compute content identity (SHA-256) — the catalog
+warden scrub install --enable  # weekly background re-verify: bit-rot detection
+warden doctor                  # store health; it will nag about anything missing
+```
+
+The scrub step matters more than it looks: without it nothing ever re-reads
+your bytes, so silent corruption on a shelf or backup drive surfaces only
+when a restore fails. `warden doctor` reminds you until the timer is
+running (on systemd machines; elsewhere it stays quiet — use cron to run
+`warden hash && warden verify --all` instead).
+
 ## Building
 
 Rust, edition 2024. `cargo build` / `cargo test`; `cargo run` opens the GUI.

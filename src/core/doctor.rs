@@ -33,6 +33,9 @@ pub enum FindingKind {
     DanglingSnapshotLink,
     /// An Ollama manifest layer whose blob file is missing.
     MissingOllamaBlob,
+    /// The scheduled scrub timer isn't running — nothing re-verifies
+    /// tracked bytes, so bit rot goes unnoticed until a restore fails.
+    ScrubTimerOff,
 }
 
 impl FindingKind {
@@ -44,6 +47,7 @@ impl FindingKind {
             FindingKind::IncompleteDownload => "incomplete download",
             FindingKind::DanglingSnapshotLink => "dangling snapshot link",
             FindingKind::MissingOllamaBlob => "missing ollama blob",
+            FindingKind::ScrubTimerOff => "scrub timer off",
         }
     }
 
@@ -79,6 +83,13 @@ impl FindingKind {
                  missing from the blob store. The model is registered but \
                  cannot run."
             }
+            FindingKind::ScrubTimerOff => {
+                "The scheduled scrub — a systemd user timer running \
+                 `hash && verify --all` at idle I/O priority — is not \
+                 active. Nothing periodically re-reads your tracked bytes, \
+                 so silent corruption (bit rot) on the shelf or a backup \
+                 drive would go unnoticed until a restore fails."
+            }
         }
     }
 
@@ -96,6 +107,9 @@ impl FindingKind {
             FindingKind::DanglingSnapshotLink => "nothing — it points at bytes already gone",
             FindingKind::MissingOllamaBlob => {
                 "the model's registration in ollama (its bytes are already missing)"
+            }
+            FindingKind::ScrubTimerOff => {
+                "nothing — it gains a periodic background re-verify (idle I/O)"
             }
         }
     }
@@ -189,10 +203,47 @@ fn cli_available(name: &str) -> bool {
     })
 }
 
-/// Check every store. Unreadable directories contribute nothing — degrade,
-/// never fail the report.
+/// Check every store, plus the machine-level advisories (scrub timer).
+/// Unreadable directories contribute nothing — degrade, never fail the
+/// report.
 pub fn check(ollama_stores: &[PathBuf], hf_hub: Option<&Path>) -> Vec<Finding> {
-    check_with_tools(ollama_stores, hf_hub, OwnerTools::detect())
+    let mut out = check_with_tools(ollama_stores, hf_hub, OwnerTools::detect());
+    out.extend(scrub_advisory(crate::core::scrub::timer_state()));
+    out
+}
+
+/// A finding when the scheduled scrub isn't protecting this machine.
+/// Pure over the probed state so it's testable; `None` on non-systemd
+/// machines (nothing sensible to advise) and when the timer runs.
+pub fn scrub_advisory(state: crate::core::scrub::TimerState) -> Option<Finding> {
+    use crate::core::scrub::{self, TimerState};
+    let (detail, remedy) = match state {
+        TimerState::Enabled | TimerState::NoSystemd => return None,
+        TimerState::NotInstalled => (
+            "no scrub units installed",
+            Remedy::Manual {
+                command: "warden scrub install --enable".into(),
+            },
+        ),
+        TimerState::Disabled => {
+            let (program, args) = scrub::enable_command();
+            (
+                "units installed but the timer is disabled",
+                Remedy::OwnerCommand {
+                    program,
+                    args,
+                    expect_gone: None,
+                },
+            )
+        }
+    };
+    Some(Finding {
+        kind: FindingKind::ScrubTimerOff,
+        subject: scrub::TIMER_NAME.into(),
+        detail: detail.into(),
+        bytes: 0,
+        remedy,
+    })
 }
 
 pub fn check_with_tools(
@@ -658,6 +709,28 @@ mod tests {
         std::fs::create_dir_all(&stray).unwrap();
         assert!(apply(&Remedy::HuskDir { path: stray.clone() }).is_err());
         assert!(stray.exists());
+    }
+
+    #[test]
+    fn scrub_advisory_tracks_timer_state() {
+        use crate::core::scrub::TimerState;
+        // Healthy or not-applicable: quiet.
+        assert!(scrub_advisory(TimerState::Enabled).is_none());
+        assert!(scrub_advisory(TimerState::NoSystemd).is_none());
+        // Not installed: the advisory hands the user the one-liner.
+        let f = scrub_advisory(TimerState::NotInstalled).unwrap();
+        assert_eq!(f.kind, FindingKind::ScrubTimerOff);
+        assert_eq!(
+            f.remedy,
+            Remedy::Manual { command: "warden scrub install --enable".into() }
+        );
+        // Installed but disabled: --fix / the GUI button can enable it.
+        let f = scrub_advisory(TimerState::Disabled).unwrap();
+        assert!(f.remedy.executable());
+        assert_eq!(
+            f.remedy.display(),
+            "systemctl --user enable --now modelwarden-scrub.timer"
+        );
     }
 
     #[test]
