@@ -904,6 +904,11 @@ fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
     if parts.len() > 1 {
         eprintln!("split model: {} parts", parts.len());
     }
+    let before = parts.len();
+    let parts = acquire::with_projectors(&files, parts);
+    for extra in &parts[before..] {
+        eprintln!("vision projector included (required for images): {extra}");
+    }
     download_files(repo, &parts, token.as_deref())
 }
 

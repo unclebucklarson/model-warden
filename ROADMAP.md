@@ -221,6 +221,17 @@ backed up, which are the same bytes — without ever losing bytes.**
   ("Archive 2") as well as id/path — labels existed but nothing accepted
   them. Proven E2E.
 
+- **Post-release polish (2026-08-25, user-driven).** Storefront: CI /
+  release / license badges in the README; GitHub repo description and
+  topics set. GUI: Inventory columns are sortable — click a header to
+  sort, again to reverse (default: name, ascending; previously rows sat
+  in hash order). Fetch closes the last bundle gap (user question re
+  vision models like Qwen3.8-Ridge + its mmproj): downloading a model now
+  pulls the repo's `mmproj` projector along automatically — same
+  asymmetric rule as the catalog's bundle_for (projector rides along,
+  choosing the projector alone stays alone). Backup/archive/demote/
+  restore already bundled projectors since M9. 74 tests green.
+
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 
 **All planned milestones M0–M13.3 are complete.** 73 tests green, tree

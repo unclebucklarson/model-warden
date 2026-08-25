@@ -514,8 +514,11 @@ warden fetch unsloth/Qwen3.8-27B-GGUF Q4_K_XL    # downloads the match
 
 Split models expand automatically: match any part of a
 `-00001-of-00003`-style set and all parts download together (a set with
-missing parts is refused rather than half-downloaded). Interrupted
-downloads resume where they stopped — just re-run the command.
+missing parts is refused rather than half-downloaded). Vision models get
+the same treatment: if the repo ships an `mmproj` projector (required for
+image input), downloading the model pulls the projector along too — the
+bundle promise (2.4) starts at download time. Interrupted downloads
+resume where they stopped — just re-run the command.
 
 Safetensors-style repos (no GGUFs):
 

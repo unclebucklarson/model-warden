@@ -46,6 +46,18 @@ enum Msg {
     Error(String),
 }
 
+/// Sortable Inventory columns; clicking a header sorts by it, clicking
+/// again reverses.
+#[derive(Default, PartialEq, Clone, Copy)]
+enum InvCol {
+    #[default]
+    Name,
+    Quant,
+    Size,
+    Where,
+    State,
+}
+
 #[derive(Default, PartialEq, Clone, Copy)]
 enum Pane {
     #[default]
@@ -89,6 +101,8 @@ struct App {
     demote_target: String,
     demote_remove: bool,
     fix_confirm: Option<usize>,
+    inv_sort_col: InvCol,
+    inv_sort_asc: bool,
     show_fetch: bool,
     fetch_repo: String,
     fetch_token: String,
@@ -127,6 +141,8 @@ impl App {
             demote_target: String::new(),
             demote_remove: false,
             fix_confirm: None,
+            inv_sort_col: InvCol::Name,
+            inv_sort_asc: true,
             show_fetch: false,
             fetch_repo: String::new(),
             fetch_token: String::new(),
@@ -596,24 +612,73 @@ impl App {
             .iter()
             .any(|r| r.kind == RootKind::Removable && r.path.exists());
         let mut actions: Vec<RowAction> = Vec::new();
+        let (sort_col, sort_asc) = (self.inv_sort_col, self.inv_sort_asc);
+        let mut sort_clicked: Option<InvCol> = None;
+        let quant_of = |e: &manifest::ModelEntry| {
+            e.meta
+                .as_ref()
+                .and_then(|g| g.quantization.clone())
+                .unwrap_or_default()
+        };
+        let where_of = |e: &manifest::ModelEntry| {
+            let mut kinds: Vec<&str> = e.locations.iter().map(|l| l.kind.label()).collect();
+            kinds.sort();
+            kinds.dedup();
+            kinds.join(" + ")
+        };
+        // Rows sorted by the chosen column (ties break on name), with the
+        // live-location count precomputed once per row.
+        let mut rows: Vec<_> = inv
+            .models
+            .iter()
+            .map(|(k, e)| {
+                let live = e.locations.iter().filter(|l| inv.live_accessible(l)).count();
+                (k, e, live)
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            let ord = match sort_col {
+                InvCol::Name => a.1.display_name.to_lowercase().cmp(&b.1.display_name.to_lowercase()),
+                InvCol::Quant => quant_of(a.1).cmp(&quant_of(b.1)),
+                InvCol::Size => a.1.size.cmp(&b.1.size),
+                InvCol::Where => where_of(a.1).cmp(&where_of(b.1)),
+                InvCol::State => a.2.cmp(&b.2),
+            };
+            let ord = if sort_asc { ord } else { ord.reverse() };
+            ord.then_with(|| a.1.display_name.cmp(&b.1.display_name))
+        });
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("inventory")
                 .striped(true)
                 .min_col_width(60.0)
                 .show(ui, |ui| {
-                    ui.strong("Name");
-                    ui.strong("Quant");
-                    ui.strong("Size");
-                    ui.strong("Where");
-                    ui.strong("State");
+                    let mut header = |ui: &mut egui::Ui, label: &str, col: InvCol| {
+                        let marker = if sort_col == col {
+                            if sort_asc { " ▲" } else { " ▼" }
+                        } else {
+                            ""
+                        };
+                        if ui
+                            .add(
+                                egui::Button::new(
+                                    egui::RichText::new(format!("{label}{marker}")).strong(),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Sort by this column (click again to reverse)")
+                            .clicked()
+                        {
+                            sort_clicked = Some(col);
+                        }
+                    };
+                    header(ui, "Name", InvCol::Name);
+                    header(ui, "Quant", InvCol::Quant);
+                    header(ui, "Size", InvCol::Size);
+                    header(ui, "Where", InvCol::Where);
+                    header(ui, "State", InvCol::State);
                     ui.strong("");
                     ui.end_row();
-                    for (key, entry) in &inv.models {
-                        let live = entry
-                            .locations
-                            .iter()
-                            .filter(|l| inv.live_accessible(l))
-                            .count();
+                    for (key, entry, live) in rows {
                         let offline_only = live == 0;
                         let text = |s: String| {
                             if offline_only {
@@ -642,19 +707,9 @@ impl App {
                         }
                         ui.label(text(entry.display_name.clone()))
                             .on_hover_text(hover.join("\n"));
-                        ui.label(text(
-                            entry
-                                .meta
-                                .as_ref()
-                                .and_then(|g| g.quantization.clone())
-                                .unwrap_or_default(),
-                        ));
+                        ui.label(text(quant_of(entry)));
                         ui.label(text(human_size(entry.size)));
-                        let mut kinds: Vec<&str> =
-                            entry.locations.iter().map(|l| l.kind.label()).collect();
-                        kinds.sort();
-                        kinds.dedup();
-                        ui.label(text(kinds.join(" + ")));
+                        ui.label(text(where_of(entry)));
                         if offline_only {
                             ui.weak("OFFLINE");
                         } else {
@@ -718,6 +773,14 @@ impl App {
                         .unwrap_or(key);
                     self.show_backup = true;
                 }
+            }
+        }
+        if let Some(col) = sort_clicked {
+            if self.inv_sort_col == col {
+                self.inv_sort_asc = !self.inv_sort_asc;
+            } else {
+                self.inv_sort_col = col;
+                self.inv_sort_asc = true;
             }
         }
     }
@@ -1193,15 +1256,24 @@ impl App {
             }
         }
         if let Some((repo, filename)) = download {
-            let parts = self
-                .fetch_files
-                .as_deref()
-                .map(|all| modelwarden::core::acquire::split_set(all, &filename))
-                .unwrap_or_else(|| Ok(vec![filename.clone()]));
+            use modelwarden::core::acquire;
+            let all = self.fetch_files.as_deref().unwrap_or_default();
+            let parts = if all.is_empty() {
+                Ok(vec![filename.clone()])
+            } else {
+                acquire::split_set(all, &filename)
+            };
             match parts {
                 Ok(parts) => {
                     if parts.len() > 1 {
                         self.activity.push(format!("split model: {} parts", parts.len()));
+                    }
+                    let before = parts.len();
+                    let parts = acquire::with_projectors(all, parts);
+                    for extra in &parts[before..] {
+                        self.activity.push(format!(
+                            "vision projector included (required for images): {extra}"
+                        ));
                     }
                     self.spawn_fetch(repo, parts, explicit_token.clone());
                     open = false;

@@ -137,6 +137,27 @@ pub fn split_set(all: &[RemoteFile], chosen: &str) -> Result<Vec<String>> {
     Ok(parts)
 }
 
+/// Complete a download set with the repo's `mmproj` vision projectors —
+/// the same rule the catalog's bundle_for applies: a projector rides
+/// along with its model (it's required for images), but choosing the
+/// projector alone never drags the model in. Mirrored here so the bundle
+/// promise starts at download time, not at the first backup.
+pub fn with_projectors(all: &[RemoteFile], mut set: Vec<String>) -> Vec<String> {
+    let is_projector = |name: &str| {
+        let base = name.rsplit('/').next().unwrap_or(name).to_lowercase();
+        base.contains("mmproj") && base.ends_with(".gguf")
+    };
+    if set.iter().all(|f| is_projector(f)) {
+        return set; // projector-only choice stays as chosen
+    }
+    for f in all {
+        if is_projector(&f.filename) && !set.contains(&f.filename) {
+            set.push(f.filename.clone());
+        }
+    }
+    set
+}
+
 /// GGUF files a repo offers, with sizes when the API provides them.
 ///
 /// HF answers **401 for unknown repo ids too** (it hides private repos), so
@@ -484,6 +505,37 @@ mod tests {
 
         // No siblings array at all is an error, not an empty repo.
         assert!(files_from_siblings("org/repo", &serde_json::json!({}), false).is_err());
+    }
+
+    #[test]
+    fn projectors_ride_along_with_the_model_never_the_reverse() {
+        let files = |names: &[&str]| -> Vec<RemoteFile> {
+            names
+                .iter()
+                .map(|n| RemoteFile { filename: n.to_string(), size: None })
+                .collect()
+        };
+        let all = files(&[
+            "Qwen-Ridge-3.7bpw.gguf",
+            "mmproj-Qwen-BF16.gguf",
+            "README.md",
+        ]);
+        // Downloading the model pulls the projector too.
+        assert_eq!(
+            with_projectors(&all, vec!["Qwen-Ridge-3.7bpw.gguf".into()]),
+            vec!["Qwen-Ridge-3.7bpw.gguf", "mmproj-Qwen-BF16.gguf"]
+        );
+        // Downloading just the projector stays just the projector.
+        assert_eq!(
+            with_projectors(&all, vec!["mmproj-Qwen-BF16.gguf".into()]),
+            vec!["mmproj-Qwen-BF16.gguf"]
+        );
+        // No projector in the repo: set unchanged.
+        let plain = files(&["model-Q4.gguf"]);
+        assert_eq!(
+            with_projectors(&plain, vec!["model-Q4.gguf".into()]),
+            vec!["model-Q4.gguf"]
+        );
     }
 
     #[test]
