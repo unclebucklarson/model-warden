@@ -82,6 +82,10 @@ versioned contract — see [docs/inventory-schema.md](docs/inventory-schema.md).
 Drives carry their own `.modelwarden/manifest.json`, so a backup drive is
 self-describing on any machine.
 
+**New to modelwarden? Start with the [User's Guide](docs/users-guide.md)** —
+a full walkthrough for newcomers: the concepts, both programs, every
+command, and the everyday recipes.
+
 ## Setting up
 
 First run, in order:
@@ -105,6 +109,7 @@ Rust, edition 2024. `cargo build` / `cargo test`; `cargo run` opens the GUI.
 The hash-path crates are optimized even in dev profiles (see Cargo.toml).
 
 Design authority: [PLAN.md](PLAN.md). Status: [ROADMAP.md](ROADMAP.md).
+User documentation: [docs/users-guide.md](docs/users-guide.md).
 Spike results that shaped the design: [docs/spikes.md](docs/spikes.md).
 Project overview for readers outside the repo: [docs/overview.md](docs/overview.md).
 

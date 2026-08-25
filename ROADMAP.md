@@ -206,6 +206,13 @@ backed up, which are the same bytes — without ever losing bytes.**
   itself vs. you). **Still to build: CI workflow (build+test) and the
   tag-triggered release workflow (GH Releases with packaged binaries);
   needs the repo pushed to GitHub — public/private is the user's call.**
+  Also landed pre-release (user request, 2026-08-25): **docs/users-guide.md**
+  — a comprehensive novice-facing guide (concepts with reasons, GUI tour,
+  CLI reference, recipes, findings glossary, FAQ, glossary), linked from
+  the README. Writing it surfaced a real gap, fixed alongside: `verify`
+  and `demote --to` now accept a drive's registration **label**
+  ("Archive 2") as well as id/path — labels existed but nothing accepted
+  them. Proven E2E.
 
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 

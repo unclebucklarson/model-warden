@@ -29,7 +29,7 @@ Commands (landing per ROADMAP.md milestone):
                                    root). No query = everything; queries pick
                                    models, each expanded to its full bundle
                                    (split parts, vision projectors)
-  verify <path|root-id> [--repair]
+  verify <path|root-id|label> [--repair]
   verify --all [--repair]          re-hash roots against their manifests;
                                    --all covers every online owned root,
                                    --repair re-copies mismatched/missing
@@ -39,7 +39,7 @@ Commands (landing per ROADMAP.md milestone):
                                    `hash && verify --all` on a schedule;
                                    --enable also starts it
   archive <query>                  promote a cache-owned model to the shelf
-  archive demote <query> --to <path|id> [--remove-source]
+  archive demote <query> --to <path|id|label> [--remove-source]
                                    verified copy to cold storage; the shelf
                                    copy is deleted only with --remove-source
   restore <query>                  verified copy from a drive back to the shelf
@@ -557,7 +557,7 @@ fn cmd_archive(args: &[String]) -> ExitCode {
 
     if args.get(1).map(String::as_str) == Some("demote") {
         let Some(query) = args.get(2).filter(|a| !a.starts_with("--")) else {
-            eprintln!("usage: warden archive demote <query> --to <path|root-id> [--remove-source]");
+            eprintln!("usage: warden archive demote <query> --to <path|root-id|label> [--remove-source]");
             return ExitCode::from(2);
         };
         let Some(to) = args
@@ -565,7 +565,7 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             .position(|a| a == "--to")
             .and_then(|i| args.get(i + 1))
         else {
-            eprintln!("warden: demote needs --to <path|root-id>");
+            eprintln!("warden: demote needs --to <path|root-id|label>");
             return ExitCode::from(2);
         };
         let remove_source = args.iter().any(|a| a == "--remove-source");
@@ -576,7 +576,12 @@ fn cmd_archive(args: &[String]) -> ExitCode {
         let canonical = std::path::Path::new(to).canonicalize().ok();
         let Some(target) = modelwarden::core::roots::discover_roots(&cfg)
             .into_iter()
-            .find(|r| r.id == *to || Some(&r.path) == canonical.as_ref())
+            // Addressable by id, path, or the registration label.
+            .find(|r| {
+                r.id == *to
+                    || r.label.as_deref() == Some(to.as_str())
+                    || Some(&r.path) == canonical.as_ref()
+            })
         else {
             eprintln!("warden: {to} is not a registered root — `warden roots add` it first");
             return ExitCode::from(2);
@@ -1203,13 +1208,19 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
         }
     } else {
         let Some(which) = args.get(1).filter(|a| !a.starts_with("--")) else {
-            eprintln!("usage: warden verify <path|root-id> [--repair]  |  warden verify --all [--repair]");
+            eprintln!("usage: warden verify <path|root-id|label> [--repair]  |  warden verify --all [--repair]");
             return ExitCode::from(2);
         };
         let canonical = std::path::Path::new(which).canonicalize().ok();
         let man = match manifest::load_all_manifests(&state)
             .into_iter()
-            .find(|m| m.root.id == *which || Some(&m.root.path) == canonical.as_ref())
+            // A root is addressable by id, path, or the human label the
+            // user gave it at registration ("Archive 2").
+            .find(|m| {
+                m.root.id == *which
+                    || m.root.label.as_deref() == Some(which.as_str())
+                    || Some(&m.root.path) == canonical.as_ref()
+            })
         {
             Some(m) => m,
             None => {
