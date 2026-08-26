@@ -18,7 +18,8 @@ worker (~680 MB/s measured; ~8 min for 300 GiB, then near-instant reruns).
 
 - **`warden`** — the CLI. Every read command takes `--json`.
 - **`warden-gui`** (`cargo run`) — a traditional desktop app: menu bar,
-  status bar, activity log; Inventory / Duplicates / Usage / Health tabs.
+  status bar, activity log; Inventory / Duplicates / Usage / Health /
+  Trash tabs.
 
 ## Commands
 
@@ -40,16 +41,29 @@ warden verify <path|id|--all> [--repair]
                          re-hash roots against their manifests (bit-rot
                          check); --repair re-copies bad files from a live
                          source, replacing them atomically
-warden scrub install     systemd user timer: hash && verify --all on a
-                         schedule (weekly default); written, never enabled
+warden scrub install [--enable]
+                         systemd user timer: hash && verify --all on a
+                         schedule (weekly default); --enable also starts it
 warden archive <query>   promote a cache-owned model to the shelf
 warden archive demote <query> --to <root> [--remove-source]
 warden restore <query>   verified copy from a drive back to the shelf
+warden delete <query…>   stage 1 of deletion: move bundles to the root's
+                         trash (a rename — restorable, nothing destroyed);
+                         shared companions auto-kept, foreign copies get
+                         the owner command printed, never run
+warden trash [list|restore <q>|empty --yes]
+                         inspect / undo / permanently destroy — `empty
+                         --yes` is warden's only irreversible act
+warden roots forget <id|label|path> --yes
+                         un-register a drive that is truly gone (died,
+                         reformatted) after an impact preview; removes
+                         knowledge only, touches no bytes
 warden dedup [--hardlink]  collapse same-fs duplicates (dry run by default)
 warden report            disk usage by model family
 warden fetch <org/repo> [pattern] [--token T]
-                         download from HF: split sets fetched together,
-                         Range resume, gated repos via --token
+                         download from HF: split sets and mmproj vision
+                         projectors fetched together, dropped connections
+                         auto-resume mid-transfer, gated repos via --token
                          [--save-token], the GUI token field, config
                          hf_token, $HF_TOKEN, or the hf CLI's saved login.
                          Wrong repo ids get did-you-mean suggestions
@@ -67,15 +81,19 @@ detected and stolen.
 
 - **Never write inside a store another tool owns** (Ollama, HF cache):
   scanned and reported; cleanup routes through the owning tool's own CLI,
-  run only on explicit request. Sole exception: `*.incomplete` download
-  debris, removed with an active-download guard. Orphan blobs (real bytes)
-  are always left to the human.
+  run only on explicit request — and its success is verified, never
+  trusted. Two guarded exceptions warden removes itself: `*.incomplete`
+  download debris and provably-empty pruned husks. Orphan blobs (real
+  bytes) are always left to the human.
 - **Every copy is verified**: `.partial` temp name → source-read hash must
   match the catalog → destination read back and re-hashed → rename.
 - **The only reclaim is hardlinking** (same filesystem, owned roots only),
   and both sides are re-hashed against the bytes on disk first.
-- **The one sanctioned deletion**: `archive demote --remove-source`, after
-  the cold copy verified — a provably completed move.
+- **Bytes are destroyed only by `trash empty`**: deletion is two-stage —
+  `delete` renames bundles into the root's trash (restorable), and only
+  the explicit empty destroys them. The other sanctioned removal,
+  `demote --remove-source`, fires only after the cold copy verified — a
+  provably completed move.
 - **Offline is not gone**: unplugged drives keep their manifests; the
   catalog answers "it's on the drive labeled archive1".
 

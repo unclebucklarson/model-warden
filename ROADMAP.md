@@ -288,24 +288,24 @@ backed up, which are the same bytes — without ever losing bytes.**
   Delete dialog also now surfaces offline copies up front. Proven E2E.
   77 tests green.
 
-## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
+## ⇒ PICK UP HERE (state as of 2026-08-26, v0.2.0)
 
-**All planned milestones M0–M13.3 are complete.** 73 tests green, tree
-clean, docs current. Stores are healthy (husks cleaned 2026-08-20); the
-one open doctor finding is the scrub-timer advisory, by design. What
-remains:
+**Everything through M15 + the use-in-anger wave is complete and
+released**: v0.2.0 on GitHub Releases and crates.io (`cargo install
+modelwarden`). 77 tests green, CI on every push, docs current. The
+scrub timer is enabled on the dev machine. What remains:
 
-1. **User actions pending (one-liners):**
-   - Enable the scrub timer: `warden doctor --fix` now does it, or
-     `systemctl --user enable --now modelwarden-scrub.timer`.
-   - Restart the GUI if it's been running since before M12/M13 (picks up
-     safetensors rows, whole-snapshot download, durable activity log).
+1. **User's real-world task in progress:** the corrupt "Archive 2"
+   drive — `warden roots forget "Archive 2" --yes`, reformat,
+   re-register, re-run backups.
 2. **Sibling integration** — llamacppCodeConf reads `inventory.json`
    (schema v1, frozen, docs/inventory-schema.md). **Owned by the Claude
-   instance in `~/src2/llamacppCodeConf`**, to start after its in-flight
-   updates land. Do NOT start from this repo.
-3. Otherwise: **use-in-anger pass** — the backlog is empty; let real usage
-   surface the next milestone, as it did for M8.1/M9/M10.
+   instance in `~/src2/llamacppCodeConf`.** Do NOT start from this repo.
+3. Otherwise: **use-in-anger** — the backlog is empty; real usage keeps
+   nominating the next work (it has produced every milestone since M13).
+
+Release routine: bump Cargo.toml version → commit → `git tag vX.Y.Z &&
+git push origin vX.Y.Z` (GH release builds itself) → `cargo publish`.
 
 ## Smaller items (fold in opportunistically)
 

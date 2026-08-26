@@ -159,16 +159,19 @@ in `docs/spikes.md`.
 
 ## Milestones
 
-> **Status 2026-08-20: all milestones complete** — M0–M7 as planned below,
+> **Status 2026-08-26 (v0.2.0): all milestones complete** — M0–M7 as planned below,
 > plus M8 (restore, split-GGUF + gated downloads, write lock), M8.1 (HF
 > token management, 401 did-you-mean), M9 (bundles — every operation moves
 > everything a model needs to run; selective backup; native folder pickers),
 > M10 (doctor remedies: owner-mediated cleanup via `hf cache rm` /
 > `ollama rm`, full explanations + loss statements per finding), M11
 > (scrub timer, verify --repair, provenance surfaced), M12 (safetensors
-> model directories as whole-container bundles), and M13 (whole-snapshot
-> fetch for non-GGUF repos). Details and per-milestone results in
-> ROADMAP.md.
+> model directories as whole-container bundles), M13 (whole-snapshot
+> fetch), M14 (GitHub + crates.io release pipeline, dual MIT/Apache-2.0),
+> M15 (two-stage deletion), and the use-in-anger wave: cold-storage
+> workflow, companion-grouped sortable inventory, auto-resuming
+> downloads, `roots forget` for dead drives. Details and per-milestone
+> results in ROADMAP.md.
 
 - **M0 — plan + scaffold + spikes.** This document, CLAUDE.md, ROADMAP.md, a
   compiling scaffold (both bins runnable), and the four spikes run with verdicts

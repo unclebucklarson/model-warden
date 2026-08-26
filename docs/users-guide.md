@@ -1,6 +1,6 @@
 # modelwarden — User's Guide
 
-*For version 0.1.0. Written for newcomers: every concept is explained, and
+*For version 0.2.0. Written for newcomers: every concept is explained, and
 every feature comes with the reason it exists.*
 
 ---
