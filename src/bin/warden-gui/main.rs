@@ -104,6 +104,8 @@ struct App {
     inv_sort_col: InvCol,
     inv_sort_asc: bool,
     inv_filter: String,
+    /// Parents whose companion rows are expanded (collapsed by default).
+    inv_expanded: std::collections::BTreeSet<String>,
     show_fetch: bool,
     fetch_repo: String,
     fetch_token: String,
@@ -145,6 +147,7 @@ impl App {
             inv_sort_col: InvCol::Name,
             inv_sort_asc: true,
             inv_filter: String::new(),
+            inv_expanded: std::collections::BTreeSet::new(),
             show_fetch: false,
             fetch_repo: String::new(),
             fetch_token: String::new(),
@@ -689,7 +692,17 @@ impl App {
         // Final display order: each primary model followed by its indented
         // companions (a companion shows under its first parent in sort
         // order). A group shows if the model OR any companion matches.
-        let mut display: Vec<(&String, &manifest::ModelEntry, usize, Option<String>)> = Vec::new();
+        // Companions are collapsed by default; an active filter forces
+        // groups open so a companion match is always visible.
+        struct DispRow<'a> {
+            key: &'a String,
+            entry: &'a manifest::ModelEntry,
+            live: usize,
+            required_by: Option<String>,
+            kids: usize,
+            expanded: bool,
+        }
+        let mut display: Vec<DispRow> = Vec::new();
         for (k, e, live) in &rows {
             if parents_of.contains_key(*k) {
                 continue; // rendered under its parent below
@@ -703,15 +716,33 @@ impl App {
             if !row_matches(k, e) && !children.iter().any(|(ck, ce, _)| row_matches(ck, ce)) {
                 continue;
             }
-            display.push((k, e, *live, None));
-            for (ck, ce, clive) in children {
-                let req: Vec<&str> = parents_of[*ck]
-                    .iter()
-                    .filter_map(|p| inv.models.get(p).map(|pe| pe.display_name.as_str()))
-                    .collect();
-                display.push((ck, ce, *clive, Some(format!("required by {}", req.join(", ")))));
+            let expanded = !filter.is_empty() || self.inv_expanded.contains(*k);
+            display.push(DispRow {
+                key: k,
+                entry: e,
+                live: *live,
+                required_by: None,
+                kids: children.len(),
+                expanded,
+            });
+            if expanded {
+                for (ck, ce, clive) in children {
+                    let req: Vec<&str> = parents_of[*ck]
+                        .iter()
+                        .filter_map(|p| inv.models.get(p).map(|pe| pe.display_name.as_str()))
+                        .collect();
+                    display.push(DispRow {
+                        key: ck,
+                        entry: ce,
+                        live: *clive,
+                        required_by: Some(format!("required by {}", req.join(", "))),
+                        kids: 0,
+                        expanded: false,
+                    });
+                }
             }
         }
+        let mut toggled: Option<String> = None;
 
         egui::ScrollArea::both().show(ui, |ui| {
             egui::Grid::new("inventory")
@@ -744,7 +775,7 @@ impl App {
                     header(ui, "State", InvCol::State);
                     ui.strong("");
                     ui.end_row();
-                    for (key, entry, live, required_by) in display {
+                    for DispRow { key, entry, live, required_by, kids, expanded } in display {
                         let offline_only = live == 0;
                         let text = |s: String| {
                             if offline_only {
@@ -777,6 +808,26 @@ impl App {
                                     ui.label(text(format!("    ↳ {}", entry.display_name)))
                                         .on_hover_text(format!("{note}\n{}", hover.join("\n")));
                                     ui.weak(format!("       {note}"));
+                                });
+                            }
+                            None if kids > 0 => {
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .small_button(if expanded { "▾" } else { "▸" })
+                                        .on_hover_text(format!(
+                                            "{} {kids} required file{}",
+                                            if expanded { "Hide" } else { "Show" },
+                                            if kids == 1 { "" } else { "s" },
+                                        ))
+                                        .clicked()
+                                    {
+                                        toggled = Some(key.clone());
+                                    }
+                                    ui.label(text(entry.display_name.clone()))
+                                        .on_hover_text(hover.join("\n"));
+                                    if !expanded {
+                                        ui.weak(format!("+{kids}"));
+                                    }
                                 });
                             }
                             None => {
@@ -858,6 +909,11 @@ impl App {
             } else {
                 self.inv_sort_col = col;
                 self.inv_sort_asc = true;
+            }
+        }
+        if let Some(k) = toggled {
+            if !self.inv_expanded.remove(&k) {
+                self.inv_expanded.insert(k);
             }
         }
     }
