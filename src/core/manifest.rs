@@ -473,7 +473,7 @@ pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
     keys.into_iter().collect()
 }
 
-fn ollama_base(name: &str) -> &str {
+pub(crate) fn ollama_base(name: &str) -> &str {
     name.strip_suffix("+projector").unwrap_or(name)
 }
 

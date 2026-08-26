@@ -17,3 +17,4 @@ pub mod roots;
 pub mod scan;
 pub mod scrub;
 pub mod settings;
+pub mod trash;

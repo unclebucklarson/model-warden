@@ -17,7 +17,7 @@ update it when milestones land.
 
 - `cargo build` / `cargo test` — core is headless and fully testable.
 - `cargo run` — opens the GUI (`default-run = "warden-gui"`).
-- `cargo run --bin warden -- <scan|hash|status|dups|doctor|roots|where|backup|verify|archive|restore|dedup|report|fetch>` — CLI; `--json` on all read commands.
+- `cargo run --bin warden -- <scan|hash|status|dups|doctor|roots|where|backup|verify|scrub|archive|restore|dedup|report|fetch|delete|trash>` — CLI; `--json` on all read commands.
 - Config: `~/.config/modelwarden/config.json` (records only what the user changed).
 - State (manifests, merged inventory): `~/.local/state/modelwarden/`.
 
@@ -50,8 +50,13 @@ Non-obvious constraints that shape the code:
 - **Operations move bundles, not files.** Backup/archive/demote/restore carry
   everything a model needs to run: split `-NNNNN-of-NNNNN` parts, mmproj
   projectors beside the model, Ollama `+projector` blobs (`bundle_for`).
-- **Never delete model bytes.** The only reclaim is hardlinking, after
-  hash-verifying both files, via temp-link+rename.
+- **Bytes are destroyed only by `trash empty`.** Deletion is two-stage
+  (`src/core/trash.rs`): `delete` renames a bundle into
+  `<root>/.modelwarden/trash/` (restorable, nothing destroyed; companions
+  another model needs are auto-kept; foreign copies get owner commands
+  printed, never run); only the explicit `trash empty --yes` / GUI
+  Empty-Trash confirm destroys bytes. Space reclaim otherwise is
+  hardlinking, after hash-verifying both files, via temp-link+rename.
 - **All copies go .partial → verify hash → rename.** A half-copy must never be
   scannable as a model. Refuse-overwrite everywhere.
 - **A missing root is Offline, not gone.** Never drop offline entries from

@@ -57,6 +57,16 @@ Commands (landing per ROADMAP.md milestone):
                                    for safetensors-style repos, where the
                                    directory is the model (weights,
                                    tokenizer, configs, subdirs together)
+  delete <query…>                  stage 1 of deletion: move each model's
+                                   bundle into its root's trash (a rename —
+                                   nothing destroyed, fully restorable).
+                                   Companions another model still needs are
+                                   kept; foreign-store copies get the owner
+                                   command printed, never executed
+  trash [list]                     what the trash holds, where, how old
+  trash restore <query>            rename matching files back into place
+  trash empty --yes                stage 2: permanently destroy the trash —
+                                   warden's only irreversible act
 ";
 
 fn main() -> ExitCode {
@@ -87,6 +97,8 @@ fn main() -> ExitCode {
         Some("dedup") => cmd_dedup(&args, json),
         Some("report") => cmd_report(json),
         Some("fetch") => cmd_fetch(&args, json),
+        Some("delete") => cmd_delete(&args),
+        Some("trash") => cmd_trash(&args, json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -1033,6 +1045,191 @@ fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode
     }
     rerun_hash_quietly();
     if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+}
+
+/// Stage 1 of deletion: bundles move (rename) into their root's trash.
+/// Nothing is destroyed here — that takes `trash empty --yes`.
+fn cmd_delete(args: &[String]) -> ExitCode {
+    use modelwarden::core::trash;
+    let queries: Vec<&String> = args[1..]
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .collect();
+    if queries.is_empty() {
+        eprintln!("usage: warden delete <query…>");
+        return ExitCode::from(2);
+    }
+    let state = settings::state_dir();
+    let Some(inv) = manifest::load_inventory(&state) else {
+        eprintln!("warden: no inventory yet — run `warden hash` first");
+        return ExitCode::from(2);
+    };
+    let mut keys: Vec<String> = Vec::new();
+    for q in &queries {
+        match resolve_one(&inv, q) {
+            Ok((key, _)) => keys.push(key.to_string()),
+            Err(code) => return code,
+        }
+    }
+    let (del, kept) = trash::deletable_set(&inv, &keys);
+    let total: u64 = del
+        .iter()
+        .filter_map(|k| inv.models.get(k).map(|e| e.size))
+        .sum();
+    let _lock = match take_write_lock(&state) {
+        Ok(l) => l,
+        Err(code) => return code,
+    };
+    for (name, why) in &kept {
+        println!("kept {name} — {why}");
+    }
+    match trash::move_to_trash(&inv, &del) {
+        Ok(report) => {
+            for (name, path) in &report.trashed {
+                println!("trashed {name} → {}", path.display());
+            }
+            for (name, root) in &report.offline {
+                println!("left {name} on offline root {root} — rerun `warden delete` when it's plugged in");
+            }
+            if !report.foreign.is_empty() {
+                println!("\nalso in foreign stores — warden never touches those; run yourself:");
+                for (_, cmd) in &report.foreign {
+                    println!("    {cmd}");
+                }
+            }
+            println!(
+                "\n{} files moved to trash ({}). Nothing destroyed:",
+                report.trashed.len(),
+                human_size(total)
+            );
+            println!("    undo:            warden trash restore <name>");
+            println!("    reclaim space:   warden trash empty --yes");
+            rerun_hash_quietly();
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("warden: {e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_trash(args: &[String], json: bool) -> ExitCode {
+    use modelwarden::core::trash;
+    let cfg = settings::AppConfig::load(&settings::config_file());
+    let roots = modelwarden::core::roots::discover_roots(&cfg);
+    match args.get(1).map(String::as_str) {
+        None | Some("list") => {
+            let items = trash::list(&roots);
+            if json {
+                let rows: Vec<serde_json::Value> = items
+                    .iter()
+                    .map(|f| {
+                        serde_json::json!({
+                            "root_id": f.root_id,
+                            "rel_path": f.rel_path,
+                            "size": f.size,
+                            "trashed_unix": f.trashed_unix,
+                        })
+                    })
+                    .collect();
+                return print_json(&rows);
+            }
+            if items.is_empty() {
+                println!("trash is empty");
+                return ExitCode::SUCCESS;
+            }
+            let total: u64 = items.iter().map(|f| f.size).sum();
+            for f in &items {
+                println!(
+                    "{:>10}  {:<50}  [{}] {}",
+                    human_size(f.size),
+                    f.rel_path.display(),
+                    f.root_label,
+                    ago(f.trashed_unix)
+                );
+            }
+            println!(
+                "\n{} files, {} — restore with `warden trash restore <name>`, \
+                 destroy with `warden trash empty --yes`",
+                items.len(),
+                human_size(total)
+            );
+            ExitCode::SUCCESS
+        }
+        Some("restore") => {
+            let Some(q) = args.get(2).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: warden trash restore <query>");
+                return ExitCode::from(2);
+            };
+            let ql = q.to_lowercase();
+            let items: Vec<_> = trash::list(&roots)
+                .into_iter()
+                .filter(|f| f.rel_path.to_string_lossy().to_lowercase().contains(&ql))
+                .collect();
+            if items.is_empty() {
+                eprintln!("warden: nothing in the trash matches \"{q}\"");
+                return ExitCode::from(1);
+            }
+            let state = settings::state_dir();
+            let _lock = match take_write_lock(&state) {
+                Ok(l) => l,
+                Err(code) => return code,
+            };
+            let mut failed = false;
+            for f in &items {
+                let Some(root) = roots.iter().find(|r| r.id == f.root_id) else { continue };
+                match trash::restore(root, &f.rel_path) {
+                    Ok(dst) => println!("restored {}", dst.display()),
+                    Err(e) => {
+                        eprintln!("warden: {e:#}");
+                        failed = true;
+                    }
+                }
+            }
+            rerun_hash_quietly();
+            if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
+        }
+        Some("empty") => {
+            let items = trash::list(&roots);
+            let total: u64 = items.iter().map(|f| f.size).sum();
+            if items.is_empty() {
+                println!("trash is already empty");
+                return ExitCode::SUCCESS;
+            }
+            if !args.iter().any(|a| a == "--yes") {
+                println!(
+                    "would PERMANENTLY DESTROY {} files ({}) — this cannot be undone.",
+                    items.len(),
+                    human_size(total)
+                );
+                println!("rerun with --yes to proceed: warden trash empty --yes");
+                return ExitCode::SUCCESS;
+            }
+            let state = settings::state_dir();
+            let _lock = match take_write_lock(&state) {
+                Ok(l) => l,
+                Err(code) => return code,
+            };
+            let mut count = 0usize;
+            let mut bytes = 0u64;
+            for root in &roots {
+                match trash::empty(root) {
+                    Ok((c, b)) => {
+                        count += c;
+                        bytes += b;
+                    }
+                    Err(e) => eprintln!("warden: {}: {e:#}", root.id),
+                }
+            }
+            println!("destroyed {count} files, {} reclaimed", human_size(bytes));
+            ExitCode::SUCCESS
+        }
+        _ => {
+            eprintln!("usage: warden trash [list] | trash restore <query> | trash empty --yes");
+            ExitCode::from(2)
+        }
+    }
 }
 
 fn cmd_report(json: bool) -> ExitCode {

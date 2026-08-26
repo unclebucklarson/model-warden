@@ -55,8 +55,10 @@ modelwarden exists:
 
 **What warden deliberately does not do:** it never runs or serves models,
 never edits another tool's configuration, and — this is the core promise —
-**never deletes model bytes**. It is a librarian, not a janitor with a
-shredder. The full safety rules are in section 2.5.
+**never destroys model bytes as a side effect of anything**. The only way
+bytes stop existing is the deliberate, two-step trash flow (delete, then
+empty the trash) described in 2.5. It is a librarian, not a janitor with a
+shredder.
 
 ---
 
@@ -155,14 +157,19 @@ human with a file manager could still rescue everything.
 
 These invariants hold everywhere, in both the GUI and CLI:
 
-1. **Model bytes are never deleted.** The only space reclaim is
-   *hardlinking* — making two directory entries share one copy of the bytes
-   (see 2.6) — and even that happens only after re-hashing both files to
-   prove they are still identical. The single exception: an *archive with
-   move* (`demote --remove-source`) deletes the original **only after** the
-   new copy's bytes have been read back from the destination and
-   hash-verified. Deletion happens only when the bytes provably exist
-   somewhere else.
+1. **Bytes are destroyed only by emptying the trash.** Deleting a model
+   (`warden delete`, or Delete… in the GUI) *moves* its bundle into the
+   root's trash — a same-filesystem rename: instant, free, and fully
+   restorable. Only the separate, explicit act of emptying the trash
+   (`warden trash empty --yes`, or the GUI's Empty Trash confirmation)
+   destroys bytes — two decisions, deliberately separated in time.
+   Companions another model still needs (a shared vision projector) are
+   automatically spared. Otherwise, space reclaim is *hardlinking* —
+   making two directory entries share one copy of the bytes (see 2.6) —
+   after re-hashing both files to prove they are still identical; and an
+   *archive with move* (`demote --remove-source`) deletes the original
+   **only after** the new copy's bytes have been read back from the
+   destination and hash-verified.
 2. **Every copy is verified end-to-end.** Copies are written to a temporary
    `.partial` name, hashed as written, read back from the destination and
    hashed *again*, and only then renamed into place. A power cut mid-copy
@@ -314,6 +321,11 @@ Row actions:
   files included, shared companions moved once.
 - **Back up…** — back up this model (and everything it needs — its whole
   bundle) to a drive.
+- **Delete…** — move the model's bundle to the trash (see the Trash tab
+  below). The confirmation shows exactly what will move, what is kept
+  because another model needs it, and — for copies in Ollama or the HF
+  cache — the owning tool's command for you to run yourself (warden never
+  touches foreign stores). Nothing is destroyed by this action.
 
 ### 4.2 The Duplicates tab 🔗
 
@@ -341,7 +353,17 @@ it opens a confirmation showing exactly what will run and who is acting
 exceptions), and nothing happens until you click **Run it**. Findings that
 must stay manual show you the exact command to copy.
 
-### 4.5 Menus and dialogs
+### 4.5 The Trash tab 🗑
+
+Deleted bundles land here, intact — a delete is just a rename into
+`<root>/.modelwarden/trash/`. Each file shows its size, root, and age, with
+a per-file **Restore** (a rename back; it refuses to overwrite anything
+that reappeared). **Empty Trash…** is warden's single irreversible act: a
+confirmation states the exact count and size being destroyed, and only
+that click makes bytes stop existing. There is no automatic emptying —
+destruction never happens on a schedule.
+
+### 4.6 Menus and dialogs
 
 - **File → Update Catalog** — rescan all roots, hash new/changed files,
   rewrite the catalog. Same as `warden hash`. Progress shows in the status
@@ -450,6 +472,17 @@ hash prefix matters when two different models share a name.
   (safetensors-style): downloads the *whole snapshot* into one shelf
   directory, because for those models the directory is the model (see 2.4).
   Plain `fetch` on such a repo lists the files and suggests this.
+- **`warden delete <query…>`** — stage 1 of deletion: each model's bundle
+  moves into its root's trash (a rename — nothing destroyed, fully
+  restorable). Companions another model still needs are kept
+  automatically; copies in foreign stores get the owner command printed
+  for you to run yourself.
+- **`warden trash`** — list what the trash holds, where, and how old.
+- **`warden trash restore <query>`** — rename matching files back into
+  place.
+- **`warden trash empty --yes`** — stage 2: permanently destroy the
+  trash's contents. Without `--yes` it only reports what would be
+  destroyed. This is warden's one irreversible command.
 - **`warden version`** / **`warden help`** — what they say.
 
 ---
@@ -627,12 +660,12 @@ re-fingerprints and re-hashes; the "failure" disappears). If you didn't,
 that's bit rot or a bad copy: run `verify --repair` to re-copy from a
 healthy source.
 
-**Why won't warden just delete X?** — by design (2.5). Anything that
-removes model bytes either goes through the owning tool's command with your
-confirmation, is provably byte-free (husks, `.incomplete` debris), or is a
-verified move that proved the bytes exist elsewhere first. When warden
-won't act, it prints the exact command so the decision — and the deletion —
-is yours.
+**How do I actually delete a model?** — `warden delete <name>` (or the
+row's Delete… button), then, when you're sure, `warden trash empty --yes`
+(or Empty Trash… in the Trash tab). The two steps are separate on purpose:
+the first is a free, restorable rename; only the second destroys bytes.
+Copies inside Ollama or the HF cache are never touched — warden prints the
+owning tool's removal command for you to run yourself.
 
 **The system Ollama store (`/usr/share/ollama/…`) shows nothing** — it's
 often unreadable to your user account. Warden degrades gracefully and

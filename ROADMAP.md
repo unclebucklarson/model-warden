@@ -256,7 +256,25 @@ backed up, which are the same bytes — without ever losing bytes.**
   models leave the view, never the catalog. Proven E2E (bulk demote of 2
   of 3 models, verified moves). 74 tests green. **Open discussion:
   deletes — a way to totally remove models; touches the never-delete
-  invariant, options under discussion with the user.**
+  invariant, options under discussion with the user.** → became M15, below.
+
+- **M15 — two-stage deletion (2026-08-25; user decisions: Option B trash
+  with GUI parity / foreign stores offered-never-executed / shared
+  companions auto-kept / delete = everywhere in owned roots).** The
+  never-delete invariant's one sanctioned amendment, recorded in PLAN.md
+  and CLAUDE.md: `warden delete <query…>` renames bundles into
+  `<root>/.modelwarden/trash/` (instant, free, restorable, invisible to
+  scans); `warden trash [list|restore <q>|empty --yes]` completes the
+  cycle — `empty` is warden's only irreversible act and requires --yes
+  (CLI) / a count-and-size confirm (GUI). Companions still required by a
+  surviving model are auto-kept via bundle asymmetry; foreign-store
+  copies yield owner commands (printed CLI / copyable in the GUI dialog),
+  never executed. GUI: Delete… row action with full preview, and a Trash
+  tab (list, per-file Restore, Empty Trash…). No trash index — the
+  filesystem is the record, human-rescuable with a file manager. No
+  auto-empty, ever. Proven E2E: shared projector spared on single delete,
+  taken when both users deleted; restore refuses overwrite; empty
+  destroys only trash contents. 77 tests green.
 
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 

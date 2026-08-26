@@ -65,6 +65,7 @@ enum Pane {
     Duplicates,
     Usage,
     Health,
+    Trash,
 }
 
 /// Buttons inside the grid can't take `&mut self`; they queue here and the
@@ -73,6 +74,7 @@ enum RowAction {
     Promote(String),
     DemoteDialog(String),
     BackupDialog(String),
+    DeleteDialog(String),
 }
 
 struct App {
@@ -101,6 +103,9 @@ struct App {
     demote_target: String,
     demote_remove: bool,
     show_cold: bool,
+    delete_key: Option<String>,
+    trash_items: Option<Vec<modelwarden::core::trash::TrashedFile>>,
+    show_empty_confirm: bool,
     cold_filter: String,
     cold_sel: std::collections::BTreeSet<String>,
     cold_target: String,
@@ -151,6 +156,9 @@ impl App {
             demote_target: String::new(),
             demote_remove: false,
             show_cold: false,
+            delete_key: None,
+            trash_items: None,
+            show_empty_confirm: false,
             cold_filter: String::new(),
             cold_sel: std::collections::BTreeSet::new(),
             cold_target: String::new(),
@@ -929,6 +937,18 @@ impl App {
                             {
                                 actions.push(RowAction::BackupDialog(key.clone()));
                             }
+                            if key.starts_with("sha256:")
+                                && required_by.is_none()
+                                && ui
+                                    .small_button("Delete…")
+                                    .on_hover_text(
+                                        "Move this model's bundle to the trash — a rename, \
+                                         nothing destroyed; restorable until you empty the trash",
+                                    )
+                                    .clicked()
+                            {
+                                actions.push(RowAction::DeleteDialog(key.clone()));
+                            }
                         });
                         ui.end_row();
                     }
@@ -948,6 +968,7 @@ impl App {
                         .unwrap_or(key);
                     self.show_backup = true;
                 }
+                RowAction::DeleteDialog(key) => self.delete_key = Some(key),
             }
         }
         if let Some(col) = sort_clicked {
@@ -1275,6 +1296,290 @@ impl App {
             self.spawn_demote(keys, target, remove);
         } else {
             self.show_cold = open;
+        }
+    }
+
+    /// Stage 1 of deletion, previewed: what goes to the trash, what is
+    /// kept for other models, and the owner commands for foreign copies
+    /// (shown, never run). Confirming moves files — destroys nothing.
+    fn delete_dialog(&mut self, ctx: &egui::Context) {
+        use modelwarden::core::trash;
+        let Some(key) = self.delete_key.clone() else { return };
+        let Some(inv) = self.inv.clone() else {
+            self.delete_key = None;
+            return;
+        };
+        let keys = vec![key.clone()];
+        let (del, kept) = trash::deletable_set(&inv, &keys);
+        let foreign = trash::foreign_commands(&inv, &del);
+        let total: u64 = del
+            .iter()
+            .filter_map(|k| inv.models.get(k).map(|e| e.size))
+            .sum();
+        let name = inv
+            .models
+            .get(&key)
+            .map(|e| e.display_name.clone())
+            .unwrap_or_else(|| key.clone());
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new("Move to Trash")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.strong(format!("{name} — {} incl. required files", human_size(total)));
+                ui.label(
+                    "This MOVES the bundle into its root's trash (a rename — nothing \
+                     is destroyed). Restore any time from the Trash tab; space returns \
+                     only when you empty the trash.",
+                );
+                for (n, why) in &kept {
+                    ui.weak(format!("kept: {n} — {why}"));
+                }
+                if !foreign.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label("Copies in foreign stores are never touched — run yourself if wanted:");
+                    for cmd in &foreign {
+                        ui.horizontal(|ui| {
+                            ui.monospace(cmd);
+                            if ui.small_button("Copy").clicked() {
+                                ui.ctx().copy_text(cmd.clone());
+                            }
+                        });
+                    }
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Move to Trash").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if go {
+            self.delete_key = None;
+            self.spawn_delete(keys);
+        } else if !open || cancel {
+            self.delete_key = None;
+        }
+    }
+
+    fn spawn_delete(&mut self, keys: Vec<String>) {
+        self.trash_items = None;
+        self.spawn("moving to trash", move |tx| {
+            use modelwarden::core::trash;
+            let state = settings::state_dir();
+            let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            let Some(inv) = manifest::load_inventory(&state) else {
+                let _ = tx.send(Msg::Error("catalog missing — update it first".into()));
+                return;
+            };
+            let (del, kept) = trash::deletable_set(&inv, &keys);
+            for (n, why) in &kept {
+                let _ = tx.send(Msg::Activity(format!("kept {n} — {why}")));
+            }
+            match trash::move_to_trash(&inv, &del) {
+                Ok(report) => {
+                    for (n, p) in &report.trashed {
+                        let _ = tx.send(Msg::Activity(format!("trashed {n} → {}", p.display())));
+                    }
+                    for (n, root) in &report.offline {
+                        let _ = tx.send(Msg::Activity(format!(
+                            "left {n} on offline root {root} — delete again when it's plugged in"
+                        )));
+                    }
+                    for (_, cmd) in &report.foreign {
+                        let _ = tx.send(Msg::Activity(format!("foreign copy — run yourself: {cmd}")));
+                    }
+                    if let Some(inv) = Self::refresh_catalog(tx) {
+                        let _ = tx.send(Msg::Refreshed(inv));
+                    }
+                    let _ = tx.send(Msg::Finished(format!(
+                        "{} files moved to trash — nothing destroyed (Trash tab to restore or empty)",
+                        report.trashed.len()
+                    )));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    /// The trash: what's inside, per-file restore, and the one truly
+    /// irreversible act — emptying it — behind its own confirm dialog.
+    fn trash_pane(&mut self, ui: &mut egui::Ui) {
+        use modelwarden::core::trash;
+        let cfg = settings::AppConfig::load(&settings::config_file());
+        let roots = modelwarden::core::roots::discover_roots(&cfg);
+        let items = self
+            .trash_items
+            .get_or_insert_with(|| trash::list(&roots))
+            .clone();
+        if items.is_empty() {
+            ui.label("The trash is empty.");
+            ui.label(
+                "Delete… on an Inventory row moves a model's bundle here — a rename, \
+                 nothing destroyed — and it stays restorable until the trash is emptied.",
+            );
+            return;
+        }
+        let total: u64 = items.iter().map(|f| f.size).sum();
+        let mut restore_req: Option<(String, std::path::PathBuf)> = None;
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} files, {} — nothing here is lost until the trash is emptied.",
+                items.len(),
+                human_size(total)
+            ));
+            if ui.button("Empty Trash…").clicked() {
+                self.show_empty_confirm = true;
+            }
+            if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+                self.trash_items = None;
+            }
+        });
+        ui.separator();
+        egui::ScrollArea::both().show(ui, |ui| {
+            egui::Grid::new("trash").striped(true).min_col_width(60.0).show(ui, |ui| {
+                ui.strong("File");
+                ui.strong("Size");
+                ui.strong("Root");
+                ui.strong("Trashed");
+                ui.strong("");
+                ui.end_row();
+                for f in &items {
+                    ui.label(f.rel_path.display().to_string());
+                    ui.label(human_size(f.size));
+                    ui.label(&f.root_label);
+                    ui.label(ago_str(f.trashed_unix));
+                    if ui
+                        .small_button("Restore")
+                        .on_hover_text("Rename back into place (refuses to overwrite)")
+                        .clicked()
+                    {
+                        restore_req = Some((f.root_id.clone(), f.rel_path.clone()));
+                    }
+                    ui.end_row();
+                }
+            });
+        });
+        if let Some((root_id, rel)) = restore_req {
+            self.spawn_restore(root_id, rel);
+        }
+    }
+
+    fn spawn_restore(&mut self, root_id: String, rel: std::path::PathBuf) {
+        self.trash_items = None;
+        self.spawn("restoring from trash", move |tx| {
+            use modelwarden::core::trash;
+            let state = settings::state_dir();
+            let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                Ok(l) => l,
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    return;
+                }
+            };
+            let cfg = settings::AppConfig::load(&settings::config_file());
+            let Some(root) = modelwarden::core::roots::discover_roots(&cfg)
+                .into_iter()
+                .find(|r| r.id == root_id)
+            else {
+                let _ = tx.send(Msg::Error(format!("root {root_id} not found")));
+                return;
+            };
+            match trash::restore(&root, &rel) {
+                Ok(dst) => {
+                    let _ = tx.send(Msg::Activity(format!("restored {}", dst.display())));
+                    if let Some(inv) = Self::refresh_catalog(tx) {
+                        let _ = tx.send(Msg::Refreshed(inv));
+                    }
+                    let _ = tx.send(Msg::Finished(format!("restored {}", dst.display())));
+                }
+                Err(e) => {
+                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+                }
+            }
+        });
+    }
+
+    fn empty_confirm_dialog(&mut self, ctx: &egui::Context) {
+        use modelwarden::core::trash;
+        if !self.show_empty_confirm {
+            return;
+        }
+        let cfg = settings::AppConfig::load(&settings::config_file());
+        let roots = modelwarden::core::roots::discover_roots(&cfg);
+        let items = trash::list(&roots);
+        let total: u64 = items.iter().map(|f| f.size).sum();
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new("Empty Trash")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.strong(format!(
+                    "PERMANENTLY DESTROY {} files ({})?",
+                    items.len(),
+                    human_size(total)
+                ));
+                ui.label(
+                    "This is warden's only irreversible act. The bytes stop existing; \
+                     no backup, catalog entry, or restore can bring them back.",
+                );
+                ui.horizontal(|ui| {
+                    if ui.button(format!("Destroy {} files", items.len())).clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if go {
+            self.show_empty_confirm = false;
+            self.trash_items = None;
+            self.spawn("emptying trash", move |tx| {
+                let state = settings::state_dir();
+                let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(format!("{e:#}")));
+                        return;
+                    }
+                };
+                let cfg = settings::AppConfig::load(&settings::config_file());
+                let mut count = 0usize;
+                let mut bytes = 0u64;
+                for root in modelwarden::core::roots::discover_roots(&cfg) {
+                    if let Ok((c, b)) = trash::empty(&root) {
+                        count += c;
+                        bytes += b;
+                    }
+                }
+                let _ = tx.send(Msg::Activity(format!(
+                    "destroyed {count} files, {} reclaimed",
+                    human_size(bytes)
+                )));
+                let _ = tx.send(Msg::Finished(format!(
+                    "trash emptied: {count} files, {} reclaimed",
+                    human_size(bytes)
+                )));
+            });
+        } else if !open || cancel {
+            self.show_empty_confirm = false;
         }
     }
 
@@ -1886,6 +2191,7 @@ impl eframe::App for App {
                 ui.selectable_value(&mut self.pane, Pane::Duplicates, "🔗 Duplicates");
                 ui.selectable_value(&mut self.pane, Pane::Usage, "📊 Usage");
                 ui.selectable_value(&mut self.pane, Pane::Health, "🩺 Health");
+                ui.selectable_value(&mut self.pane, Pane::Trash, "🗑 Trash");
             });
             ui.separator();
             match self.pane {
@@ -1893,6 +2199,7 @@ impl eframe::App for App {
                 Pane::Duplicates => self.duplicates_pane(ui),
                 Pane::Usage => self.usage_pane(ui),
                 Pane::Health => self.health_pane(ui),
+                Pane::Trash => self.trash_pane(ui),
             }
         });
 
@@ -1900,6 +2207,8 @@ impl eframe::App for App {
         self.backup_dialog(ui.ctx());
         self.demote_dialog(ui.ctx());
         self.cold_dialog(ui.ctx());
+        self.delete_dialog(ui.ctx());
+        self.empty_confirm_dialog(ui.ctx());
         self.reclaim_dialog(ui.ctx());
         self.fetch_dialog(ui.ctx());
         self.fix_dialog(ui.ctx());
@@ -1930,4 +2239,15 @@ fn ago(unix: u64) -> String {
 
 fn human_size(bytes: u64) -> String {
     modelwarden::core::format::human_size(bytes)
+}
+
+fn ago_str(unix: u64) -> String {
+    let now = manifest::now_unix();
+    let d = now.saturating_sub(unix);
+    match d {
+        0..=90 => format!("{d}s ago"),
+        91..=5400 => format!("{} min ago", d / 60),
+        5401..=172_800 => format!("{} hours ago", d / 3600),
+        _ => format!("{} days ago", d / 86_400),
+    }
 }
