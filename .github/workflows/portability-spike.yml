@@ -1,0 +1,27 @@
+name: Portability spike
+
+# Manually-triggered only: compile + test on macOS and Windows runners to
+# turn the portability seam table (docs/portability.md) into compiler
+# facts. Not part of CI; failures here are findings, not breakage.
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  spike:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Check (compile front)
+        run: cargo check --locked --all-targets
+      - name: Test (behavior front)
+        run: cargo test --locked
