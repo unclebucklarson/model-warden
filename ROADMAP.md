@@ -301,8 +301,15 @@ scrub timer is enabled on the dev machine. What remains:
 2. **Sibling integration** — llamacppCodeConf reads `inventory.json`
    (schema v1, frozen, docs/inventory-schema.md). **Owned by the Claude
    instance in `~/src2/llamacppCodeConf`.** Do NOT start from this repo.
-3. Otherwise: **use-in-anger** — the backlog is empty; real usage keeps
-   nominating the next work (it has produced every milestone since M13).
+3. **M16 candidate — macOS/Windows support (external user request,
+   2026-08-26).** Spike run on real runners (verdict in docs/spikes.md
+   #5): macOS passes 76/77 tests already (one lock-liveness fix);
+   Windows needs the unix-metadata seam abstracted (7 files, mechanical).
+   Full analysis, tiers, and M16a/M16b ship checklists:
+   **docs/portability.md**. Waiting on the requester's platform to pick
+   the first target before building.
+4. Otherwise: **use-in-anger** — real usage keeps nominating the next
+   work (it has produced every milestone since M13).
 
 Release routine: bump Cargo.toml version → commit → `git tag vX.Y.Z &&
 git push origin vX.Y.Z` (GH release builds itself) → `cargo publish`.

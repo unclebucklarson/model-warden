@@ -64,3 +64,15 @@ lists *attached* devices — so the manifest must persist the UUID; an
 unplugged drive is identified by its stored manifest, not by probing.
 Fallback for weak-UUID filesystems: `.modelwarden/root-id` marker file on
 owned removable roots.
+
+## Spike 5 — macOS/Windows portability (run 2026-08-26, real GH runners)
+
+`cargo check` + `cargo test` on `macos-latest` and `windows-latest` via
+the manual-dispatch `portability-spike.yml` workflow. Verdict: **macOS
+passes 76 of 77 tests today** — the sole failure is the write lock's
+`/proc`-based liveness check judging a live lock stale (single seam,
+single fix: `kill(pid, 0)`). **Windows doesn't compile**: every error is
+`std::os::unix` metadata (dev/ino/mode) across seven files — mechanical,
+not architectural; the safety invariants (rename, hardlink, hash-verify)
+are all platform-neutral. Full seam table, tier definitions, and ship
+checklists: docs/portability.md.
