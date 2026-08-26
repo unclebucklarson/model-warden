@@ -1349,6 +1349,34 @@ impl App {
                         });
                     }
                 }
+                // Copies on unplugged drives can't move now — say so up
+                // front, not just in the activity log afterwards.
+                let offline: Vec<String> = del
+                    .iter()
+                    .filter_map(|k| inv.models.get(k))
+                    .flat_map(|e| {
+                        e.locations.iter().filter_map(|l| {
+                            let root = inv.roots.iter().find(|r| r.id == l.root_id)?;
+                            (root.kind.owned() && !inv.live_accessible(l)).then(|| {
+                                format!(
+                                    "{} — on \"{}\" (offline)",
+                                    e.display_name,
+                                    root.label.clone().unwrap_or_else(|| root.id.clone())
+                                )
+                            })
+                        })
+                    })
+                    .collect();
+                if !offline.is_empty() {
+                    ui.add_space(4.0);
+                    ui.label(
+                        "Copies on offline drives stay put for now — run Delete… \
+                         again with the drive plugged in:",
+                    );
+                    for o in &offline {
+                        ui.weak(o);
+                    }
+                }
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui.button("Move to Trash").clicked() {

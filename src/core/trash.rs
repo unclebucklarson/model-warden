@@ -87,7 +87,8 @@ pub fn move_to_trash(inv: &Inventory, del: &BTreeSet<String>) -> Result<TrashRep
                 continue;
             }
             if !inv.live_accessible(loc) {
-                report.offline.push((entry.display_name.clone(), root.id.clone()));
+                let label = root.label.clone().unwrap_or_else(|| root.id.clone());
+                report.offline.push((entry.display_name.clone(), label));
                 continue;
             }
             let src = root.path.join(&loc.rel_path);
@@ -150,7 +151,10 @@ fn owner_removal_command(display_name: &str, kind: RootKind, rel_path: &Path) ->
             let first = rel_path.components().next()?;
             let dir = first.as_os_str().to_string_lossy();
             let repo = dir.strip_prefix("models--")?.replace("--", "/");
-            Some(format!("hf cache rm {repo} -y"))
+            // hf's cache rm wants the typed id ("model/org/name") — the bare
+            // repo id silently matches nothing ("Could not find in cache",
+            // exit 0). Found in the field.
+            Some(format!("hf cache rm model/{repo} -y"))
         }
         _ => None,
     }
@@ -368,7 +372,7 @@ mod tests {
                 RootKind::HfHub,
                 Path::new("models--org--Repo/snapshots/rev/m.gguf")
             ),
-            Some("hf cache rm org/Repo -y".into())
+            Some("hf cache rm model/org/Repo -y".into())
         );
         assert_eq!(
             owner_removal_command("x", RootKind::Shelf, Path::new("m.gguf")),
