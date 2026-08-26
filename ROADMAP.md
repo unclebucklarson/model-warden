@@ -244,6 +244,20 @@ backed up, which are the same bytes — without ever losing bytes.**
   validates. Publishing awaits the user's `cargo login` token; after
   first publish, add CARGO_REGISTRY_TOKEN to the release workflow.
 
+- **Cold-storage workflow (2026-08-25, user refinement).** Collapsible
+  companions (▸/+N toggle, collapsed by default; filter forces groups
+  open). Bulk demote: CLI `archive demote <query…>` takes many queries;
+  GUI **Tools → Move to Cold Storage…** — checkbox list with filter,
+  target dropdown (any registered root: drive, NAS, or fixed dir),
+  remove-after-verify checkbox, bundle-inclusive size total; shared
+  companions move once (bundle union, deduped). Inventory **Active / All**
+  toggle: Active (default) hides models whose every copy is on a
+  registered cold root, with a "(N in cold storage hidden)" hint — cold
+  models leave the view, never the catalog. Proven E2E (bulk demote of 2
+  of 3 models, verified moves). 74 tests green. **Open discussion:
+  deletes — a way to totally remove models; touches the never-delete
+  invariant, options under discussion with the user.**
+
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 
 **All planned milestones M0–M13.3 are complete.** 73 tests green, tree

@@ -291,7 +291,11 @@ again to reverse), and use the **filter box** to narrow the list by name,
 quant, location, or hash. Files that exist only to serve another model —
 a vision `mmproj` projector, a safetensors model's tokenizer and config
 companions — appear **indented under the model that needs them**, marked
-"required by …", so the list reads as models, not as loose files. Rows for
+"required by …", so the list reads as models, not as loose files; they're
+collapsed behind a **▸** toggle by default. The **Active / All** switch
+controls whether cold-stored models (every copy on a registered cold-
+storage root) appear: Active shows your working set, All shows the whole
+catalog. Rows for
 models on an unplugged drive appear greyed with the drive's label —
 offline, not gone. Hover a row for details, including **provenance** if
 warden downloaded it (which repo, revision, and when).
@@ -301,9 +305,13 @@ Row actions:
 - **Archive** — copy a cache-owned model (e.g. one Ollama pulled) to your
   shelf, so no cache pruner can take it from you. Uses a hardlink when both
   are on the same filesystem, costing zero extra bytes.
-- **Demote…** — move a model to cold storage (a registered drive). A dialog
-  asks which drive, and whether to remove the shelf copy afterwards — the
-  removal happens only after the drive's copy hash-verifies (see 2.5).
+- **Demote…** — move a model to cold storage (a registered root — a drive,
+  NAS mount, or any folder you registered). A dialog asks which target,
+  and whether to remove the shelf copy afterwards — the removal happens
+  only after the target's copy hash-verifies (see 2.5). For many models at
+  once, use **Tools → Move to Cold Storage…**: check off models (a filter
+  helps), pick the target, and one confirmation moves them all — required
+  files included, shared companions moved once.
 - **Back up…** — back up this model (and everything it needs — its whole
   bundle) to a drive.
 
@@ -408,8 +416,8 @@ that write take the single-instance lock automatically.
 - **`warden archive <query>`** — *promote*: copy a cache-owned model to the
   shelf (hardlink when same-filesystem — zero extra bytes). The cache copy
   is untouched; you've just made sure a pruner can't take the model away.
-- **`warden archive demote <query> --to <path|root-id> [--remove-source]`**
-  — *demote*: move a model to cold storage. A verified copy lands on the
+- **`warden archive demote <query…> --to <path|root-id|label> [--remove-source]`**
+  — *demote*: move one or many models to cold storage in one command. A verified copy lands on the
   drive and is recorded in the drive's carried manifest; the shelf copy is
   deleted only if you passed `--remove-source`, and only after the drive
   copy's read-back hash matched.
@@ -490,7 +498,7 @@ warden dedup --hardlink     # reclaim (same bytes stay available at every path)
 And for models you want to *keep but not keep here*:
 
 ```
-warden archive demote gemma --to "Archive 2" --remove-source
+warden archive demote gemma qwen glm --to "Archive 2" --remove-source
 ```
 
 The shelf copy disappears only after the drive copy verifies. The model

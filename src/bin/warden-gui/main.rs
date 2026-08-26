@@ -100,12 +100,19 @@ struct App {
     demote_key: Option<String>,
     demote_target: String,
     demote_remove: bool,
+    show_cold: bool,
+    cold_filter: String,
+    cold_sel: std::collections::BTreeSet<String>,
+    cold_target: String,
+    cold_remove: bool,
     fix_confirm: Option<usize>,
     inv_sort_col: InvCol,
     inv_sort_asc: bool,
     inv_filter: String,
     /// Parents whose companion rows are expanded (collapsed by default).
     inv_expanded: std::collections::BTreeSet<String>,
+    /// false = Active view (cold-stored models hidden); true = everything.
+    inv_show_all: bool,
     show_fetch: bool,
     fetch_repo: String,
     fetch_token: String,
@@ -143,11 +150,17 @@ impl App {
             demote_key: None,
             demote_target: String::new(),
             demote_remove: false,
+            show_cold: false,
+            cold_filter: String::new(),
+            cold_sel: std::collections::BTreeSet::new(),
+            cold_target: String::new(),
+            cold_remove: false,
             fix_confirm: None,
             inv_sort_col: InvCol::Name,
             inv_sort_asc: true,
             inv_filter: String::new(),
             inv_expanded: std::collections::BTreeSet::new(),
+            inv_show_all: false,
             show_fetch: false,
             fetch_repo: String::new(),
             fetch_token: String::new(),
@@ -315,7 +328,7 @@ impl App {
         });
     }
 
-    fn spawn_demote(&mut self, key: String, root_id: String, remove_source: bool) {
+    fn spawn_demote(&mut self, keys: Vec<String>, root_id: String, remove_source: bool) {
         self.spawn("demoting to cold storage", move |tx| {
             let state = settings::state_dir();
             let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
@@ -329,10 +342,6 @@ impl App {
                 let _ = tx.send(Msg::Error("catalog missing — update it first".into()));
                 return;
             };
-            let Some(entry) = inv.models.get(&key) else {
-                let _ = tx.send(Msg::Error("model vanished from the catalog".into()));
-                return;
-            };
             let cfg = settings::AppConfig::load(&settings::config_file());
             let Some(target) = modelwarden::core::roots::discover_roots(&cfg)
                 .into_iter()
@@ -341,10 +350,15 @@ impl App {
                 let _ = tx.send(Msg::Error(format!("root {root_id} not found")));
                 return;
             };
-            let _ = entry;
             let mut on = event_to_progress(tx.clone());
             let mut lines = Vec::new();
-            for k in manifest::bundle_for(&inv, &key) {
+            // Union of every selected model's bundle, deduped — a shared
+            // companion moves once.
+            let all: std::collections::BTreeSet<String> = keys
+                .iter()
+                .flat_map(|k| manifest::bundle_for(&inv, k))
+                .collect();
+            for k in all {
                 let Some(e) = inv.models.get(&k) else { continue };
                 let on_shelf = e.locations.iter().any(|l| {
                     l.kind == RootKind::Shelf && inv.live_accessible(l)
@@ -536,6 +550,19 @@ impl App {
                 ui.close();
             }
             if ui
+                .button("Move to Cold Storage…")
+                .on_hover_text(
+                    "Select models to move (verified) to a registered root; \
+                     they leave the shelf but never the catalog",
+                )
+                .clicked()
+            {
+                self.show_cold = true;
+                self.cold_sel.clear();
+                self.cold_remove = true;
+                ui.close();
+            }
+            if ui
                 .button("Download from HuggingFace…")
                 .on_hover_text("Fetch a repo's GGUF into the shelf, resume-capable")
                 .clicked()
@@ -669,6 +696,15 @@ impl App {
             }
         }
 
+        // Cold-stored = every copy lives on a registered (cold) root. Those
+        // models leave the Active view but never the catalog.
+        let is_cold = |e: &manifest::ModelEntry| {
+            e.locations.iter().all(|l| l.kind == RootKind::Removable)
+        };
+        let cold_count = rows
+            .iter()
+            .filter(|(k, e, _)| !parents_of.contains_key(*k) && is_cold(e))
+            .count();
         ui.horizontal(|ui| {
             ui.label("Filter:");
             ui.add(
@@ -678,6 +714,14 @@ impl App {
             );
             if !self.inv_filter.is_empty() && ui.small_button("✕").clicked() {
                 self.inv_filter.clear();
+            }
+            ui.separator();
+            ui.selectable_value(&mut self.inv_show_all, false, "Active")
+                .on_hover_text("Models with a copy outside cold storage");
+            ui.selectable_value(&mut self.inv_show_all, true, "All")
+                .on_hover_text("Everything, cold storage included");
+            if !self.inv_show_all && cold_count > 0 {
+                ui.weak(format!("({cold_count} in cold storage hidden)"));
             }
         });
         let filter = self.inv_filter.trim().to_lowercase();
@@ -706,6 +750,9 @@ impl App {
         for (k, e, live) in &rows {
             if parents_of.contains_key(*k) {
                 continue; // rendered under its parent below
+            }
+            if !self.inv_show_all && is_cold(e) {
+                continue; // Active view: cold storage stays out of sight
             }
             let children: Vec<_> = rows
                 .iter()
@@ -1091,6 +1138,146 @@ impl App {
         }
     }
 
+    /// Bulk cold storage: check off models, pick a registered root, one
+    /// verified batch move. Companions ride along via bundle expansion.
+    fn cold_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_cold {
+            return;
+        }
+        let Some(inv) = self.inv.clone() else {
+            self.activity.push("no catalog yet — File → Update Catalog first".into());
+            self.show_cold = false;
+            return;
+        };
+        let targets: Vec<(String, String)> = inv
+            .roots
+            .iter()
+            .filter(|r| r.kind == RootKind::Removable && r.path.exists())
+            .map(|r| (r.id.clone(), r.label.clone().unwrap_or_else(|| r.id.clone())))
+            .collect();
+        if self.cold_target.is_empty() || !targets.iter().any(|(id, _)| *id == self.cold_target) {
+            self.cold_target = targets.first().map(|(id, _)| id.clone()).unwrap_or_default();
+        }
+        let companions = companion_keys(&inv);
+        // Selectable: primary models with a live shelf copy to move.
+        let eligible: Vec<(&String, &manifest::ModelEntry)> = inv
+            .models
+            .iter()
+            .filter(|(k, e)| {
+                k.starts_with("sha256:")
+                    && !companions.contains(*k)
+                    && e.locations
+                        .iter()
+                        .any(|l| l.kind == RootKind::Shelf && inv.live_accessible(l))
+            })
+            .collect();
+        // Selected total counts whole bundles, deduped.
+        let bundle_keys: std::collections::BTreeSet<String> = self
+            .cold_sel
+            .iter()
+            .flat_map(|k| manifest::bundle_for(&inv, k))
+            .collect();
+        let total: u64 = bundle_keys
+            .iter()
+            .filter_map(|k| inv.models.get(k).map(|e| e.size))
+            .sum();
+
+        let mut open = self.show_cold;
+        let mut start = false;
+        egui::Window::new("Move to Cold Storage")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Verified move: each copy must hash-verify on the target before \
+                     anything else happens. Moved models stay in the catalog — \
+                     findable, greyed while their root is offline.",
+                );
+                if targets.is_empty() {
+                    ui.label("No registered roots are reachable — File → Storage Roots… to add one.");
+                    return;
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Target:");
+                    egui::ComboBox::from_id_salt("cold_target")
+                        .selected_text(
+                            targets
+                                .iter()
+                                .find(|(id, _)| *id == self.cold_target)
+                                .map(|(_, l)| l.clone())
+                                .unwrap_or_default(),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (id, label) in &targets {
+                                ui.selectable_value(&mut self.cold_target, id.clone(), label);
+                            }
+                        });
+                    ui.checkbox(&mut self.cold_remove, "Remove shelf copy after verify")
+                        .on_hover_text(
+                            "Off = the shelf keeps its copy too (backup-style). \
+                             On = a true move; deletion happens only after the \
+                             target copy's read-back hash matched.",
+                        );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Filter:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.cold_filter)
+                            .desired_width(240.0),
+                    );
+                });
+                ui.separator();
+                let f = self.cold_filter.trim().to_lowercase();
+                egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
+                    for (k, e) in &eligible {
+                        if !f.is_empty() && !e.display_name.to_lowercase().contains(&f) {
+                            continue;
+                        }
+                        let mut on = self.cold_sel.contains(*k);
+                        if ui
+                            .checkbox(
+                                &mut on,
+                                format!("{} ({})", e.display_name, human_size(e.size)),
+                            )
+                            .changed()
+                        {
+                            if on {
+                                self.cold_sel.insert((*k).clone());
+                            } else {
+                                self.cold_sel.remove(*k);
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(format!(
+                        "{} selected — {} incl. required files",
+                        self.cold_sel.len(),
+                        human_size(total)
+                    ));
+                    if ui
+                        .add_enabled(
+                            !self.cold_sel.is_empty() && !self.cold_target.is_empty(),
+                            egui::Button::new("Move to cold storage"),
+                        )
+                        .clicked()
+                    {
+                        start = true;
+                    }
+                });
+            });
+        if start {
+            let keys: Vec<String> = self.cold_sel.iter().cloned().collect();
+            let target = self.cold_target.clone();
+            let remove = self.cold_remove;
+            self.show_cold = false;
+            self.spawn_demote(keys, target, remove);
+        } else {
+            self.show_cold = open;
+        }
+    }
+
     fn demote_dialog(&mut self, ctx: &egui::Context) {
         let Some(key) = self.demote_key.clone() else {
             return;
@@ -1167,7 +1354,7 @@ impl App {
             let target = self.demote_target.clone();
             let remove = self.demote_remove;
             self.demote_key = None;
-            self.spawn_demote(key, target, remove);
+            self.spawn_demote(vec![key], target, remove);
         } else if !open {
             self.demote_key = None;
         }
@@ -1623,6 +1810,21 @@ impl App {
     }
 }
 
+/// Contents that ride in another model's bundle while their own bundle
+/// stays alone (mmproj, Ollama +projector, safetensors companions) — the
+/// asymmetry bundle_for already encodes.
+fn companion_keys(inv: &manifest::Inventory) -> std::collections::BTreeSet<String> {
+    let mut out = std::collections::BTreeSet::new();
+    for k in inv.models.keys() {
+        for m in manifest::bundle_for(inv, k) {
+            if &m != k && !manifest::bundle_for(inv, &m).iter().any(|x| x == k) {
+                out.insert(m);
+            }
+        }
+    }
+    out
+}
+
 /// Backup/archive events all render the same way: durable log_line()
 /// events land in the activity panel (mirroring the CLI's output),
 /// transient ticks only update the status bar.
@@ -1697,6 +1899,7 @@ impl eframe::App for App {
         self.roots_dialog(ui.ctx());
         self.backup_dialog(ui.ctx());
         self.demote_dialog(ui.ctx());
+        self.cold_dialog(ui.ctx());
         self.reclaim_dialog(ui.ctx());
         self.fetch_dialog(ui.ctx());
         self.fix_dialog(ui.ctx());

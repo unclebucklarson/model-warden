@@ -39,7 +39,7 @@ Commands (landing per ROADMAP.md milestone):
                                    `hash && verify --all` on a schedule;
                                    --enable also starts it
   archive <query>                  promote a cache-owned model to the shelf
-  archive demote <query> --to <path|id|label> [--remove-source]
+  archive demote <query…> --to <path|id|label> [--remove-source]
                                    verified copy to cold storage; the shelf
                                    copy is deleted only with --remove-source
   restore <query>                  verified copy from a drive back to the shelf
@@ -556,10 +556,24 @@ fn cmd_archive(args: &[String]) -> ExitCode {
     let cfg = settings::AppConfig::load(&settings::config_file());
 
     if args.get(1).map(String::as_str) == Some("demote") {
-        let Some(query) = args.get(2).filter(|a| !a.starts_with("--")) else {
-            eprintln!("usage: warden archive demote <query> --to <path|root-id|label> [--remove-source]");
+        // Positional queries between "demote" and the flags — bulk cold
+        // storage is one command, not one command per model.
+        let mut queries: Vec<&String> = Vec::new();
+        let mut i = 2;
+        while i < args.len() {
+            match args[i].as_str() {
+                "--to" => i += 2,
+                a if a.starts_with("--") => i += 1,
+                _ => {
+                    queries.push(&args[i]);
+                    i += 1;
+                }
+            }
+        }
+        if queries.is_empty() {
+            eprintln!("usage: warden archive demote <query…> --to <path|root-id|label> [--remove-source]");
             return ExitCode::from(2);
-        };
+        }
         let Some(to) = args
             .iter()
             .position(|a| a == "--to")
@@ -569,10 +583,13 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         };
         let remove_source = args.iter().any(|a| a == "--remove-source");
-        let (key, _entry) = match resolve_one(&inv, query) {
-            Ok(m) => m,
-            Err(code) => return code,
-        };
+        let mut keys: Vec<String> = Vec::new();
+        for query in &queries {
+            match resolve_one(&inv, query) {
+                Ok((key, _entry)) => keys.push(key.to_string()),
+                Err(code) => return code,
+            }
+        }
         let canonical = std::path::Path::new(to).canonicalize().ok();
         let Some(target) = modelwarden::core::roots::discover_roots(&cfg)
             .into_iter()
@@ -591,7 +608,12 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             Err(code) => return code,
         };
         let mut failed = false;
-        for k in manifest::bundle_for(&inv, key) {
+        // Union of every query's bundle, deduped — shared companions move once.
+        let all: std::collections::BTreeSet<String> = keys
+            .iter()
+            .flat_map(|k| manifest::bundle_for(&inv, k))
+            .collect();
+        for k in all {
             let Some(e) = inv.models.get(&k) else { continue };
             let on_shelf = e.locations.iter().any(|l| {
                 l.kind == modelwarden::core::roots::RootKind::Shelf && inv.live_accessible(l)
