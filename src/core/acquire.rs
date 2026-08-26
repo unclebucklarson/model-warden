@@ -40,6 +40,9 @@ pub enum FetchEvent {
     /// Every ~8 MiB.
     Progress { label: String, done: u64, total: Option<u64> },
     Hashing { label: String },
+    /// The connection dropped mid-transfer; warden re-issues a Range
+    /// request from `at` on its own — no rerun needed.
+    Retry { label: String, at: u64, attempt: u32 },
 }
 
 impl FetchEvent {
@@ -59,6 +62,10 @@ impl FetchEvent {
             )),
             Self::Progress { .. } => None,
             Self::Hashing { label } => Some(format!("hashing {label}")),
+            Self::Retry { label, at, attempt } => Some(format!(
+                "connection dropped — resuming {label} at {} (attempt {attempt})",
+                human_size(*at)
+            )),
         }
     }
 }
@@ -297,90 +304,140 @@ pub fn fetch(
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let tmp = partial_path(&dest);
-    let mut resume_from = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-
     let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
     let label = format!("{repo}/{filename}");
-    let mut req = with_auth(agent().get(&url), token);
-    if resume_from > 0 {
-        req = req.set("Range", &format!("bytes={resume_from}-"));
-    }
-    let resp = req.call().with_context(|| format!("downloading {url}"))?;
 
-    // A 200 to a Range request means the server ignored it: start over.
-    let appending = resp.status() == 206;
-    if resume_from > 0 && !appending {
-        resume_from = 0;
-    }
-    // `x-repo-commit` is exact when present, but redirects (CDN, moved
-    // repos) routinely eat it — the API's HEAD-of-main sha is the fallback.
-    let revision = resp
-        .header("x-repo-commit")
-        .map(str::to_string)
-        .or_else(|| {
-            with_auth(
-                agent().get(&format!("https://huggingface.co/api/models/{repo}")),
-                token,
-            )
+    // A dropped connection is normal on a 20 GiB transfer: warden retries
+    // on its own, resuming from the .partial via a fresh Range request.
+    // Only zero-progress attempts count against the budget, so a flaky
+    // link that keeps inching forward never gives up.
+    const MAX_STALLED_ATTEMPTS: u32 = 5;
+    let mut stalled = 0u32;
+    let mut attempt = 0u32;
+    let mut started = false;
+    let mut revision: Option<String> = None;
+    let mut etag: Option<String> = None;
+    loop {
+        let mut resume_from = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        let pass_start = resume_from;
+        let mut retry = |at: u64, on: &mut dyn FnMut(FetchEvent)| -> Result<()> {
+            attempt += 1;
+            stalled = if at > pass_start { 0 } else { stalled + 1 };
+            if stalled >= MAX_STALLED_ATTEMPTS {
+                bail!(
+                    "download stalled at {} after {attempt} attempts — the partial is \
+                     kept; rerun the same fetch to resume ({})",
+                    at,
+                    tmp.display()
+                );
+            }
+            on(FetchEvent::Retry {
+                label: label.clone(),
+                at,
+                attempt,
+            });
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            Ok(())
+        };
+
+        let mut req = with_auth(agent().get(&url), token);
+        if resume_from > 0 {
+            req = req.set("Range", &format!("bytes={resume_from}-"));
+        }
+        let resp = match req.call() {
+            Ok(r) => r,
+            Err(ureq::Error::Status(code, r)) => {
+                return Err(ureq::Error::Status(code, r).into());
+            }
+            Err(e) => {
+                // Transport-level failure before any bytes: retry.
+                retry(resume_from, &mut on)
+                    .with_context(|| format!("downloading {url}: {e}"))?;
+                continue;
+            }
+        };
+
+        // A 200 to a Range request means the server ignored it: start over.
+        let appending = resp.status() == 206;
+        if resume_from > 0 && !appending {
+            resume_from = 0;
+        }
+        if revision.is_none() {
+            // `x-repo-commit` is exact when present, but redirects (CDN,
+            // moved repos) routinely eat it — the API's sha is the fallback.
+            revision = resp.header("x-repo-commit").map(str::to_string).or_else(|| {
+                with_auth(
+                    agent().get(&format!("https://huggingface.co/api/models/{repo}")),
+                    token,
+                )
                 .call()
                 .ok()
                 .and_then(|r| r.into_json::<serde_json::Value>().ok())
                 .and_then(|j| j.get("sha").and_then(|s| s.as_str()).map(str::to_string))
-        });
-    let etag = resp
-        .header("x-linked-etag")
-        .or_else(|| resp.header("etag"))
-        .map(|e| e.trim_matches('"').to_string());
-    let total = resp
-        .header("content-length")
-        .and_then(|l| l.parse::<u64>().ok())
-        .map(|l| l + if appending { resume_from } else { 0 });
-
-    on(FetchEvent::Start {
-        label: label.clone(),
-        total,
-        resumed_from: resume_from,
-    });
-
-    let mut file = if appending {
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&tmp)
-            .with_context(|| format!("appending to {}", tmp.display()))?
-    } else {
-        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
-    };
-    let mut reader = resp.into_reader();
-    let mut buf = vec![0u8; 1024 * 1024];
-    let mut done = resume_from;
-    let mut last = done;
-    loop {
-        let n = reader.read(&mut buf).context("network read")?;
-        if n == 0 {
-            break;
+            });
+            etag = resp
+                .header("x-linked-etag")
+                .or_else(|| resp.header("etag"))
+                .map(|e| e.trim_matches('"').to_string());
         }
-        file.write_all(&buf[..n])
-            .with_context(|| format!("writing {}", tmp.display()))?;
-        done += n as u64;
-        if done - last >= 8 * 1024 * 1024 {
-            last = done;
-            on(FetchEvent::Progress {
+        let total = resp
+            .header("content-length")
+            .and_then(|l| l.parse::<u64>().ok())
+            .map(|l| l + if appending { resume_from } else { 0 });
+
+        if !started {
+            started = true;
+            on(FetchEvent::Start {
                 label: label.clone(),
-                done,
                 total,
+                resumed_from: resume_from,
             });
         }
-    }
-    file.sync_all().ok();
-    drop(file);
-    if let Some(t) = total
-        && done != t
-    {
-        // Keep the .partial — the next fetch resumes from here.
-        bail!(
-            "connection ended early at {done}/{t} bytes — rerun to resume ({})",
-            tmp.display()
-        );
+
+        let mut file = if appending {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&tmp)
+                .with_context(|| format!("appending to {}", tmp.display()))?
+        } else {
+            std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?
+        };
+        let mut reader = resp.into_reader();
+        let mut buf = vec![0u8; 1024 * 1024];
+        let mut done = resume_from;
+        let mut last = done;
+        let outcome: Result<()> = loop {
+            let n = match reader.read(&mut buf) {
+                Ok(n) => n,
+                // Mid-stream drop ("response body closed before all bytes
+                // were read" and friends): resume, don't fail.
+                Err(e) => break Err(e.into()),
+            };
+            if n == 0 {
+                break Ok(());
+            }
+            // Disk errors are not retryable — fail immediately.
+            file.write_all(&buf[..n])
+                .with_context(|| format!("writing {}", tmp.display()))?;
+            done += n as u64;
+            if done - last >= 8 * 1024 * 1024 {
+                last = done;
+                on(FetchEvent::Progress {
+                    label: label.clone(),
+                    done,
+                    total,
+                });
+            }
+        };
+        file.sync_all().ok();
+        drop(file);
+
+        let short = total.is_some_and(|t| done < t);
+        if outcome.is_err() || short {
+            retry(done, &mut on)?;
+            continue;
+        }
+        break;
     }
     std::fs::rename(&tmp, &dest).with_context(|| format!("finalizing {}", dest.display()))?;
 
@@ -551,6 +608,13 @@ mod tests {
         );
         let tick = FetchEvent::Progress { label: "x".into(), done: 1, total: None };
         assert_eq!(tick.log_line(), None);
+        // A mid-transfer drop is reported as an automatic resume, not a
+        // failure — both frontends surface this line durably.
+        let retry = FetchEvent::Retry { label: "org/m.gguf".into(), at: 2048, attempt: 2 };
+        assert_eq!(
+            retry.log_line().as_deref(),
+            Some("connection dropped — resuming org/m.gguf at 2.0 KiB (attempt 2)")
+        );
     }
 
     #[test]

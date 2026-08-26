@@ -563,8 +563,11 @@ Split models expand automatically: match any part of a
 missing parts is refused rather than half-downloaded). Vision models get
 the same treatment: if the repo ships an `mmproj` projector (required for
 image input), downloading the model pulls the projector along too — the
-bundle promise (2.4) starts at download time. Interrupted downloads
-resume where they stopped — just re-run the command.
+bundle promise (2.4) starts at download time. Dropped connections
+resume automatically mid-download (a fresh Range request from the byte
+where it stopped, retried until it stalls outright); a download that
+still fails keeps its `.partial`, and re-running the same command
+resumes from it.
 
 Safetensors-style repos (no GGUFs):
 
