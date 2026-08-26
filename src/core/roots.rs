@@ -181,6 +181,30 @@ fn generated_id(path: &Path) -> String {
     format!("ext-{:08x}", h.finish() as u32)
 }
 
+/// Un-register a root — the user declaring "this drive is truly gone"
+/// (died, reformatted, given away). Removes only warden's *knowledge*:
+/// the registration here, and (by the caller) the stored manifest. No
+/// bytes are touched — if the drive still works, its files and its
+/// carried manifest are intact, and re-registering re-catalogs it.
+/// Matches by id, label, or path.
+pub fn forget_root(
+    cfg: &mut crate::core::settings::AppConfig,
+    key: &str,
+) -> Result<crate::core::settings::RegisteredRoot> {
+    let canonical = Path::new(key).canonicalize().ok();
+    let idx = cfg
+        .roots
+        .iter()
+        .position(|r| {
+            r.id == key
+                || r.label.as_deref() == Some(key)
+                || r.path == Path::new(key)
+                || Some(&r.path) == canonical.as_ref()
+        })
+        .with_context(|| format!("{key} is not a registered root (see `warden roots list`)"))?;
+    Ok(cfg.roots.remove(idx))
+}
+
 fn root_id(kind: RootKind, path: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(path.as_bytes());

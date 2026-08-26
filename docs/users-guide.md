@@ -462,6 +462,14 @@ hash prefix matters when two different models share a name.
   glossary.
 - **`warden roots add <path> [--label X]`** / **`warden roots list`** —
   register and list drives (see 2.2).
+- **`warden roots forget <id|label|path> --yes`** — for a drive that is
+  *truly* gone: died, got reformatted, was given away. "Offline is not
+  gone" holds right up until you know otherwise — this is how you tell
+  warden. It removes only warden's knowledge (no bytes are touched
+  anywhere); without `--yes` it previews the cost: how many models had
+  copies there, and how many existed nowhere else and will leave the
+  catalog. A working drive can always be re-registered and re-cataloged
+  later. GUI: the **Forget…** button in File → Storage Roots….
 - **`warden fetch <org/repo> [pattern] [--token T [--save-token]]`** —
   download from Hugging Face into the shelf. With just a repo, lists its
   GGUF files and sizes; with a pattern matching exactly one file, downloads
@@ -673,6 +681,13 @@ owning tool's removal command for you to run yourself.
 **The system Ollama store (`/usr/share/ollama/…`) shows nothing** — it's
 often unreadable to your user account. Warden degrades gracefully and
 scans what it can.
+
+**A drive died or had to be reformatted** — tell warden it's truly gone:
+`warden roots forget "<label>" --yes` (or Forget… in Storage Roots…). The
+preview states exactly what knowledge is lost — models that existed only
+there leave the catalog; models with other copies just drop that
+location. After reformatting, the drive gets a fresh identity when you
+re-register it.
 
 **NAS quirks** — some network filesystems report unstable modification
 times, which invalidates fingerprints and causes safe-but-slow re-hashing.

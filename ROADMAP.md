@@ -276,6 +276,18 @@ backed up, which are the same bytes — without ever losing bytes.**
   taken when both users deleted; restore refuses overwrite; empty
   destroys only trash contents. 77 tests green.
 
+- **Loss handling hardening (2026-08-26, user-driven — a real corrupt
+  drive).** Three fixes from one afternoon of real use: automatic
+  mid-download resume (Range retry from the .partial, zero-progress
+  budget of 5; user's 20.7 GiB fetch had died on a drop); generated
+  `hf cache rm` commands now use the typed id (`model/org/repo` — the
+  bare form silently matches nothing on hf 1.26, exit 0); and
+  `warden roots forget <id|label|path> --yes` + GUI Forget… button —
+  un-register a truly-gone drive with an impact preview (N models here,
+  M nowhere else leave the catalog), knowledge-only, no bytes touched.
+  Delete dialog also now surfaces offline copies up front. Proven E2E.
+  77 tests green.
+
 ## ⇒ PICK UP HERE (state as of 2026-08-20, HEAD 371f03e + M13.1/.2/.3)
 
 **All planned milestones M0–M13.3 are complete.** 73 tests green, tree

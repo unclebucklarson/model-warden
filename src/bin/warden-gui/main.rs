@@ -106,6 +106,7 @@ struct App {
     delete_key: Option<String>,
     trash_items: Option<Vec<modelwarden::core::trash::TrashedFile>>,
     show_empty_confirm: bool,
+    forget_confirm: Option<String>,
     cold_filter: String,
     cold_sel: std::collections::BTreeSet<String>,
     cold_target: String,
@@ -159,6 +160,7 @@ impl App {
             delete_key: None,
             trash_items: None,
             show_empty_confirm: false,
+            forget_confirm: None,
             cold_filter: String::new(),
             cold_sel: std::collections::BTreeSet::new(),
             cold_target: String::new(),
@@ -2064,6 +2066,96 @@ impl App {
         self.show_backup = open;
     }
 
+    /// "This drive is truly gone" — un-register a root after showing what
+    /// knowledge is lost. No bytes are touched anywhere.
+    fn forget_dialog(&mut self, ctx: &egui::Context) {
+        let Some(root_id) = self.forget_confirm.clone() else { return };
+        let (name, touched, only, only_bytes) = self
+            .inv
+            .as_ref()
+            .map(|inv| {
+                let name = inv
+                    .root(&root_id)
+                    .map(|r| {
+                        r.label
+                            .clone()
+                            .unwrap_or_else(|| r.id.clone())
+                    })
+                    .unwrap_or_else(|| root_id.clone());
+                let (t, o, b) = manifest::root_impact(inv, &root_id);
+                (name, t, o, b)
+            })
+            .unwrap_or((root_id.clone(), 0, 0, 0));
+        let mut open = true;
+        let mut go = false;
+        let mut cancel = false;
+        egui::Window::new("Forget Root")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.strong(format!("Forget \"{name}\"?"));
+                ui.label(
+                    "For a drive that is truly gone — died, reformatted, given away. \
+                     This removes warden's KNOWLEDGE of it; no bytes are touched \
+                     anywhere. A working drive can be re-registered later.",
+                );
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "{touched} models have a copy there; {only} exist nowhere else \
+                     ({}) and will leave the catalog.",
+                    human_size(only_bytes)
+                ));
+                ui.horizontal(|ui| {
+                    if ui.button("Forget it").clicked() {
+                        go = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+        if go {
+            self.forget_confirm = None;
+            self.spawn("forgetting root", move |tx| {
+                let state = settings::state_dir();
+                let _lock = match modelwarden::core::lock::WriteLock::acquire(&state) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(format!("{e:#}")));
+                        return;
+                    }
+                };
+                let mut cfg = settings::AppConfig::load(&settings::config_file());
+                match modelwarden::core::roots::forget_root(&mut cfg, &root_id) {
+                    Ok(root) => {
+                        if let Err(e) = cfg.save(&settings::config_file()) {
+                            let _ = tx.send(Msg::Error(format!("saving config: {e:#}")));
+                            return;
+                        }
+                        let man = manifest::manifest_path(&state, &root.id);
+                        let _ = std::fs::remove_file(&man);
+                        let _ = std::fs::remove_file(man.with_extension("json.bak"));
+                        let _ = tx.send(Msg::Activity(format!(
+                            "forgot root {} ({})",
+                            root.id,
+                            root.path.display()
+                        )));
+                        if let Some(inv) = Self::refresh_catalog(tx) {
+                            let _ = tx.send(Msg::Refreshed(inv));
+                        }
+                        let _ = tx.send(Msg::Finished(format!("forgot root {}", root.id)));
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Msg::Error(format!("{e:#}")));
+                    }
+                }
+            });
+        } else if !open || cancel {
+            self.forget_confirm = None;
+        }
+    }
+
     fn roots_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_roots {
             return;
@@ -2075,11 +2167,13 @@ impl App {
             .show(ctx, |ui| {
                 let cfg = settings::AppConfig::load(&settings::config_file());
                 let specs = modelwarden::core::roots::discover_roots(&cfg);
+                let mut forget: Option<String> = None;
                 egui::Grid::new("roots").striped(true).show(ui, |ui| {
                     ui.strong("Root");
                     ui.strong("Kind");
                     ui.strong("State");
                     ui.strong("Path");
+                    ui.strong("");
                     ui.end_row();
                     for s in &specs {
                         ui.label(&s.id);
@@ -2097,9 +2191,27 @@ impl App {
                                 .map(|l| format!("  ({l})"))
                                 .unwrap_or_default()
                         ));
+                        if s.kind == RootKind::Removable {
+                            if ui
+                                .small_button("Forget…")
+                                .on_hover_text(
+                                    "Un-register a drive that is truly gone (died, \
+                                     reformatted). Removes warden's knowledge only — \
+                                     no bytes are touched.",
+                                )
+                                .clicked()
+                            {
+                                forget = Some(s.id.clone());
+                            }
+                        } else {
+                            ui.label("");
+                        }
                         ui.end_row();
                     }
                 });
+                if forget.is_some() {
+                    self.forget_confirm = forget;
+                }
                 ui.separator();
                 ui.label("Register a drive or NAS mount (identified by fs UUID + marker file):");
                 ui.horizontal(|ui| {
@@ -2237,6 +2349,7 @@ impl eframe::App for App {
         self.cold_dialog(ui.ctx());
         self.delete_dialog(ui.ctx());
         self.empty_confirm_dialog(ui.ctx());
+        self.forget_dialog(ui.ctx());
         self.reclaim_dialog(ui.ctx());
         self.fetch_dialog(ui.ctx());
         self.fix_dialog(ui.ctx());

@@ -507,6 +507,26 @@ pub struct FamilyUsage {
     pub stored_bytes: u64,
 }
 
+/// What forgetting a root costs in *knowledge*: (models with a copy
+/// there, models whose ONLY known copies are there, bytes of the latter).
+/// Only-here models leave the catalog entirely once the root is forgotten.
+pub fn root_impact(inv: &Inventory, root_id: &str) -> (usize, usize, u64) {
+    let mut touched = 0usize;
+    let mut only = 0usize;
+    let mut only_bytes = 0u64;
+    for e in inv.models.values() {
+        if !e.locations.iter().any(|l| l.root_id == root_id) {
+            continue;
+        }
+        touched += 1;
+        if e.locations.iter().all(|l| l.root_id == root_id) {
+            only += 1;
+            only_bytes += e.size;
+        }
+    }
+    (touched, only, only_bytes)
+}
+
 pub fn family_usage(inv: &Inventory) -> Vec<FamilyUsage> {
     let mut map: BTreeMap<String, FamilyUsage> = BTreeMap::new();
     for entry in inv.models.values() {

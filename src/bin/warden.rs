@@ -23,6 +23,11 @@ Commands (landing per ROADMAP.md milestone):
                     remedies are printed for you
   roots list [--json]              all roots incl. offline drives
   roots add <path> [--label X]     register a drive/NAS mount by fs UUID
+  roots forget <id|label|path> [--yes]
+                                   un-register a root that is truly gone
+                                   (died, reformatted); removes knowledge
+                                   only — no bytes touched. Models known
+                                   nowhere else leave the catalog
   where <query> [--json]           locate a model across roots, incl. offline
   backup <path> [query…] [--label X]
                                    verified copy to a target (registered as a
@@ -417,6 +422,69 @@ fn cmd_roots(args: &[String], json: bool) -> ExitCode {
                         root.id,
                         root.fs_uuid.as_deref().unwrap_or("none; marker file")
                     );
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("warden: {e:#}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Some("forget") => {
+            let Some(key) = args.get(2).filter(|a| !a.starts_with("--")) else {
+                eprintln!("usage: warden roots forget <id|label|path> [--yes]");
+                return ExitCode::from(2);
+            };
+            let state = settings::state_dir();
+            // Impact first: forgetting destroys knowledge, and the user
+            // should see exactly how much before saying yes.
+            let impact = manifest::load_inventory(&state).map(|inv| {
+                let root = inv
+                    .roots
+                    .iter()
+                    .find(|r| {
+                        r.id == **key
+                            || r.label.as_deref() == Some(key.as_str())
+                            || r.path == std::path::Path::new(key.as_str())
+                    })
+                    .map(|r| r.id.clone());
+                root.map(|id| manifest::root_impact(&inv, &id))
+            });
+            if let Some(Some((touched, only, only_bytes))) = impact {
+                println!(
+                    "{touched} models have a copy on this root; {only} exist NOWHERE else \
+                     ({}) and will leave the catalog.",
+                    human_size(only_bytes)
+                );
+            }
+            if !args.iter().any(|a| a == "--yes") {
+                println!(
+                    "forgetting removes warden's knowledge of the root — no bytes are \
+                     touched; a working drive can be re-registered and re-cataloged."
+                );
+                println!("rerun with --yes to proceed: warden roots forget \"{key}\" --yes");
+                return ExitCode::SUCCESS;
+            }
+            let _lock = match take_write_lock(&state) {
+                Ok(l) => l,
+                Err(code) => return code,
+            };
+            match modelwarden::core::roots::forget_root(&mut cfg, key) {
+                Ok(root) => {
+                    if let Err(e) = cfg.save(&settings::config_file()) {
+                        eprintln!("warden: saving config: {e:#}");
+                        return ExitCode::FAILURE;
+                    }
+                    let man = manifest::manifest_path(&state, &root.id);
+                    let _ = std::fs::remove_file(&man);
+                    let _ = std::fs::remove_file(man.with_extension("json.bak"));
+                    println!(
+                        "forgot {} ({}){}",
+                        root.id,
+                        root.path.display(),
+                        root.label.map(|l| format!(" \"{l}\"")).unwrap_or_default()
+                    );
+                    rerun_hash_quietly();
                     ExitCode::SUCCESS
                 }
                 Err(e) => {
