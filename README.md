@@ -110,9 +110,11 @@ command, and the everyday recipes.
 
 ## Setting up
 
-Grab the latest tarball from GitHub Releases (binaries `warden` and
-`warden-gui`; put them on your `PATH`), or build from source (see Building
-below). Then, first run, in order:
+Grab the latest tarball from GitHub Releases — Linux x86_64, macOS
+Apple Silicon and Intel — (binaries `warden` and `warden-gui`; put them
+on your `PATH`), or build from source (see Building below). macOS is in
+beta: see [docs/qa-macos.md](docs/qa-macos.md) for install notes
+(Gatekeeper) and known limitations. Then, first run, in order:
 
 ```
 warden scan                    # find your stores; check the inventory looks right

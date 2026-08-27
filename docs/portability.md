@@ -1,7 +1,8 @@
 # Portability: macOS and Windows
 
-Status: **analysis complete, build not started** — awaiting the
-requesting user's platform to pick the first ship target. Facts below
+Status: **M16a (macOS) shipped, awaiting real-machine QA** — the
+requester is on macOS; docs/qa-macos.md is their beta script. Windows
+(M16b) not started. Facts below
 come from the portability spike (2026-08-26): `cargo check` + `cargo
 test` on real `macos-latest` and `windows-latest` runners
 (`.github/workflows/portability-spike.yml`, manual dispatch).
@@ -57,13 +58,12 @@ Compile-error inventory from the spike (Windows): `identity.rs:27`,
 
 ### M16a — macOS (small)
 
-- [ ] Lock liveness via `kill(pid, 0)` (fixes the one failing test)
-- [ ] CI: add `macos-latest` to the build+test matrix (promote from spike)
-- [ ] Release: `aarch64-apple-darwin` artifact in release.yml
-- [ ] Docs: named degradations (marker-only drive identity for external
-      drives without the by-uuid path; no scheduled scrub — manual
-      `hash && verify --all` guidance, e.g. cron/launchd by hand)
-- [ ] Real-machine pass: scan a real Ollama + HF cache on macOS
+- [x] Lock liveness via `kill(pid, 0)` (fixes the one failing test)
+- [x] CI: `macos-latest` in the build+test matrix
+- [x] Release: `aarch64-apple-darwin` + `x86_64-apple-darwin` artifacts
+- [x] Docs: named degradations (docs/qa-macos.md carries them for the
+      tester; README points macOS users at it)
+- [ ] Real-machine pass: the requester's QA run (docs/qa-macos.md)
 - Later (Tier 1): launchd scrub units; `diskutil` UUID identity
 
 ### M16b — Windows (moderate)

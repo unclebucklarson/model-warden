@@ -63,8 +63,20 @@ impl WriteLock {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
+}
+
+/// macOS (and other unixes) have no /proc: probe with `kill(pid, 0)` —
+/// signal 0 delivers nothing, only checks existence. EPERM means "exists
+/// but not ours", which is still alive. Without this, a LIVE lock was
+/// judged stale and stolen (the one failing test in the portability
+/// spike, docs/spikes.md #5).
+#[cfg(all(unix, not(target_os = "linux")))]
+fn process_alive(pid: u32) -> bool {
+    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
 impl Drop for WriteLock {
