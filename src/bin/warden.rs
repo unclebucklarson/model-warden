@@ -436,21 +436,21 @@ fn cmd_roots(args: &[String], json: bool) -> ExitCode {
                 return ExitCode::from(2);
             };
             let state = settings::state_dir();
-            // Impact first: forgetting destroys knowledge, and the user
+            // Resolve FIRST — an unknown key must fail loudly here, not
+            // print reassuring guidance and then fail on --yes. (Found in
+            // the field: an unlabeled drive addressed by its colloquial
+            // name sailed past the preview silently.)
+            let resolved = match modelwarden::core::roots::forget_root(&mut cfg.clone(), key) {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("warden: {e:#}");
+                    return ExitCode::from(2);
+                }
+            };
+            // Impact next: forgetting destroys knowledge, and the user
             // should see exactly how much before saying yes.
-            let impact = manifest::load_inventory(&state).map(|inv| {
-                let root = inv
-                    .roots
-                    .iter()
-                    .find(|r| {
-                        r.id == **key
-                            || r.label.as_deref() == Some(key.as_str())
-                            || r.path == std::path::Path::new(key.as_str())
-                    })
-                    .map(|r| r.id.clone());
-                root.map(|id| manifest::root_impact(&inv, &id))
-            });
-            if let Some(Some((touched, only, only_bytes))) = impact {
+            if let Some(inv) = manifest::load_inventory(&state) {
+                let (touched, only, only_bytes) = manifest::root_impact(&inv, &resolved.id);
                 println!(
                     "{touched} models have a copy on this root; {only} exist NOWHERE else \
                      ({}) and will leave the catalog.",
