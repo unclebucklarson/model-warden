@@ -376,8 +376,12 @@ destruction never happens on a schedule.
   the model list, and watch the live bundle/size preview update before you
   commit.
 - **Tools → Download from HuggingFace…** — see 6.5. Lists a repo's files
-  and downloads into the shelf, with resume. Has a masked token field for
-  gated repos with a "Remember" option.
+  and downloads into the shelf, with resume. A **filter box** narrows big
+  listings by name or quantization (type `UD-Q3_K_XL` to cut a 31-file
+  repo down to the one you want) — and it keeps its value across repos,
+  so hunting the same quant through several repos is one keystroke per
+  repo. Has a masked token field for gated repos with a "Remember"
+  option.
 - **Help → About** — version and license.
 
 The **activity log** at the bottom keeps a durable line for everything that

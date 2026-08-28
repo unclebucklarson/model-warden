@@ -124,6 +124,7 @@ struct App {
     fetch_token: String,
     fetch_token_remember: bool,
     fetch_files: Option<Vec<modelwarden::core::acquire::RemoteFile>>,
+    fetch_filter: String,
     /// True when `fetch_files` is a whole-snapshot listing (no GGUFs) —
     /// the download unit is then the entire directory, never one file.
     fetch_snapshot: bool,
@@ -176,6 +177,7 @@ impl App {
             fetch_token: String::new(),
             fetch_token_remember: false,
             fetch_files: None,
+            fetch_filter: String::new(),
             fetch_snapshot: false,
         };
         if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
@@ -1856,8 +1858,35 @@ impl App {
                             download_snapshot = Some(self.fetch_repo.trim().to_string());
                         }
                     }
+                    // Big repos list dozens of quants; a filter cuts through.
+                    // Kept across listings on purpose — hunting the same
+                    // quant (e.g. "UD-Q3_K_XL") through several repos is
+                    // the common case.
+                    ui.horizontal(|ui| {
+                        ui.label("Filter:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.fetch_filter)
+                                .hint_text("quant or name, e.g. UD-Q3_K_XL")
+                                .desired_width(220.0),
+                        );
+                        if !self.fetch_filter.is_empty() && ui.small_button("✕").clicked() {
+                            self.fetch_filter.clear();
+                        }
+                        let q = self.fetch_filter.trim().to_lowercase();
+                        let shown = files
+                            .iter()
+                            .filter(|f| q.is_empty() || f.filename.to_lowercase().contains(&q))
+                            .count();
+                        if !q.is_empty() {
+                            ui.weak(format!("{shown} of {} shown", files.len()));
+                        }
+                    });
+                    let q = self.fetch_filter.trim().to_lowercase();
                     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
                         for f in files {
+                            if !q.is_empty() && !f.filename.to_lowercase().contains(&q) {
+                                continue;
+                            }
                             ui.horizontal(|ui| {
                                 if !self.fetch_snapshot && ui.small_button("Download").clicked() {
                                     download = Some((
