@@ -375,8 +375,10 @@ destruction never happens on a schedule.
   target folder or drive. Type or **Browse…** to the destination, filter
   the model list, and watch the live bundle/size preview update before you
   commit.
-- **Tools → Download from HuggingFace…** — see 6.5. Lists a repo's files
-  and downloads into the shelf, with resume. A **filter box** narrows big
+- **Tools → Download from HuggingFace…** — see 6.5. Lists a repo's downloadable
+  models — a split multi-part model shows as **one row** with its combined
+  size and a "(N parts)" note (parts itemized on hover), because Download
+  always transfers the whole set. A **filter box** narrows big
   listings by name or quantization (type `UD-Q3_K_XL` to cut a 31-file
   repo down to the one you want) — and it keeps its value across repos,
   so hunting the same quant through several repos is one keystroke per

@@ -165,6 +165,58 @@ pub fn with_projectors(all: &[RemoteFile], mut set: Vec<String>) -> Vec<String> 
     set
 }
 
+/// One downloadable *model* in a repo listing: a plain file, or a whole
+/// `-NNNNN-of-NNNNN` split set presented as one thing — because clicking
+/// Download transfers the whole set, the row should say so.
+#[derive(Debug, Clone)]
+pub struct RemoteModel {
+    /// What to show: the stem name, with a part count when split.
+    pub display: String,
+    /// The filename to hand to the download path (split_set expands it).
+    pub first: String,
+    /// Every file this row stands for, listing order.
+    pub parts: Vec<RemoteFile>,
+    /// Combined size; None if any part's size is unknown.
+    pub total: Option<u64>,
+}
+
+/// Group a file listing into models: split parts collapse into one entry
+/// (keyed by their stem), everything else passes through one-to-one.
+/// Order follows first appearance in the listing.
+pub fn group_listing(files: &[RemoteFile]) -> Vec<RemoteModel> {
+    let mut out: Vec<RemoteModel> = Vec::new();
+    let mut stem_index: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for f in files {
+        match split_parts(&f.filename) {
+            Some((prefix, _, count)) => {
+                let key = format!("{prefix}-of-{count}");
+                let idx = *stem_index.entry(key).or_insert_with(|| {
+                    out.push(RemoteModel {
+                        display: format!("{prefix}.gguf ({count} parts)"),
+                        first: f.filename.clone(),
+                        parts: Vec::new(),
+                        total: Some(0),
+                    });
+                    out.len() - 1
+                });
+                let m = &mut out[idx];
+                m.parts.push(f.clone());
+                m.total = match (m.total, f.size) {
+                    (Some(t), Some(s)) => Some(t + s),
+                    _ => None,
+                };
+            }
+            None => out.push(RemoteModel {
+                display: f.filename.clone(),
+                first: f.filename.clone(),
+                parts: vec![f.clone()],
+                total: f.size,
+            }),
+        }
+    }
+    out
+}
+
 /// GGUF files a repo offers, with sizes when the API provides them.
 ///
 /// HF answers **401 for unknown repo ids too** (it hides private repos), so
@@ -562,6 +614,35 @@ mod tests {
 
         // No siblings array at all is an error, not an empty repo.
         assert!(files_from_siblings("org/repo", &serde_json::json!({}), false).is_err());
+    }
+
+    #[test]
+    fn listings_group_split_sets_into_one_model() {
+        let files = |names: &[(&str, Option<u64>)]| -> Vec<RemoteFile> {
+            names
+                .iter()
+                .map(|(n, s)| RemoteFile { filename: n.to_string(), size: *s })
+                .collect()
+        };
+        let all = files(&[
+            ("UD/big-00001-of-00002.gguf", Some(40)),
+            ("plain-Q4.gguf", Some(7)),
+            ("UD/big-00002-of-00002.gguf", Some(10)),
+        ]);
+        let models = group_listing(&all);
+        assert_eq!(models.len(), 2, "{models:?}");
+        // The split set is one model: combined size, honest part count,
+        // dispatchable via any member (first seen).
+        assert_eq!(models[0].display, "UD/big.gguf (2 parts)");
+        assert_eq!(models[0].total, Some(50));
+        assert_eq!(models[0].parts.len(), 2);
+        assert_eq!(models[0].first, "UD/big-00001-of-00002.gguf");
+        // Plain files pass through untouched.
+        assert_eq!(models[1].display, "plain-Q4.gguf");
+        assert_eq!(models[1].total, Some(7));
+        // An unknown part size makes the total honest: unknown.
+        let all = files(&[("m-00001-of-00002.gguf", Some(1)), ("m-00002-of-00002.gguf", None)]);
+        assert_eq!(group_listing(&all)[0].total, None);
     }
 
     #[test]

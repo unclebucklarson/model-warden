@@ -1862,6 +1862,16 @@ impl App {
                     // Kept across listings on purpose — hunting the same
                     // quant (e.g. "UD-Q3_K_XL") through several repos is
                     // the common case.
+                    // Rows are MODELS, not files: a split set collapses to
+                    // one row with its combined size and part count —
+                    // clicking Download transfers the whole set, so the
+                    // row says so (parts itemized in the hover).
+                    let models = modelwarden::core::acquire::group_listing(files);
+                    let q = self.fetch_filter.trim().to_lowercase();
+                    let shown = models
+                        .iter()
+                        .filter(|m| q.is_empty() || m.display.to_lowercase().contains(&q))
+                        .count();
                     ui.horizontal(|ui| {
                         ui.label("Filter:");
                         ui.add(
@@ -1872,34 +1882,42 @@ impl App {
                         if !self.fetch_filter.is_empty() && ui.small_button("✕").clicked() {
                             self.fetch_filter.clear();
                         }
-                        let q = self.fetch_filter.trim().to_lowercase();
-                        let shown = files
-                            .iter()
-                            .filter(|f| q.is_empty() || f.filename.to_lowercase().contains(&q))
-                            .count();
                         if !q.is_empty() {
-                            ui.weak(format!("{shown} of {} shown", files.len()));
+                            ui.weak(format!("{shown} of {} shown", models.len()));
                         }
                     });
-                    let q = self.fetch_filter.trim().to_lowercase();
                     egui::ScrollArea::vertical().max_height(240.0).show(ui, |ui| {
-                        for f in files {
-                            if !q.is_empty() && !f.filename.to_lowercase().contains(&q) {
+                        for m in &models {
+                            if !q.is_empty() && !m.display.to_lowercase().contains(&q) {
                                 continue;
                             }
                             ui.horizontal(|ui| {
                                 if !self.fetch_snapshot && ui.small_button("Download").clicked() {
                                     download = Some((
                                         self.fetch_repo.trim().to_string(),
-                                        f.filename.clone(),
+                                        m.first.clone(),
                                     ));
                                 }
-                                // (split sets expand below, at dispatch)
-                                ui.label(format!(
+                                let label = ui.label(format!(
                                     "{:>10}  {}",
-                                    f.size.map(human_size).unwrap_or_default(),
-                                    f.filename
+                                    m.total.map(human_size).unwrap_or_default(),
+                                    m.display
                                 ));
+                                if m.parts.len() > 1 {
+                                    label.on_hover_text(
+                                        m.parts
+                                            .iter()
+                                            .map(|p| {
+                                                format!(
+                                                    "{:>10}  {}",
+                                                    p.size.map(human_size).unwrap_or_default(),
+                                                    p.filename
+                                                )
+                                            })
+                                            .collect::<Vec<_>>()
+                                            .join("\n"),
+                                    );
+                                }
                             });
                         }
                     });
