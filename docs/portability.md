@@ -1,8 +1,10 @@
 # Portability: macOS and Windows
 
-Status: **M16a (macOS) shipped, awaiting real-machine QA** — the
-requester is on macOS; docs/qa-macos.md is their beta script. Windows
-(M16b) not started. Facts below
+Status: **M16a (macOS) shipped as of v0.2.1; macOS remains labeled
+beta** — the requesting user went non-responsive before running the QA
+script (docs/qa-macos.md), so the real-machine validation stays open
+indefinitely; any future macOS field report closes it. Windows (M16b)
+not started (no demand). Facts below
 come from the portability spike (2026-08-26): `cargo check` + `cargo
 test` on real `macos-latest` and `windows-latest` runners
 (`.github/workflows/portability-spike.yml`, manual dispatch).
@@ -63,7 +65,9 @@ Compile-error inventory from the spike (Windows): `identity.rs:27`,
 - [x] Release: `aarch64-apple-darwin` + `x86_64-apple-darwin` artifacts
 - [x] Docs: named degradations (docs/qa-macos.md carries them for the
       tester; README points macOS users at it)
-- [ ] Real-machine pass: the requester's QA run (docs/qa-macos.md)
+- [ ] Real-machine pass: open indefinitely — original requester went
+      non-responsive; any macOS field report (docs/qa-macos.md) closes
+      it. macOS stays labeled beta until then.
 - Later (Tier 1): launchd scrub units; `diskutil` UUID identity
 
 ### M16b — Windows (moderate)
