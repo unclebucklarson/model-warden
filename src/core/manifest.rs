@@ -391,46 +391,115 @@ pub fn refresh(
         manifests.push(build_root_manifest(spec, previous.as_ref()));
     }
 
-    for m in &mut manifests {
-        let root_path = m.root.path.clone();
-        for f in &mut m.files {
+    // Hash what's missing with a small worker pool. Hashing is one core
+    // of SHA-256 per file (~700 MB/s) while NVMe reads several GB/s, so
+    // a few files in flight cut the first-catalog wall time severalfold;
+    // capped at 4 so spinning disks aren't seek-thrashed. Workers only
+    // hash; the manifests (and the `on` callback) stay on this thread —
+    // and each finished file is CHECKPOINTED to the state dir before its
+    // completion is reported, so an interrupted first hash resumes via
+    // fingerprint carry-forward instead of restarting from zero.
+    struct HashJob {
+        m_i: usize,
+        f_i: usize,
+        path: PathBuf,
+        label: String,
+        size: u64,
+    }
+    enum HashMsg {
+        Start { label: String, size: u64 },
+        Progress { label: String, done: u64, total: u64 },
+        Done { m_i: usize, f_i: usize, hex: String, label: String, secs: f32 },
+        Failed { label: String, error: String },
+    }
+    let mut jobs: Vec<HashJob> = Vec::new();
+    for (m_i, m) in manifests.iter().enumerate() {
+        for (f_i, f) in m.files.iter().enumerate() {
             if f.sha256.is_some() || !f.accessible {
                 continue;
             }
-            let label = f
-                .name
-                .clone()
-                .unwrap_or_else(|| f.rel_path.display().to_string());
-            on(RefreshEvent::HashStart {
-                label: label.clone(),
+            jobs.push(HashJob {
+                m_i,
+                f_i,
+                path: m.root.path.join(&f.rel_path),
+                label: f
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| f.rel_path.display().to_string()),
                 size: f.size,
             });
-            let started = std::time::Instant::now();
-            let mut last_reported = 0u64;
-            let result = identity::sha256_file(&root_path.join(&f.rel_path), |done, total| {
-                if done - last_reported >= 64 * 1024 * 1024 || done == total {
-                    last_reported = done;
-                    on(RefreshEvent::HashProgress {
-                        label: label.clone(),
-                        done,
-                        total,
-                    });
-                }
-            });
-            match result {
-                Ok(hex) => {
-                    f.sha256 = Some(hex);
-                    on(RefreshEvent::HashDone {
-                        label,
-                        secs: started.elapsed().as_secs_f32(),
-                    });
-                }
-                Err(e) => on(RefreshEvent::HashFailed {
-                    label,
-                    error: e.to_string(),
-                }),
-            }
         }
+    }
+    if !jobs.is_empty() {
+        let threads = jobs
+            .len()
+            .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .min(4);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (etx, erx) = std::sync::mpsc::channel::<HashMsg>();
+        std::thread::scope(|s| {
+            for _ in 0..threads {
+                let etx = etx.clone();
+                let jobs = &jobs;
+                let next = &next;
+                s.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(job) = jobs.get(i) else { break };
+                        let _ = etx.send(HashMsg::Start {
+                            label: job.label.clone(),
+                            size: job.size,
+                        });
+                        let started = std::time::Instant::now();
+                        let mut last = 0u64;
+                        let result = identity::sha256_file(&job.path, |done, total| {
+                            if done - last >= 64 * 1024 * 1024 || done == total {
+                                last = done;
+                                let _ = etx.send(HashMsg::Progress {
+                                    label: job.label.clone(),
+                                    done,
+                                    total,
+                                });
+                            }
+                        });
+                        let msg = match result {
+                            Ok(hex) => HashMsg::Done {
+                                m_i: job.m_i,
+                                f_i: job.f_i,
+                                hex,
+                                label: job.label.clone(),
+                                secs: started.elapsed().as_secs_f32(),
+                            },
+                            Err(e) => HashMsg::Failed {
+                                label: job.label.clone(),
+                                error: e.to_string(),
+                            },
+                        };
+                        let _ = etx.send(msg);
+                    }
+                });
+            }
+            drop(etx); // the loop below ends when the last worker exits
+            for msg in erx {
+                match msg {
+                    HashMsg::Start { label, size } => on(RefreshEvent::HashStart { label, size }),
+                    HashMsg::Progress { label, done, total } => {
+                        on(RefreshEvent::HashProgress { label, done, total })
+                    }
+                    HashMsg::Done { m_i, f_i, hex, label, secs } => {
+                        manifests[m_i].files[f_i].sha256 = Some(hex);
+                        // Checkpoint first, report second: crash after
+                        // this line and the hash is already durable.
+                        let m = &manifests[m_i];
+                        let _ = save_json(m, &manifest_path(state, &m.root.id));
+                        on(RefreshEvent::HashDone { label, secs });
+                    }
+                    HashMsg::Failed { label, error } => {
+                        on(RefreshEvent::HashFailed { label, error })
+                    }
+                }
+            }
+        });
     }
 
     for m in &manifests {
@@ -1099,5 +1168,55 @@ mod tests {
         inv.models
             .insert("sha256:cc".into(), entry_with(&[(RootKind::Ollama, true)]));
         assert_eq!(backup_coverage(&inv), (1, 3));
+    }
+    #[test]
+    fn hashing_checkpoints_each_file_and_reports_every_job() {
+        use crate::core::gguf::tests::synthetic_gguf;
+        let shelf = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        for i in 0..5 {
+            let mut b = synthetic_gguf("llama", 8192, 15);
+            b.push(i);
+            std::fs::write(shelf.path().join(format!("m{i}.gguf")), b).unwrap();
+        }
+        let spec = RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        };
+        let specs = [spec];
+        let mut starts = 0usize;
+        let mut dones = 0usize;
+        let mut checkpoint_seen = false;
+        let inv = refresh(&specs, state.path(), |ev| match ev {
+            RefreshEvent::HashStart { .. } => starts += 1,
+            RefreshEvent::HashDone { .. } => {
+                dones += 1;
+                if !checkpoint_seen {
+                    // The manifest on disk must already hold this hash
+                    // BEFORE the completion is reported: an interrupted
+                    // first hash resumes instead of restarting.
+                    let m = load_manifest(&manifest_path(state.path(), "shelf-1"))
+                        .expect("checkpoint manifest written before HashDone");
+                    assert!(
+                        m.files.iter().any(|f| f.sha256.is_some()),
+                        "checkpoint holds at least the finished hash"
+                    );
+                    checkpoint_seen = true;
+                }
+            }
+            RefreshEvent::HashFailed { label, error } => {
+                panic!("unexpected failure {label}: {error}")
+            }
+            RefreshEvent::HashProgress { .. } => {}
+        })
+        .unwrap();
+        // Every job reported exactly once, all hashes landed.
+        assert_eq!(starts, 5);
+        assert_eq!(dones, 5);
+        assert!(checkpoint_seen);
+        assert_eq!(inv.models.len(), 5);
+        assert!(inv.models.keys().all(|k| k.starts_with("sha256:")));
     }
 }

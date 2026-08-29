@@ -181,19 +181,26 @@ fn cmd_hash(json: bool) -> ExitCode {
         Err(code) => return code,
     };
     let mut hashed_count = 0usize;
+    // Files hash in parallel, so events interleave: standalone lines
+    // (the shared log_line wording) instead of the old joined
+    // "label… done" style, with \r-transient progress between them.
     let inv = manifest::refresh(&specs, &state, |ev| match ev {
         manifest::RefreshEvent::HashStart { label, size } => {
-            eprint!("  {label} ({})… ", human_size(size));
+            eprintln!("  hashing {label} ({})", human_size(size));
+        }
+        manifest::RefreshEvent::HashProgress { label, done, total } => {
+            eprint!("\r  {label} — {}%   ", done * 100 / total.max(1));
             let _ = std::io::stderr().flush();
         }
-        manifest::RefreshEvent::HashProgress { .. } => {}
-        manifest::RefreshEvent::HashDone { secs, .. } => {
-            // Completes the inline "label (size)… " prefix — same
-            // vocabulary as the shared log_line ("hashed … in Ns").
-            eprintln!("hashed in {secs:.0}s");
-            hashed_count += 1;
+        ev => {
+            if let Some(line) = ev.log_line() {
+                if matches!(ev, manifest::RefreshEvent::HashDone { .. }) {
+                    hashed_count += 1;
+                }
+                // Clear any transient progress residue before the line.
+                eprintln!("\r  {line}                              ");
+            }
         }
-        manifest::RefreshEvent::HashFailed { error, .. } => eprintln!("FAILED: {error}"),
     });
     let inv = match inv {
         Ok(inv) => inv,

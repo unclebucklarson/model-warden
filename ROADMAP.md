@@ -317,17 +317,25 @@ git push origin vX.Y.Z` (GH release builds itself) → `cargo publish`.
 
 Built test-first (see CLAUDE.md methodology). Priority order:
 
-1. **Backup-coverage visibility in the GUI** — the status bar states the
-   CLI's core safety sentence ("N of M contents have a copy on a
-   registered drive") and Inventory rows show a backed-up indicator.
-   Small; the classifier lives in core, shared with `warden status`.
-2. **GUI job queue** — a write request during a running job queues with a
-   visible "next: …" instead of "busy — ignored" (user hit this during a
-   20 GiB download).
-3. **Parallel + checkpointed hashing** — hash N files concurrently
-   (first-run wall time 2–4× better on NVMe) and persist manifests
-   periodically so an interrupted first hash resumes instead of
-   restarting. First-impression-critical for incoming testers.
+0. ~~**Integration test harness**~~ **DONE 2026-08-29**: `tests/e2e.rs`
+   runs the real binary (`CARGO_BIN_EXE_warden` — never stale) in fully
+   isolated envs; five whole-lifecycle proofs (hash carry-forward,
+   backup→demote→restore by label, delete/trash/restore/empty with
+   shared companions and the no-recatalog regression, roots-forget
+   impact, dedup dry-run-then-hardlink) now run in cargo test and CI.
+1. ~~**Backup-coverage visibility in the GUI**~~ **DONE 2026-08-29**
+   (test-first): core is_backed_up/backup_coverage; status bar headline
+   "N/M backed up to a drive"; sortable Backup column (✓/—).
+2. ~~**GUI job queue**~~ **DONE 2026-08-29** (test-first): requests
+   during a running job queue visibly and run in order; "(+N queued)" in
+   the status bar. Retires "busy — ignored".
+3. ~~**Parallel + checkpointed hashing**~~ **DONE 2026-08-29**
+   (test-first: checkpoint-before-Done red test): worker pool (≤4, HDD-
+   friendly cap), each finished file checkpointed to the state-dir
+   manifest BEFORE its completion is reported — an interrupted first
+   hash resumes via fingerprint carry. Measured: 2 GiB in 0.28 s at
+   397% CPU (was single-core ~700 MB/s). CLI hash output switched to
+   interleave-safe standalone lines.
 4. **Persistent operations journal** — append-only log under the state
    dir of every write operation (what moved/trashed/destroyed, when);
    the activity log currently dies with the session.
