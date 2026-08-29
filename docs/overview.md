@@ -15,8 +15,10 @@ pruned), and hand-downloaded files. modelwarden gives that collection a
 single source of truth: what exists, where it is, whether it's reachable,
 whether it's backed up, and which files are actually the same bytes.
 
-It is a single-user, Linux-desktop tool built for a real machine with ~280 GB
-of models — not a server product. That scope is deliberate.
+It is a single-user desktop tool (Linux; macOS in beta) built for a real
+machine with ~280 GB of models — not a server product. That scope is
+deliberate. It ships as GitHub Release binaries and on crates.io
+(`cargo install modelwarden`), dual-licensed MIT/Apache-2.0.
 
 ## The problems it addresses
 
@@ -70,7 +72,9 @@ that.
   semantics, and testing removable-drive identity. Verdicts are recorded in
   `docs/spikes.md`; several assumptions died there instead of in code.
 - **Safety as invariants, not intentions.** Never write inside a store
-  another tool owns; never delete model bytes (one documented exception: a
+  another tool owns; destroy bytes only through the explicit two-stage
+  trash (delete → restorable trash → `empty --yes`), plus one earlier
+  documented exception: a
   verified move, on an explicit flag); every copy goes through a temp name
   and is re-read before it counts; every write operation takes a
   single-instance lock. These are written down in `PLAN.md` and enforced in
@@ -123,7 +127,8 @@ that.
 ## By the numbers
 
 ~7,400 lines of Rust (≈4,750 headless core, ≈2,700 CLI + GUI), 56 tests,
-14 commits over an intensive build, each ending in a runnable milestone.
+Dozens of commits over an intensive build, each ending in a runnable
+milestone, with per-push CI on Linux and macOS.
 Stack: Rust (edition 2024), egui/eframe for the GUI, `sha2`, `ureq`, and
 deliberately little else. Design history in `PLAN.md`, running status in
 `ROADMAP.md`, empirical groundwork in `docs/spikes.md`.

@@ -4,6 +4,16 @@
 [![Release](https://img.shields.io/github/v/release/unclebucklarson/model-warden)](https://github.com/unclebucklarson/model-warden/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](LICENSE-MIT)
 
+> **🧪 Testers wanted!** warden is young, and every good recent feature
+> came from someone actually using it and hitting something. If you run
+> local models, we'd love your eyes: install, point it at your stores
+> (scanning is read-only), and tell us what surprised you —
+> [bug reports and QA reports](../../issues/new/choose) have ready-made
+> forms. **macOS users especially**: the Mac build is in beta and
+> [docs/qa-macos.md](docs/qa-macos.md) is a complete guided testing
+> script. Nothing warden does in its read commands can touch your model
+> files.
+
 **Inventory, backup, and archival for local LLM model files** — GGUFs and
 safetensors-style model directories alike. The owner of 200GB+ of models — scattered across Ollama's blob store, the HuggingFace hub
 cache, shelf directories, NAS mounts, and removable drives — can always

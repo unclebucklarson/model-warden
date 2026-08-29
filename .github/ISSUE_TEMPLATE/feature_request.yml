@@ -1,0 +1,16 @@
+name: Feature request
+description: Something warden should do, or do better
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What were you trying to do when you missed this? Real situations beat abstract ideas — most of warden's best features started as "I hit this."
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea (optional)
+      description: How you imagine it working. Note warden's ground rules — it never serves models, never edits other tools' configs, and never destroys bytes outside the two-stage trash.

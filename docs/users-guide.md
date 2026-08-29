@@ -1,6 +1,6 @@
 # modelwarden — User's Guide
 
-*For version 0.2.0. Written for newcomers: every concept is explained, and
+*For version 0.2.2+. Written for newcomers: every concept is explained, and
 every feature comes with the reason it exists.*
 
 ---
@@ -357,8 +357,9 @@ must stay manual show you the exact command to copy.
 
 Deleted bundles land here, intact — a delete is just a rename into
 `<root>/.modelwarden/trash/`. Each file shows its size, root, and age, with
-a per-file **Restore** (a rename back; it refuses to overwrite anything
-that reappeared). **Empty Trash…** is warden's single irreversible act: a
+a per-file **Restore** that brings back the file's whole bundle — split
+parts and projector included, exactly as delete took it (a rename back;
+it refuses to overwrite anything that reappeared). **Empty Trash…** is warden's single irreversible act: a
 confirmation states the exact count and size being destroyed, and only
 that click makes bytes stop existing. There is no automatic emptying —
 destruction never happens on a schedule.
@@ -492,8 +493,9 @@ hash prefix matters when two different models share a name.
   automatically; copies in foreign stores get the owner command printed
   for you to run yourself.
 - **`warden trash`** — list what the trash holds, where, and how old.
-- **`warden trash restore <query>`** — rename matching files back into
-  place.
+- **`warden trash restore <query>`** — bring matching models back. Each
+  match expands to its full bundle in the trash — split parts and the
+  projector return together, exactly as delete took them.
 - **`warden trash empty --yes`** — stage 2: permanently destroy the
   trash's contents. Without `--yes` it only reports what would be
   destroyed. This is warden's one irreversible command.

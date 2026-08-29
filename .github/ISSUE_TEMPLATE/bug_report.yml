@@ -1,0 +1,40 @@
+name: Bug report
+description: Something behaved wrong, crashed, or lied to you
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: warden version
+      description: Output of `warden version`
+      placeholder: warden 0.2.2
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [Linux, macOS (Apple Silicon), macOS (Intel), Other]
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: How installed
+      placeholder: release tarball / cargo install / built from source
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: The exact command or GUI action, what you expected, and what happened instead. Paste full output for any error — it is the most useful thing you can send.
+      placeholder: |
+        Ran: warden …
+        Expected: …
+        Got: …
+    validations:
+      required: true
+  - type: textarea
+    id: stores
+    attributes:
+      label: Stores involved (optional)
+      description: Which stores were in play (Ollama, HF cache, shelf, a drive) and rough sizes — helps reproduce scanning/catalog issues.

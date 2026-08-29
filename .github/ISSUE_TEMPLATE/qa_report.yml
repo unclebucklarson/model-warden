@@ -1,0 +1,39 @@
+name: Tester QA report
+description: Structured feedback from a testing pass (see docs/qa-macos.md for the macOS script)
+labels: [qa]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: warden version
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: Platform
+      options: [Linux, macOS (Apple Silicon), macOS (Intel), Other]
+    validations:
+      required: true
+  - type: input
+    id: install
+    attributes:
+      label: Install method
+      placeholder: release tarball / cargo install / source
+  - type: textarea
+    id: readonly
+    attributes:
+      label: "Phase 1 — read-only pass (scan, hash, status, where, dups, doctor, GUI)"
+      description: OK per command, or paste output for anything odd. Note hash speed and whether the inventory matched reality.
+    validations:
+      required: true
+  - type: textarea
+    id: write
+    attributes:
+      label: "Phase 2/3 — write & download passes (optional)"
+      description: Backup/verify to a scratch folder, drive identity across re-plug, the tiny download test.
+  - type: textarea
+    id: surprises
+    attributes:
+      label: Surprises
+      description: Anything that felt wrong, slow, or confusing — UX notes are as valuable as crashes. Screenshots welcome.

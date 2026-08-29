@@ -69,7 +69,9 @@ Commands (landing per ROADMAP.md milestone):
                                    kept; foreign-store copies get the owner
                                    command printed, never executed
   trash [list]                     what the trash holds, where, how old
-  trash restore <query>            rename matching files back into place
+  trash restore <query>            bring matching models back — each match
+                                   expands to its trash bundle (split
+                                   parts, projector) like delete took it
   trash empty --yes                stage 2: permanently destroy the trash —
                                    warden's only irreversible act
 ";
