@@ -400,10 +400,9 @@ fn check_hf_hub(hub: &Path, _tools: OwnerTools, out: &mut Vec<Finding>) {
     };
     for repo_dir in repos.flatten() {
         let dirname = repo_dir.file_name().to_string_lossy().into_owned();
-        let Some(rest) = dirname.strip_prefix("models--") else {
+        let Some(repo) = crate::core::scan::hf_repo_from_dirname(&dirname) else {
             continue;
         };
-        let repo = rest.replace("--", "/");
         let path = repo_dir.path();
 
         // Revisions that actually exist on disk.

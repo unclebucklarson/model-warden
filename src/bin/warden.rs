@@ -440,12 +440,10 @@ fn cmd_roots(args: &[String], json: bool) -> ExitCode {
             // print reassuring guidance and then fail on --yes. (Found in
             // the field: an unlabeled drive addressed by its colloquial
             // name sailed past the preview silently.)
-            let resolved = match modelwarden::core::roots::forget_root(&mut cfg.clone(), key) {
-                Ok(r) => r,
-                Err(e) => {
-                    eprintln!("warden: {e:#}");
-                    return ExitCode::from(2);
-                }
+            let Some(resolved) = modelwarden::core::roots::resolve_registered(&cfg, key).cloned()
+            else {
+                eprintln!("warden: {key} is not a registered root (see `warden roots list`)");
+                return ExitCode::from(2);
             };
             // Impact next: forgetting destroys knowledge, and the user
             // should see exactly how much before saying yes.
@@ -475,9 +473,7 @@ fn cmd_roots(args: &[String], json: bool) -> ExitCode {
                         eprintln!("warden: saving config: {e:#}");
                         return ExitCode::FAILURE;
                     }
-                    let man = manifest::manifest_path(&state, &root.id);
-                    let _ = std::fs::remove_file(&man);
-                    let _ = std::fs::remove_file(man.with_extension("json.bak"));
+                    manifest::remove_manifest(&state, &root.id);
                     println!(
                         "forgot {} ({}){}",
                         root.id,
@@ -689,10 +685,7 @@ fn cmd_archive(args: &[String]) -> ExitCode {
         };
         let mut failed = false;
         // Union of every query's bundle, deduped — shared companions move once.
-        let all: std::collections::BTreeSet<String> = keys
-            .iter()
-            .flat_map(|k| manifest::bundle_for(&inv, k))
-            .collect();
+        let all = manifest::bundle_union(&inv, &keys);
         for k in all {
             let Some(e) = inv.models.get(&k) else { continue };
             let on_shelf = e.locations.iter().any(|l| {
@@ -1245,9 +1238,20 @@ fn cmd_trash(args: &[String], json: bool) -> ExitCode {
                 Err(code) => return code,
             };
             let mut failed = false;
+            // Each match expands to its full bundle in the trash — a
+            // restore that left the projector behind would feed it to
+            // the next `trash empty`.
+            let mut expanded: std::collections::BTreeSet<(String, std::path::PathBuf)> =
+                std::collections::BTreeSet::new();
             for f in &items {
                 let Some(root) = roots.iter().find(|r| r.id == f.root_id) else { continue };
-                match trash::restore(root, &f.rel_path) {
+                for rel in trash::restore_set(root, &f.rel_path) {
+                    expanded.insert((f.root_id.clone(), rel));
+                }
+            }
+            for (root_id, rel) in &expanded {
+                let Some(root) = roots.iter().find(|r| r.id == *root_id) else { continue };
+                match trash::restore(root, rel) {
                     Ok(dst) => println!("restored {}", dst.display()),
                     Err(e) => {
                         eprintln!("warden: {e:#}");
@@ -1680,14 +1684,7 @@ fn print_json<T: serde::Serialize>(value: &T) -> ExitCode {
 }
 
 fn ago(unix: u64) -> String {
-    let now = manifest::now_unix();
-    let d = now.saturating_sub(unix);
-    match d {
-        0..=90 => format!("{d}s ago"),
-        91..=5400 => format!("{} min ago", d / 60),
-        5401..=172_800 => format!("{} hours ago", d / 3600),
-        _ => format!("{} days ago", d / 86_400),
-    }
+    modelwarden::core::format::ago(unix)
 }
 
 fn human_size(bytes: u64) -> String {

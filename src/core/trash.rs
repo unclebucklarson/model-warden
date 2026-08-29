@@ -30,16 +30,17 @@ pub fn trash_dir(root: &Path) -> PathBuf {
 /// union of the selected models' bundles, minus any content a model
 /// OUTSIDE the selection still needs.
 pub fn deletable_set(inv: &Inventory, keys: &[String]) -> (BTreeSet<String>, Vec<(String, String)>) {
-    let selected: BTreeSet<&String> = keys.iter().collect();
-    let union: BTreeSet<String> = keys
-        .iter()
-        .flat_map(|k| manifest::bundle_for(inv, k))
-        .collect();
+    let union = manifest::bundle_union(inv, keys);
     let mut del = BTreeSet::new();
     let mut kept = Vec::new();
-    'cand: for c in union {
+    // A candidate is spared only when a model OUTSIDE the deletion union
+    // still needs it. Members of the union never anchor a keep — for
+    // symmetric bundles (split parts) each part "requires" its sibling,
+    // and checking against the selection instead of the union inverted
+    // the delete: the chosen part was kept and its sibling trashed.
+    'cand: for c in union.clone() {
         for (other, e) in &inv.models {
-            if selected.contains(other) || *other == c {
+            if union.contains(other) || *other == c {
                 continue;
             }
             if manifest::bundle_for(inv, other).iter().any(|m| *m == c) {
@@ -98,22 +99,31 @@ pub fn move_to_trash(inv: &Inventory, del: &BTreeSet<String>) -> Result<TrashRep
                     .with_context(|| format!("creating {}", dir.display()))?;
             }
             // A same-named file already in the trash never blocks a delete
-            // and is never overwritten — the new arrival gets a suffix.
+            // and is never overwritten — the new arrival gets a counter
+            // BEFORE the extension ("model.1.gguf", never "model.gguf.1"),
+            // so a later restore yields a name the scanner still catalogs.
+            let base = loc
+                .rel_path
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".into());
             let mut n = 1;
             while dst.exists() {
-                let name = format!(
-                    "{}.{}",
-                    loc.rel_path
-                        .file_name()
-                        .map(|f| f.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| "file".into()),
-                    n
-                );
+                let name = match base.rsplit_once('.') {
+                    Some((stem, ext)) => format!("{stem}.{n}.{ext}"),
+                    None => format!("{base}.{n}"),
+                };
                 dst = dst.with_file_name(name);
                 n += 1;
             }
             std::fs::rename(&src, &dst)
                 .with_context(|| format!("moving {} to trash", src.display()))?;
+            // Rename preserves mtime, but the trash listing derives its
+            // "trashed N ago" age from it — stamp now, or a year-old file
+            // deleted today reads as ancient and safe to destroy.
+            if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&dst) {
+                let _ = f.set_modified(std::time::SystemTime::now());
+            }
             report.trashed.push((entry.display_name.clone(), dst.clone()));
         }
     }
@@ -150,7 +160,7 @@ fn owner_removal_command(display_name: &str, kind: RootKind, rel_path: &Path) ->
         RootKind::HfHub => {
             let first = rel_path.components().next()?;
             let dir = first.as_os_str().to_string_lossy();
-            let repo = dir.strip_prefix("models--")?.replace("--", "/");
+            let repo = crate::core::scan::hf_repo_from_dirname(&dir)?;
             // hf's cache rm wants the typed id ("model/org/name") — the bare
             // repo id silently matches nothing ("Could not find in cache",
             // exit 0). Found in the field.
@@ -209,6 +219,60 @@ fn walk(dir: &Path, base: &Path, root: &RootSpec, out: &mut Vec<TrashedFile>) {
             });
         }
     }
+}
+
+/// Everything that should come back WITH `rel` — the bundle rules applied
+/// to trash contents by filename, since the trash carries no catalog:
+/// split siblings and same-directory projectors ride along; a weights
+/// file (or a directory holding one) brings its whole subtree; restoring
+/// a projector alone stays alone — the same asymmetry as bundle_for.
+/// Restore must mirror delete: delete trashes the bundle, so a restore
+/// that brought back one file would strand the rest for the next empty.
+pub fn restore_set(root: &RootSpec, rel: &Path) -> Vec<PathBuf> {
+    let td = trash_dir(&root.path);
+    let mut all = Vec::new();
+    walk(&td, &td, root, &mut all);
+    let fname = rel
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    if manifest::is_projector_name(&fname) {
+        return vec![rel.to_path_buf()];
+    }
+    let dir = rel.parent().map(Path::to_path_buf).unwrap_or_default();
+    let name_of = |p: &Path| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let weights_container = !dir.as_os_str().is_empty()
+        && (crate::core::scan::is_weights_filename(&fname)
+            || all.iter().any(|f| {
+                f.rel_path.starts_with(&dir)
+                    && crate::core::scan::is_weights_filename(&name_of(&f.rel_path))
+            }));
+    if weights_container {
+        return all
+            .iter()
+            .filter(|f| f.rel_path.starts_with(&dir))
+            .map(|f| f.rel_path.clone())
+            .collect();
+    }
+    let my_split = crate::core::acquire::split_parts(&fname).map(|(p, _, c)| (p.to_string(), c));
+    let mut out = vec![rel.to_path_buf()];
+    for f in &all {
+        if f.rel_path == rel || f.rel_path.parent().map(Path::to_path_buf).unwrap_or_default() != dir {
+            continue;
+        }
+        let f2 = name_of(&f.rel_path);
+        let same_split = my_split.as_ref().is_some_and(|(p, c)| {
+            crate::core::acquire::split_parts(&f2).is_some_and(|(p2, _, c2)| p2 == p && c2 == *c)
+        });
+        if same_split || manifest::is_projector_name(&f2) {
+            out.push(f.rel_path.clone());
+        }
+    }
+    out
 }
 
 /// Rename a trashed file back to its place in the root. Refuses to
@@ -358,6 +422,104 @@ mod tests {
         assert!(bytes > 0);
         assert!(list(std::slice::from_ref(&spec)).is_empty());
         assert!(back.is_file(), "restored file untouched by empty");
+    }
+
+    #[test]
+    fn deleting_any_split_part_takes_the_whole_set_not_the_inverse() {
+        // Regression: split parts are SYMMETRIC bundle members; the old
+        // keep-check treated the unselected sibling as a keeper, so
+        // deleting part 1 kept part 1 and trashed part 2.
+        let shelf = tempfile::tempdir().unwrap();
+        let base = synthetic_gguf("llama", 8192, 15);
+        let mut p2 = base.clone();
+        p2.extend_from_slice(b"2");
+        std::fs::write(shelf.path().join("big-00001-of-00002.gguf"), &base).unwrap();
+        std::fs::write(shelf.path().join("big-00002-of-00002.gguf"), &p2).unwrap();
+        let spec = RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        };
+        let inv = merge(&[build_root_manifest(&spec, None)]);
+        let p1_key = inv
+            .models
+            .iter()
+            .find(|(_, e)| e.display_name.contains("00001"))
+            .map(|(k, _)| k.clone())
+            .unwrap();
+        let (del, kept) = deletable_set(&inv, &[p1_key]);
+        assert_eq!(del.len(), 2, "both parts go together: {del:?}");
+        assert!(kept.is_empty(), "no half-model survivors: {kept:?}");
+    }
+
+    #[test]
+    fn collision_suffix_keeps_the_extension_scannable() {
+        let (_shelf, spec, inv) = env();
+        let key = inv
+            .models
+            .iter()
+            .find(|(_, e)| e.display_name.contains("model"))
+            .map(|(k, _)| k.clone())
+            .unwrap();
+        let (del, _) = deletable_set(&inv, &[key]);
+        // Seed a same-named file already in the trash.
+        let taken = trash_dir(&spec.path).join("Vision/model-Q4.gguf");
+        std::fs::create_dir_all(taken.parent().unwrap()).unwrap();
+        std::fs::write(&taken, b"earlier occupant").unwrap();
+        let report = move_to_trash(&inv, &del).unwrap();
+        let renamed = report
+            .trashed
+            .iter()
+            .find(|(_, p)| p.to_string_lossy().contains("model-Q4"))
+            .unwrap();
+        assert!(
+            renamed.1.to_string_lossy().ends_with("model-Q4.1.gguf"),
+            "suffix goes before the extension: {renamed:?}"
+        );
+    }
+
+    #[test]
+    fn restore_brings_the_bundle_back_like_delete_took_it() {
+        let shelf = tempfile::tempdir().unwrap();
+        let base = synthetic_gguf("llama", 8192, 15);
+        let mut b = base.clone();
+        b.extend_from_slice(b"b");
+        let mut c = base.clone();
+        c.extend_from_slice(b"c");
+        let mut d = base.clone();
+        d.extend_from_slice(b"d");
+        std::fs::create_dir_all(shelf.path().join("V")).unwrap();
+        std::fs::write(shelf.path().join("V/big-00001-of-00002.gguf"), &base).unwrap();
+        std::fs::write(shelf.path().join("V/big-00002-of-00002.gguf"), &b).unwrap();
+        std::fs::write(shelf.path().join("V/mmproj-F16.gguf"), &c).unwrap();
+        std::fs::write(shelf.path().join("V/other-Q4.gguf"), &d).unwrap();
+        let spec = RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        };
+        let inv = merge(&[build_root_manifest(&spec, None)]);
+        // Trash everything so the trash holds the split pair, the
+        // projector, and an unrelated model side by side.
+        let all_keys: Vec<String> = inv.models.keys().cloned().collect();
+        let (del, _) = deletable_set(&inv, &all_keys);
+        move_to_trash(&inv, &del).unwrap();
+        // Restoring one split part expands to both parts + projector,
+        // never the unrelated neighbor.
+        let set = restore_set(&spec, Path::new("V/big-00001-of-00002.gguf"));
+        let names: BTreeSet<String> = set
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains("big-00001-of-00002.gguf"));
+        assert!(names.contains("big-00002-of-00002.gguf"));
+        assert!(names.contains("mmproj-F16.gguf"));
+        assert!(!names.contains("other-Q4.gguf"), "{names:?}");
+        // Restoring the projector alone stays alone (asymmetric).
+        let solo = restore_set(&spec, Path::new("V/mmproj-F16.gguf"));
+        assert_eq!(solo.len(), 1);
     }
 
     #[test]

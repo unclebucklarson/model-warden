@@ -144,10 +144,9 @@ pub fn hf_hub_models(hub: &Path) -> Vec<ModelFile> {
     };
     for repo_dir in repos.flatten() {
         let dirname = repo_dir.file_name().to_string_lossy().into_owned();
-        let Some(rest) = dirname.strip_prefix("models--") else {
+        let Some(repo) = hf_repo_from_dirname(&dirname) else {
             continue;
         };
-        let repo = rest.replace("--", "/");
         let snapshots = repo_dir.path().join("snapshots");
         let Ok(revs) = std::fs::read_dir(&snapshots) else {
             continue;
@@ -282,6 +281,13 @@ pub fn shelf_models(dir: &Path) -> Vec<ModelFile> {
 /// directory that directly holds a non-GGUF weights file IS a model — its
 /// whole subtree is cataloged (weights + tokenizer/config companions) so
 /// the bundle stays runnable.
+/// The one `models--org--name` → `org/name` parse, shared by the
+/// scanner, doctor, and trash so a fix (or datasets--/spaces-- support)
+/// lands once.
+pub fn hf_repo_from_dirname(dirname: &str) -> Option<String> {
+    Some(dirname.strip_prefix("models--")?.replace("--", "/"))
+}
+
 fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
     if depth > 3 {
         return;
@@ -299,6 +305,12 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
     }
     for e in entries {
         let path = e.path();
+        // Dot-entries are never models — critically including
+        // `.modelwarden/trash/`, or deleted models would re-catalog on
+        // the rescan that follows every delete.
+        if e.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
         if path.is_dir() {
             walk_gguf(&path, depth + 1, out);
         } else if is_gguf(&path) {
@@ -601,6 +613,25 @@ mod tests {
                 .iter()
                 .all(|m| matches!(&m.source, Source::HfHub { repo } if repo == "unsloth/Test-GGUF"))
         );
+    }
+
+    #[test]
+    fn shelf_scan_never_descends_into_dot_directories() {
+        // Regression: trashed models re-cataloged themselves because
+        // walk_gguf descended into <root>/.modelwarden/trash.
+        let shelf = tempfile::tempdir().unwrap();
+        let trash = shelf.path().join(".modelwarden/trash/Vis");
+        std::fs::create_dir_all(&trash).unwrap();
+        std::fs::write(trash.join("gone.gguf"), gguf::tests::synthetic_gguf("llama", 8192, 15))
+            .unwrap();
+        std::fs::write(
+            shelf.path().join("live.gguf"),
+            gguf::tests::synthetic_gguf("llama", 8192, 15),
+        )
+        .unwrap();
+        let models = shelf_models(shelf.path());
+        assert_eq!(models.len(), 1, "{models:?}");
+        assert!(models[0].path.ends_with("live.gguf"));
     }
 
     #[test]

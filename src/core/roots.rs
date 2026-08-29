@@ -191,18 +191,28 @@ pub fn forget_root(
     cfg: &mut crate::core::settings::AppConfig,
     key: &str,
 ) -> Result<crate::core::settings::RegisteredRoot> {
-    let canonical = Path::new(key).canonicalize().ok();
-    let idx = cfg
-        .roots
-        .iter()
-        .position(|r| {
-            r.id == key
-                || r.label.as_deref() == Some(key)
-                || r.path == Path::new(key)
-                || Some(&r.path) == canonical.as_ref()
-        })
+    let idx = resolve_registered_idx(cfg, key)
         .with_context(|| format!("{key} is not a registered root (see `warden roots list`)"))?;
     Ok(cfg.roots.remove(idx))
+}
+
+/// Look up a registered root by id, label, or path — WITHOUT mutating
+/// anything. Previews resolve through this; only forget_root removes.
+pub fn resolve_registered<'a>(
+    cfg: &'a crate::core::settings::AppConfig,
+    key: &str,
+) -> Option<&'a crate::core::settings::RegisteredRoot> {
+    resolve_registered_idx(cfg, key).map(|i| &cfg.roots[i])
+}
+
+fn resolve_registered_idx(cfg: &crate::core::settings::AppConfig, key: &str) -> Option<usize> {
+    let canonical = Path::new(key).canonicalize().ok();
+    cfg.roots.iter().position(|r| {
+        r.id == key
+            || r.label.as_deref() == Some(key)
+            || r.path == Path::new(key)
+            || Some(&r.path) == canonical.as_ref()
+    })
 }
 
 fn root_id(kind: RootKind, path: &str) -> String {

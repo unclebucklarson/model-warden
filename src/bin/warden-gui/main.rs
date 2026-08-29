@@ -70,6 +70,19 @@ enum Pane {
 
 /// Buttons inside the grid can't take `&mut self`; they queue here and the
 /// frame processes the queue after rendering.
+/// Snapshot of a delete confirmation, computed ONCE when the dialog
+/// opens — not per frame (the old form deep-cloned the Inventory and
+/// re-derived the deletable set 60x/second while a modal sat open).
+/// The worker re-derives truth under the write lock before moving.
+struct DeletePreview {
+    key: String,
+    name: String,
+    total: u64,
+    kept: Vec<(String, String)>,
+    foreign: Vec<String>,
+    offline: Vec<String>,
+}
+
 enum RowAction {
     Promote(String),
     DemoteDialog(String),
@@ -103,7 +116,7 @@ struct App {
     demote_target: String,
     demote_remove: bool,
     show_cold: bool,
-    delete_key: Option<String>,
+    delete_preview: Option<DeletePreview>,
     trash_items: Option<Vec<modelwarden::core::trash::TrashedFile>>,
     show_empty_confirm: bool,
     forget_confirm: Option<String>,
@@ -125,6 +138,7 @@ struct App {
     fetch_token_remember: bool,
     fetch_files: Option<Vec<modelwarden::core::acquire::RemoteFile>>,
     fetch_filter: String,
+    fetch_models: Vec<modelwarden::core::acquire::RemoteModel>,
     /// True when `fetch_files` is a whole-snapshot listing (no GGUFs) —
     /// the download unit is then the entire directory, never one file.
     fetch_snapshot: bool,
@@ -158,7 +172,7 @@ impl App {
             demote_target: String::new(),
             demote_remove: false,
             show_cold: false,
-            delete_key: None,
+            delete_preview: None,
             trash_items: None,
             show_empty_confirm: false,
             forget_confirm: None,
@@ -178,6 +192,7 @@ impl App {
             fetch_token_remember: false,
             fetch_files: None,
             fetch_filter: String::new(),
+            fetch_models: Vec::new(),
             fetch_snapshot: false,
         };
         if let Some(inv) = manifest::load_inventory(&settings::state_dir()) {
@@ -362,14 +377,25 @@ impl App {
                 let _ = tx.send(Msg::Error(format!("root {root_id} not found")));
                 return;
             };
+            // A selection can go stale between opening the dialog and the
+            // worker taking the lock (another warden deleted the model) —
+            // say so instead of silently succeeding at nothing.
+            let missing: Vec<&String> =
+                keys.iter().filter(|k| !inv.models.contains_key(*k)).collect();
+            if missing.len() == keys.len() {
+                let _ = tx.send(Msg::Error(
+                    "model(s) vanished from the catalog — refresh and retry".into(),
+                ));
+                return;
+            }
             let mut on = event_to_progress(tx.clone());
             let mut lines = Vec::new();
+            for k in missing {
+                lines.push(format!("skipped {k}: vanished from the catalog"));
+            }
             // Union of every selected model's bundle, deduped — a shared
             // companion moves once.
-            let all: std::collections::BTreeSet<String> = keys
-                .iter()
-                .flat_map(|k| manifest::bundle_for(&inv, k))
-                .collect();
+            let all = manifest::bundle_union(&inv, &keys);
             for k in all {
                 let Some(e) = inv.models.get(&k) else { continue };
                 let on_shelf = e.locations.iter().any(|l| {
@@ -395,7 +421,13 @@ impl App {
             if let Some(inv) = Self::refresh_catalog(tx) {
                 let _ = tx.send(Msg::Refreshed(inv));
             }
-            let _ = tx.send(Msg::Finished(lines.join("; ")));
+            if lines.is_empty() {
+                let _ = tx.send(Msg::Finished(
+                    "nothing to demote — no live shelf copies among the selection".into(),
+                ));
+            } else {
+                let _ = tx.send(Msg::Finished(lines.join("; ")));
+            }
         });
     }
 
@@ -507,10 +539,12 @@ impl App {
                 Msg::Progress(line) => self.progress = Some(line),
                 Msg::Activity(line) => self.activity.push(line),
                 Msg::RemoteFiles(files) => {
+                    self.fetch_models = modelwarden::core::acquire::group_listing(&files);
                     self.fetch_files = Some(files);
                     self.fetch_snapshot = false;
                 }
                 Msg::RemoteSnapshot(files) => {
+                    self.fetch_models = modelwarden::core::acquire::group_listing(&files);
                     self.fetch_files = Some(files);
                     self.fetch_snapshot = true;
                 }
@@ -692,21 +726,9 @@ impl App {
             ord.then_with(|| a.1.display_name.cmp(&b.1.display_name))
         });
 
-        // Companions: a content that rides in another model's bundle while
-        // its own bundle stays alone (mmproj projectors, Ollama +projector
-        // blobs, safetensors tokenizer/config files). That asymmetry IS the
-        // "required by" relation — bundle_for is the single source of truth.
-        use std::collections::BTreeMap;
-        let mut parents_of: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for (k, _, _) in &rows {
-            for m in manifest::bundle_for(inv, k) {
-                if &m != *k
-                    && !manifest::bundle_for(inv, &m).iter().any(|x| x == *k)
-                {
-                    parents_of.entry(m).or_default().push((*k).clone());
-                }
-            }
-        }
+        // The "required by" relation comes from core — the single source
+        // of truth shared with the cold-storage dialog and delete.
+        let parents_of = manifest::companion_parents(inv);
 
         // Cold-stored = every copy lives on a registered (cold) root. Those
         // models leave the Active view but never the catalog.
@@ -715,7 +737,16 @@ impl App {
         };
         let cold_count = rows
             .iter()
-            .filter(|(k, e, _)| !parents_of.contains_key(*k) && is_cold(e))
+            .filter(|(k, e, _)| {
+                !parents_of.contains_key(*k)
+                    && is_cold(e)
+                    && rows
+                        .iter()
+                        .filter(|(ck, _, _)| {
+                            parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
+                        })
+                        .all(|(_, ce, _)| is_cold(ce))
+            })
             .count();
         ui.horizontal(|ui| {
             ui.label("Filter:");
@@ -763,15 +794,21 @@ impl App {
             if parents_of.contains_key(*k) {
                 continue; // rendered under its parent below
             }
-            if !self.inv_show_all && is_cold(e) {
-                continue; // Active view: cold storage stays out of sight
-            }
             let children: Vec<_> = rows
                 .iter()
                 .filter(|(ck, _, _)| {
                     parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
                 })
                 .collect();
+            // Active view: a group leaves only when EVERY member is cold —
+            // a shelf-resident projector must not vanish because its
+            // parent model was demoted.
+            if !self.inv_show_all
+                && is_cold(e)
+                && children.iter().all(|(_, ce, _)| is_cold(ce))
+            {
+                continue;
+            }
             if !row_matches(k, e) && !children.iter().any(|(ck, ce, _)| row_matches(ck, ce)) {
                 continue;
             }
@@ -972,7 +1009,41 @@ impl App {
                         .unwrap_or(key);
                     self.show_backup = true;
                 }
-                RowAction::DeleteDialog(key) => self.delete_key = Some(key),
+                RowAction::DeleteDialog(key) => {
+                    use modelwarden::core::trash;
+                    if let Some(inv) = &self.inv {
+                        let keys = vec![key.clone()];
+                        let (del, kept) = trash::deletable_set(inv, &keys);
+                        let foreign = trash::foreign_commands(inv, &del);
+                        let total = del
+                            .iter()
+                            .filter_map(|k| inv.models.get(k).map(|e| e.size))
+                            .sum();
+                        let name = inv
+                            .models
+                            .get(&key)
+                            .map(|e| e.display_name.clone())
+                            .unwrap_or_else(|| key.clone());
+                        let offline: Vec<String> = del
+                            .iter()
+                            .filter_map(|k| inv.models.get(k))
+                            .flat_map(|e| {
+                                e.locations.iter().filter_map(|l| {
+                                    let root = inv.roots.iter().find(|r| r.id == l.root_id)?;
+                                    (root.kind.owned() && !inv.live_accessible(l)).then(|| {
+                                        format!(
+                                            "{} — on \"{}\" (offline)",
+                                            e.display_name,
+                                            root.label.clone().unwrap_or_else(|| root.id.clone())
+                                        )
+                                    })
+                                })
+                            })
+                            .collect();
+                        self.delete_preview =
+                            Some(DeletePreview { key, name, total, kept, foreign, offline });
+                    }
+                }
             }
         }
         if let Some(col) = sort_clicked {
@@ -1197,11 +1268,8 @@ impl App {
             })
             .collect();
         // Selected total counts whole bundles, deduped.
-        let bundle_keys: std::collections::BTreeSet<String> = self
-            .cold_sel
-            .iter()
-            .flat_map(|k| manifest::bundle_for(&inv, k))
-            .collect();
+        let sel: Vec<String> = self.cold_sel.iter().cloned().collect();
+        let bundle_keys = manifest::bundle_union(&inv, &sel);
         let total: u64 = bundle_keys
             .iter()
             .filter_map(|k| inv.models.get(k).map(|e| e.size))
@@ -1306,25 +1374,16 @@ impl App {
     /// Stage 1 of deletion, previewed: what goes to the trash, what is
     /// kept for other models, and the owner commands for foreign copies
     /// (shown, never run). Confirming moves files — destroys nothing.
+    /// Stage 1 of deletion, previewed: what goes to the trash, what is
+    /// kept for other models, and the owner commands for foreign copies
+    /// (shown, never run). The preview was computed once when Delete…
+    /// was clicked; confirming moves files — destroys nothing.
     fn delete_dialog(&mut self, ctx: &egui::Context) {
-        use modelwarden::core::trash;
-        let Some(key) = self.delete_key.clone() else { return };
-        let Some(inv) = self.inv.clone() else {
-            self.delete_key = None;
-            return;
-        };
-        let keys = vec![key.clone()];
-        let (del, kept) = trash::deletable_set(&inv, &keys);
-        let foreign = trash::foreign_commands(&inv, &del);
-        let total: u64 = del
-            .iter()
-            .filter_map(|k| inv.models.get(k).map(|e| e.size))
-            .sum();
-        let name = inv
-            .models
-            .get(&key)
-            .map(|e| e.display_name.clone())
-            .unwrap_or_else(|| key.clone());
+        let Some(p) = &self.delete_preview else { return };
+        let (key, name, total) = (p.key.clone(), p.name.clone(), p.total);
+        let kept = p.kept.clone();
+        let foreign = p.foreign.clone();
+        let offline = p.offline.clone();
         let mut open = true;
         let mut go = false;
         let mut cancel = false;
@@ -1353,24 +1412,6 @@ impl App {
                         });
                     }
                 }
-                // Copies on unplugged drives can't move now — say so up
-                // front, not just in the activity log afterwards.
-                let offline: Vec<String> = del
-                    .iter()
-                    .filter_map(|k| inv.models.get(k))
-                    .flat_map(|e| {
-                        e.locations.iter().filter_map(|l| {
-                            let root = inv.roots.iter().find(|r| r.id == l.root_id)?;
-                            (root.kind.owned() && !inv.live_accessible(l)).then(|| {
-                                format!(
-                                    "{} — on \"{}\" (offline)",
-                                    e.display_name,
-                                    root.label.clone().unwrap_or_else(|| root.id.clone())
-                                )
-                            })
-                        })
-                    })
-                    .collect();
                 if !offline.is_empty() {
                     ui.add_space(4.0);
                     ui.label(
@@ -1392,10 +1433,10 @@ impl App {
                 });
             });
         if go {
-            self.delete_key = None;
-            self.spawn_delete(keys);
+            self.delete_preview = None;
+            self.spawn_delete(vec![key]);
         } else if !open || cancel {
-            self.delete_key = None;
+            self.delete_preview = None;
         }
     }
 
@@ -1451,11 +1492,12 @@ impl App {
     /// irreversible act — emptying it — behind its own confirm dialog.
     fn trash_pane(&mut self, ui: &mut egui::Ui) {
         use modelwarden::core::trash;
-        let cfg = settings::AppConfig::load(&settings::config_file());
-        let roots = modelwarden::core::roots::discover_roots(&cfg);
         let items = self
             .trash_items
-            .get_or_insert_with(|| trash::list(&roots))
+            .get_or_insert_with(|| {
+                let cfg = settings::AppConfig::load(&settings::config_file());
+                trash::list(&modelwarden::core::roots::discover_roots(&cfg))
+            })
             .clone();
         if items.is_empty() {
             ui.label("The trash is empty.");
@@ -1493,7 +1535,7 @@ impl App {
                     ui.label(f.rel_path.display().to_string());
                     ui.label(human_size(f.size));
                     ui.label(&f.root_label);
-                    ui.label(ago_str(f.trashed_unix));
+                    ui.label(ago(f.trashed_unix));
                     if ui
                         .small_button("Restore")
                         .on_hover_text("Rename back into place (refuses to overwrite)")
@@ -1530,16 +1572,41 @@ impl App {
                 let _ = tx.send(Msg::Error(format!("root {root_id} not found")));
                 return;
             };
-            match trash::restore(&root, &rel) {
-                Ok(dst) => {
-                    let _ = tx.send(Msg::Activity(format!("restored {}", dst.display())));
-                    if let Some(inv) = Self::refresh_catalog(tx) {
-                        let _ = tx.send(Msg::Refreshed(inv));
+            // The clicked file expands to its trash-bundle — restoring a
+            // model without its projector would strand the projector for
+            // the next Empty Trash.
+            let set = trash::restore_set(&root, &rel);
+            let mut restored = 0usize;
+            let mut last_err: Option<String> = None;
+            for r in &set {
+                match trash::restore(&root, r) {
+                    Ok(dst) => {
+                        restored += 1;
+                        let _ = tx.send(Msg::Activity(format!("restored {}", dst.display())));
                     }
-                    let _ = tx.send(Msg::Finished(format!("restored {}", dst.display())));
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        let _ = tx.send(Msg::Activity(format!("FAILED {}: {msg}", r.display())));
+                        last_err = Some(msg);
+                    }
                 }
-                Err(e) => {
-                    let _ = tx.send(Msg::Error(format!("{e:#}")));
+            }
+            if restored > 0 {
+                if let Some(inv) = Self::refresh_catalog(tx) {
+                    let _ = tx.send(Msg::Refreshed(inv));
+                }
+            }
+            match last_err {
+                None => {
+                    let _ = tx.send(Msg::Finished(format!(
+                        "restored {restored} file{}",
+                        if restored == 1 { "" } else { "s" }
+                    )));
+                }
+                Some(e) => {
+                    let _ = tx.send(Msg::Error(format!(
+                        "restored {restored}, but not everything: {e}"
+                    )));
                 }
             }
         });
@@ -1550,9 +1617,16 @@ impl App {
         if !self.show_empty_confirm {
             return;
         }
-        let cfg = settings::AppConfig::load(&settings::config_file());
-        let roots = modelwarden::core::roots::discover_roots(&cfg);
-        let items = trash::list(&roots);
+        // Counts come from the pane's cached listing — never a per-frame
+        // filesystem walk while a modal merely sits open. The worker
+        // re-derives truth under the write lock before destroying.
+        let items = self
+            .trash_items
+            .get_or_insert_with(|| {
+                let cfg = settings::AppConfig::load(&settings::config_file());
+                trash::list(&modelwarden::core::roots::discover_roots(&cfg))
+            })
+            .clone();
         let total: u64 = items.iter().map(|f| f.size).sum();
         let mut open = true;
         let mut go = false;
@@ -1595,20 +1669,35 @@ impl App {
                 let cfg = settings::AppConfig::load(&settings::config_file());
                 let mut count = 0usize;
                 let mut bytes = 0u64;
+                let mut errors: Vec<String> = Vec::new();
                 for root in modelwarden::core::roots::discover_roots(&cfg) {
-                    if let Ok((c, b)) = trash::empty(&root) {
-                        count += c;
-                        bytes += b;
+                    match trash::empty(&root) {
+                        Ok((c, b)) => {
+                            count += c;
+                            bytes += b;
+                        }
+                        // A root that could not be emptied still holds
+                        // files the user believes destroyed — never
+                        // report that as success.
+                        Err(e) => errors.push(format!("{}: {e:#}", root.id)),
                     }
                 }
                 let _ = tx.send(Msg::Activity(format!(
                     "destroyed {count} files, {} reclaimed",
                     human_size(bytes)
                 )));
-                let _ = tx.send(Msg::Finished(format!(
-                    "trash emptied: {count} files, {} reclaimed",
-                    human_size(bytes)
-                )));
+                if errors.is_empty() {
+                    let _ = tx.send(Msg::Finished(format!(
+                        "trash emptied: {count} files, {} reclaimed",
+                        human_size(bytes)
+                    )));
+                } else {
+                    let _ = tx.send(Msg::Error(format!(
+                        "trash NOT fully emptied ({count} files, {} reclaimed): {}",
+                        human_size(bytes),
+                        errors.join("; ")
+                    )));
+                }
             });
         } else if !open || cancel {
             self.show_empty_confirm = false;
@@ -1865,8 +1954,9 @@ impl App {
                     // Rows are MODELS, not files: a split set collapses to
                     // one row with its combined size and part count —
                     // clicking Download transfers the whole set, so the
-                    // row says so (parts itemized in the hover).
-                    let models = modelwarden::core::acquire::group_listing(files);
+                    // row says so (parts itemized in the hover). Grouped
+                    // once on arrival, not per frame.
+                    let models = self.fetch_models.clone();
                     let q = self.fetch_filter.trim().to_lowercase();
                     let shown = models
                         .iter()
@@ -2180,9 +2270,7 @@ impl App {
                             let _ = tx.send(Msg::Error(format!("saving config: {e:#}")));
                             return;
                         }
-                        let man = manifest::manifest_path(&state, &root.id);
-                        let _ = std::fs::remove_file(&man);
-                        let _ = std::fs::remove_file(man.with_extension("json.bak"));
+                        manifest::remove_manifest(&state, &root.id);
                         let _ = tx.send(Msg::Activity(format!(
                             "forgot root {} ({})",
                             root.id,
@@ -2303,18 +2391,9 @@ impl App {
 }
 
 /// Contents that ride in another model's bundle while their own bundle
-/// stays alone (mmproj, Ollama +projector, safetensors companions) — the
-/// asymmetry bundle_for already encodes.
+/// stays alone — core's companion relation, key set only.
 fn companion_keys(inv: &manifest::Inventory) -> std::collections::BTreeSet<String> {
-    let mut out = std::collections::BTreeSet::new();
-    for k in inv.models.keys() {
-        for m in manifest::bundle_for(inv, k) {
-            if &m != k && !manifest::bundle_for(inv, &m).iter().any(|x| x == k) {
-                out.insert(m);
-            }
-        }
-    }
-    out
+    manifest::companion_parents(inv).into_keys().collect()
 }
 
 /// Backup/archive events all render the same way: durable log_line()
@@ -2429,13 +2508,3 @@ fn human_size(bytes: u64) -> String {
     modelwarden::core::format::human_size(bytes)
 }
 
-fn ago_str(unix: u64) -> String {
-    let now = manifest::now_unix();
-    let d = now.saturating_sub(unix);
-    match d {
-        0..=90 => format!("{d}s ago"),
-        91..=5400 => format!("{} min ago", d / 60),
-        5401..=172_800 => format!("{} hours ago", d / 3600),
-        _ => format!("{} days ago", d / 86_400),
-    }
-}

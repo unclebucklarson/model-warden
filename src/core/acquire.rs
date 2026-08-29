@@ -151,16 +151,31 @@ pub fn split_set(all: &[RemoteFile], chosen: &str) -> Result<Vec<String>> {
 /// promise starts at download time, not at the first backup.
 pub fn with_projectors(all: &[RemoteFile], mut set: Vec<String>) -> Vec<String> {
     let is_projector = |name: &str| {
-        let base = name.rsplit('/').next().unwrap_or(name).to_lowercase();
-        base.contains("mmproj") && base.ends_with(".gguf")
+        let base = name.rsplit('/').next().unwrap_or(name);
+        crate::core::manifest::is_projector_name(base)
     };
     if set.iter().all(|f| is_projector(f)) {
         return set; // projector-only choice stays as chosen
     }
-    for f in all {
-        if is_projector(&f.filename) && !set.contains(&f.filename) {
-            set.push(f.filename.clone());
-        }
+    let candidates: Vec<&RemoteFile> = all
+        .iter()
+        .filter(|f| is_projector(&f.filename) && !set.contains(&f.filename))
+        .collect();
+    // ONE projector suffices to run; repos often ship several precisions
+    // (f16 + bf16 + q8) and pulling them all cost a real user ~2 GiB of
+    // unasked-for transfer. Prefer plain f16 (llama.cpp's default
+    // pairing), then bf16, else the first listed; the listing still
+    // shows the rest for a deliberate manual pick.
+    let pick = candidates
+        .iter()
+        .find(|f| {
+            let b = f.filename.to_lowercase();
+            b.contains("f16") && !b.contains("bf16")
+        })
+        .or_else(|| candidates.iter().find(|f| f.filename.to_lowercase().contains("bf16")))
+        .or_else(|| candidates.first());
+    if let Some(f) = pick {
+        set.push(f.filename.clone());
     }
     set
 }
@@ -395,11 +410,35 @@ pub fn fetch(
         let mut req = with_auth(agent().get(&url), token);
         if resume_from > 0 {
             req = req.set("Range", &format!("bytes={resume_from}-"));
+            // If the file changed on the server since the pass that set
+            // `etag`, If-Range makes it answer 200-full instead of
+            // appending bytes of a NEW revision onto our OLD partial —
+            // the full response truncates and restarts cleanly below.
+            if let Some(e) = &etag {
+                req = req.set("If-Range", &format!("\"{e}\""));
+            }
         }
         let resp = match req.call() {
             Ok(r) => r,
+            Err(ureq::Error::Status(416, r)) if resume_from > 0 => {
+                // Range unsatisfiable. If the partial is exactly the full
+                // length (crash after the last byte, before rename), it's
+                // complete — finalize it. Otherwise it's stale garbage:
+                // discard warden's own temp and start over.
+                let full = r
+                    .header("content-range")
+                    .and_then(|cr| cr.rsplit('/').next())
+                    .and_then(|t| t.parse::<u64>().ok());
+                if full == Some(resume_from) {
+                    break;
+                }
+                let _ = std::fs::remove_file(&tmp);
+                retry(0, &mut on).with_context(|| format!("downloading {url}"))?;
+                continue;
+            }
             Err(ureq::Error::Status(code, r)) => {
-                return Err(ureq::Error::Status(code, r).into());
+                return Err(ureq::Error::Status(code, r))
+                    .with_context(|| format!("downloading {url}"));
             }
             Err(e) => {
                 // Transport-level failure before any bytes: retry.
@@ -484,12 +523,32 @@ pub fn fetch(
         file.sync_all().ok();
         drop(file);
 
-        let short = total.is_some_and(|t| done < t);
-        if outcome.is_err() || short {
-            retry(done, &mut on)?;
-            continue;
+        match total {
+            // More bytes than declared: never publish it — discard the
+            // temp and start over. (The old `!= total` check refused
+            // this; a rework briefly accepted it.)
+            Some(t) if done > t => {
+                let _ = std::fs::remove_file(&tmp);
+                retry(0, &mut on)?;
+                continue;
+            }
+            // Short — dropped mid-stream or clean-but-early EOF: resume.
+            Some(t) if done < t => {
+                retry(done, &mut on)?;
+                continue;
+            }
+            // Exactly complete: success even if the connection closed
+            // uncleanly after the last byte — retrying a finished
+            // transfer just earns a 416.
+            Some(_) => break,
+            None => {
+                if outcome.is_err() {
+                    retry(done, &mut on)?;
+                    continue;
+                }
+                break;
+            }
         }
-        break;
     }
     std::fs::rename(&tmp, &dest).with_context(|| format!("finalizing {}", dest.display()))?;
 
@@ -673,6 +732,18 @@ mod tests {
         assert_eq!(
             with_projectors(&plain, vec!["model-Q4.gguf".into()]),
             vec!["model-Q4.gguf"]
+        );
+        // Several projector precisions: ONE comes along (f16 preferred) —
+        // a real user paid ~2 GiB for all of them before this rule.
+        let multi = files(&[
+            "big-Q4.gguf",
+            "mmproj-big-bf16.gguf",
+            "mmproj-big-f16.gguf",
+            "mmproj-big-Q8_0.gguf",
+        ]);
+        assert_eq!(
+            with_projectors(&multi, vec!["big-Q4.gguf".into()]),
+            vec!["big-Q4.gguf", "mmproj-big-f16.gguf"]
         );
     }
 

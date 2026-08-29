@@ -18,6 +18,19 @@ pub fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Relative-time label ("3 min ago") — one copy, so the CLI, the GUI
+/// activity timestamps, and the Trash tab can never drift apart.
+pub fn ago(unix: u64) -> String {
+    let now = crate::core::manifest::now_unix();
+    let d = now.saturating_sub(unix);
+    match d {
+        0..=90 => format!("{d}s ago"),
+        91..=5400 => format!("{} min ago", d / 60),
+        5401..=172_800 => format!("{} hours ago", d / 3600),
+        _ => format!("{} days ago", d / 86_400),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

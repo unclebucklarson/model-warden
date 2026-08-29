@@ -24,8 +24,8 @@ sha2 = "0.10"
 thiserror = "2"
 ureq = { version = "2", features = ["json"] }
 
-# Lock liveness on unixes without /proc (macOS): kill(pid, 0).
-[target.'cfg(all(unix, not(target_os = "linux")))'.dependencies]
+# Lock liveness probe: kill(pid, 0) on every unix.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]

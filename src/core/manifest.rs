@@ -123,6 +123,15 @@ pub fn manifest_path(state_dir: &Path, root_id: &str) -> PathBuf {
     manifest_dir(state_dir).join(format!("{root_id}.json"))
 }
 
+/// Remove a root's stored manifest (and the `.bak` that save_json keeps)
+/// — the state-side half of forgetting a root. The `.bak` naming is
+/// save_json's private detail; it stays inside this module.
+pub fn remove_manifest(state_dir: &Path, root_id: &str) {
+    let man = manifest_path(state_dir, root_id);
+    let _ = std::fs::remove_file(&man);
+    let _ = std::fs::remove_file(man.with_extension("json.bak"));
+}
+
 pub fn inventory_path(state_dir: &Path) -> PathBuf {
     state_dir.join("inventory.json")
 }
@@ -256,6 +265,37 @@ pub fn merge(manifests: &[RootManifest]) -> Inventory {
         roots: manifests.iter().map(|m| m.root.clone()).collect(),
         models,
     }
+}
+
+/// The companion relation, once: X is a companion of Y when X rides in
+/// Y's bundle but Y does not ride in X's (mmproj projectors, Ollama
+/// +projector blobs, safetensors tokenizer/config files). Returns
+/// companion → the models that require it. Symmetric bundle members
+/// (split parts) are peers, not companions.
+pub fn companion_parents(inv: &Inventory) -> BTreeMap<String, Vec<String>> {
+    let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for k in inv.models.keys() {
+        for m in bundle_for(inv, k) {
+            if &m != k && !bundle_for(inv, &m).iter().any(|x| x == k) {
+                out.entry(m).or_default().push(k.clone());
+            }
+        }
+    }
+    out
+}
+
+/// A selection expands to the union of its bundles, shared companions
+/// once — the contract every multi-model operation (backup, demote,
+/// delete) applies before moving anything.
+pub fn bundle_union(inv: &Inventory, keys: &[String]) -> std::collections::BTreeSet<String> {
+    keys.iter().flat_map(|k| bundle_for(inv, k)).collect()
+}
+
+/// The one projector-filename rule, shared by the catalog (bundle_for),
+/// acquisition (with_projectors), and trash restore — so the definitions
+/// of "vision projector" can never drift apart.
+pub fn is_projector_name(name: &str) -> bool {
+    name.to_lowercase().contains("mmproj")
 }
 
 /// Progress reporting for `refresh` — both frontends render these; a 22 GiB
@@ -433,7 +473,7 @@ pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
                 let fname = file_name_of(&loc.rel_path);
                 let my_split =
                     crate::core::acquire::split_parts(&fname).map(|(p, _, c)| (p.to_string(), c));
-                let i_am_projector = fname.to_lowercase().contains("mmproj");
+                let i_am_projector = is_projector_name(&fname);
                 // A non-GGUF weights file isn't self-contained: the model is
                 // the whole container (tokenizer, configs, everything).
                 let i_am_weights = crate::core::scan::is_weights_filename(&fname);
@@ -461,7 +501,7 @@ pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
                                 .is_some_and(|(p2, _, c2)| p2 == p && c2 == *c)
                         });
                         same_split
-                            || (!i_am_projector && f2.to_lowercase().contains("mmproj"))
+                            || (!i_am_projector && is_projector_name(&f2))
                     });
                     if companion {
                         keys.insert(k2.clone());

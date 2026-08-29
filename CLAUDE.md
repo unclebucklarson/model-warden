@@ -60,7 +60,10 @@ Non-obvious constraints that shape the code:
 - **All copies go .partial → verify hash → rename.** A half-copy must never be
   scannable as a model. Refuse-overwrite everywhere.
 - **A missing root is Offline, not gone.** Never drop offline entries from
-  manifests; unplugged drives stay queryable.
+  manifests; unplugged drives stay queryable. The one sanctioned
+  exception: `roots forget` — the user explicitly declaring a drive truly
+  gone (dead, reformatted), previewed with an impact statement and
+  confirmed with --yes / a GUI dialog.
 - **The merged inventory is a published read-only contract** (schema_version;
   llamacppCodeConf reads it from M6). Schema changes need versioning.
 - **Spike before building on assumptions**; verdicts go in PLAN.md and
