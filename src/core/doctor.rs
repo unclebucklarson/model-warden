@@ -36,6 +36,9 @@ pub enum FindingKind {
     /// The scheduled scrub timer isn't running — nothing re-verifies
     /// tracked bytes, so bit rot goes unnoticed until a restore fails.
     ScrubTimerOff,
+    /// A backup drive's contents haven't been byte-verified in a long
+    /// time (or ever) — offline drives silently age out of trust.
+    StaleVerification,
 }
 
 impl FindingKind {
@@ -48,6 +51,7 @@ impl FindingKind {
             FindingKind::DanglingSnapshotLink => "dangling snapshot link",
             FindingKind::MissingOllamaBlob => "missing ollama blob",
             FindingKind::ScrubTimerOff => "scrub timer off",
+            FindingKind::StaleVerification => "stale verification",
         }
     }
 
@@ -90,6 +94,14 @@ impl FindingKind {
                  so silent corruption (bit rot) on the shelf or a backup \
                  drive would go unnoticed until a restore fails."
             }
+            FindingKind::StaleVerification => {
+                "This drive's bytes haven't been read end-to-end and \
+                 checked against the catalog recently. The scrub only \
+                 covers roots that are online when it runs, so a drive \
+                 that sits unplugged silently ages out of trust — and \
+                 bit rot on cold storage is exactly the kind you find \
+                 out about the day you need the backup."
+            }
         }
     }
 
@@ -110,6 +122,9 @@ impl FindingKind {
             }
             FindingKind::ScrubTimerOff => {
                 "nothing — it gains a periodic background re-verify (idle I/O)"
+            }
+            FindingKind::StaleVerification => {
+                "nothing — plug the drive in and let the verify re-read it"
             }
         }
     }
@@ -218,12 +233,73 @@ fn cli_available(name: &str) -> bool {
     })
 }
 
-/// Check every store, plus the machine-level advisories (scrub timer).
-/// Unreadable directories contribute nothing — degrade, never fail the
-/// report.
-pub fn check(ollama_stores: &[PathBuf], hf_hub: Option<&Path>) -> Vec<Finding> {
+/// Check every store, plus the machine-level advisories (scrub timer,
+/// backup-drive verification freshness). Unreadable directories
+/// contribute nothing — degrade, never fail the report.
+pub fn check(ollama_stores: &[PathBuf], hf_hub: Option<&Path>, state_dir: &Path) -> Vec<Finding> {
     let mut out = check_with_tools(ollama_stores, hf_hub, OwnerTools::detect());
     out.extend(scrub_advisory(crate::core::scrub::timer_state()));
+    out.extend(verification_advisory(
+        &crate::core::manifest::load_all_manifests(state_dir),
+        crate::core::manifest::now_unix(),
+    ));
+    out
+}
+
+/// How long a backup drive may go without an end-to-end verify before
+/// doctor starts asking about it.
+pub const STALE_VERIFY_DAYS: u64 = 90;
+
+/// Freshness advisories for backup drives: a registered drive whose
+/// oldest verification (across its hashed files) is older than
+/// STALE_VERIFY_DAYS — or that was never verified — gets a finding
+/// carrying the at-risk byte count and the exact command. Pure over the
+/// stored manifests so it's testable; drives only, since the scrub
+/// already covers whatever is online.
+pub fn verification_advisory(
+    manifests: &[crate::core::manifest::RootManifest],
+    now: u64,
+) -> Vec<Finding> {
+    use crate::core::format::human_size;
+    let mut out = Vec::new();
+    for m in manifests {
+        if m.root.kind != crate::core::roots::RootKind::Removable {
+            continue;
+        }
+        let hashed: Vec<_> = m.files.iter().filter(|f| f.sha256.is_some()).collect();
+        if hashed.is_empty() {
+            continue;
+        }
+        // A drive is only as trustworthy as its least-recently-verified
+        // file; never-verified counts as infinitely stale.
+        let oldest = hashed
+            .iter()
+            .map(|f| f.verified_unix.unwrap_or(0))
+            .min()
+            .unwrap_or(0);
+        let age_days = now.saturating_sub(oldest) / 86_400;
+        if oldest != 0 && age_days <= STALE_VERIFY_DAYS {
+            continue;
+        }
+        let name = m.root.label.clone().unwrap_or_else(|| m.root.id.clone());
+        let bytes: u64 = hashed.iter().map(|f| f.size).sum();
+        out.push(Finding {
+            kind: FindingKind::StaleVerification,
+            subject: name.clone(),
+            detail: if oldest == 0 {
+                format!("never byte-verified ({} at stake)", human_size(bytes))
+            } else {
+                format!(
+                    "oldest verification {age_days} days ago ({} at stake)",
+                    human_size(bytes)
+                )
+            },
+            bytes,
+            remedy: Remedy::Manual {
+                command: format!("warden verify \"{name}\""),
+            },
+        });
+    }
     out
 }
 
@@ -840,5 +916,47 @@ mod tests {
         })
         .unwrap_err();
         assert!(format!("{err}").contains("run yourself"));
+    }
+    #[test]
+    fn stale_drive_verification_is_advised() {
+        use crate::core::manifest::{FileRecord, RootManifest, SCHEMA_VERSION};
+        use crate::core::roots::RootKind;
+        let mk = |kind: RootKind, verified: Option<u64>| RootManifest {
+            schema_version: SCHEMA_VERSION,
+            root: crate::core::roots::RootSpec {
+                id: "ext-1".into(),
+                kind,
+                path: "/x".into(),
+                label: Some("Cold".into()),
+            },
+            generated_unix: 0,
+            files: vec![FileRecord {
+                rel_path: "m.gguf".into(),
+                size: 7,
+                fingerprint: None,
+                sha256: Some("aa".into()),
+                name: None,
+                meta: None,
+                accessible: true,
+                verified_unix: verified,
+            }],
+        };
+        let day = 86_400u64;
+        let now = 1_000 * day;
+        // Verified 10 days ago: fresh, quiet.
+        assert!(verification_advisory(&[mk(RootKind::Removable, Some(now - 10 * day))], now)
+            .is_empty());
+        // 120 days: stale — advisory names the drive, the at-risk bytes,
+        // and the exact verify command.
+        let f = &verification_advisory(&[mk(RootKind::Removable, Some(now - 120 * day))], now)[0];
+        assert_eq!(f.kind, FindingKind::StaleVerification);
+        assert_eq!(f.subject, "Cold");
+        assert_eq!(f.bytes, 7);
+        assert!(f.remedy.display().contains("warden verify \"Cold\""), "{:?}", f.remedy);
+        assert!(f.detail.contains("120 days"), "{}", f.detail);
+        // Never verified at all: advised too.
+        assert!(!verification_advisory(&[mk(RootKind::Removable, None)], now).is_empty());
+        // Non-drive roots are the scrub's job, not this advisory's.
+        assert!(verification_advisory(&[mk(RootKind::Shelf, None)], now).is_empty());
     }
 }

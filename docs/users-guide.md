@@ -369,6 +369,10 @@ destruction never happens on a schedule.
 - **File → Update Catalog** — rescan all roots, hash new/changed files,
   rewrite the catalog. Same as `warden hash`. Progress shows in the status
   bar; per-file results land in the activity log.
+- **File → Settings…** — shelf directories (add/remove, with the first
+  marked as *the* shelf where downloads land) and the store-discovery
+  toggle — the last settings that used to require editing config.json by
+  hand. Nothing saves unless every path validates.
 - **File → Storage Roots…** — see registered drives and register new ones
   (type a path or **Browse…**; optionally give the drive a label like
   "Archive 2"). Register a drive once; it's recognized forever after.
@@ -651,6 +655,7 @@ what a backup is), so it appears in `where`, but never in the dups report.
 | **dangling snapshot link** | A cache entry that looks like a file but points at pruned bytes. | Nothing; the bytes are already gone. |
 | **missing ollama blob** | An Ollama model whose manifest names a weights blob that isn't in the blob store — registered but can't run. | Just the registration; its bytes are already missing. |
 | **scrub timer off** | Nothing is periodically re-reading your bytes; bit rot would go unnoticed (see 2.7). | Nothing — fixing *gains* you a weekly background check. |
+| **stale verification** | A backup drive hasn't been byte-verified in over 90 days (or ever). The scrub only covers what's plugged in, so cold drives silently age out of trust — and the at-risk bytes are named. | Nothing — plug the drive in and run the printed `warden verify` command. |
 
 `doctor --fix` (or the GUI's Clean up buttons) executes everything in this
 table except **orphan blob**, which prints its exact removal command and

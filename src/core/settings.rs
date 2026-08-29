@@ -99,6 +99,30 @@ pub fn state_dir() -> PathBuf {
         .join("modelwarden")
 }
 
+/// Validate a scan-dirs edit before it touches the config: every path
+/// must exist (named in the error when not), the list can't be empty
+/// (warden needs a shelf — the first entry), duplicates collapse, and
+/// order is preserved (downloads land in the FIRST entry).
+pub fn normalize_scan_dirs(dirs: &[std::path::PathBuf]) -> anyhow::Result<Vec<std::path::PathBuf>> {
+    use anyhow::{Context, bail};
+    if dirs.is_empty() {
+        bail!("at least one shelf directory is required");
+    }
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for d in dirs {
+        let canon = d
+            .canonicalize()
+            .with_context(|| format!("{} does not exist", d.display()))?;
+        if !canon.is_dir() {
+            bail!("{} is not a directory", canon.display());
+        }
+        if !out.contains(&canon) {
+            out.push(canon);
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -122,5 +146,19 @@ mod tests {
         // Garbage file → defaults, not a crash.
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(AppConfig::load(&path), AppConfig::default());
+    }
+    #[test]
+    fn scan_dirs_normalize_validates_and_dedupes() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        // Warden needs a shelf: an empty list is refused.
+        assert!(normalize_scan_dirs(&[]).is_err());
+        // A missing directory is refused BY NAME, before anything saves.
+        let err = normalize_scan_dirs(&[d.path().join("no-such")]).unwrap_err();
+        assert!(format!("{err}").contains("no-such"), "{err}");
+        // Valid dirs canonicalize; duplicates collapse; order survives.
+        let out = normalize_scan_dirs(&[a.clone(), a.clone()]).unwrap();
+        assert_eq!(out, vec![a.canonicalize().unwrap()]);
     }
 }

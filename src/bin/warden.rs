@@ -337,7 +337,7 @@ fn cmd_doctor(args: &[String], json: bool) -> ExitCode {
         Vec::new()
     };
     let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
-    let findings = doctor::check(&ollama, hub.as_deref());
+    let findings = doctor::check(&ollama, hub.as_deref(), &settings::state_dir());
     if json {
         return print_json(&findings);
     }

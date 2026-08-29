@@ -17,7 +17,7 @@ update it when milestones land.
 
 - `cargo build` / `cargo test` — core is headless and fully testable.
 - `cargo run` — opens the GUI (`default-run = "warden-gui"`).
-- `cargo run --bin warden -- <scan|hash|status|dups|doctor|roots|where|backup|verify|scrub|archive|restore|dedup|report|fetch|delete|trash>` — CLI; `--json` on all read commands.
+- `cargo run --bin warden -- <scan|hash|status|dups|doctor|roots|where|backup|verify|scrub|archive|restore|dedup|report|fetch|delete|trash|journal>` — CLI; `--json` on all read commands.
 - Config: `~/.config/modelwarden/config.json` (records only what the user changed).
 - State (manifests, merged inventory): `~/.local/state/modelwarden/`.
 

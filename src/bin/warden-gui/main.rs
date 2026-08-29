@@ -121,6 +121,10 @@ struct App {
     trash_items: Option<Vec<modelwarden::core::trash::TrashedFile>>,
     show_empty_confirm: bool,
     forget_confirm: Option<String>,
+    show_settings: bool,
+    settings_dirs: Vec<String>,
+    settings_add: String,
+    settings_discover: bool,
     cold_filter: String,
     cold_sel: std::collections::BTreeSet<String>,
     cold_target: String,
@@ -180,6 +184,10 @@ impl App {
             trash_items: None,
             show_empty_confirm: false,
             forget_confirm: None,
+            show_settings: false,
+            settings_dirs: Vec::new(),
+            settings_add: String::new(),
+            settings_discover: true,
             cold_filter: String::new(),
             cold_sel: std::collections::BTreeSet::new(),
             cold_target: String::new(),
@@ -291,7 +299,11 @@ impl App {
                 Vec::new()
             };
             let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
-            let findings = modelwarden::core::doctor::check(&ollama, hub.as_deref());
+            let findings = modelwarden::core::doctor::check(
+                &ollama,
+                hub.as_deref(),
+                &settings::state_dir(),
+            );
             let n = findings.len();
             let _ = tx.send(Msg::Doctor(findings));
             let _ = tx.send(Msg::Finished(format!("doctor: {n} findings")));
@@ -311,7 +323,11 @@ impl App {
                         Vec::new()
                     };
                     let hub = cfg.discover_stores.then(scan::default_hf_hub).flatten();
-                    let findings = modelwarden::core::doctor::check(&ollama, hub.as_deref());
+                    let findings = modelwarden::core::doctor::check(
+                &ollama,
+                hub.as_deref(),
+                &settings::state_dir(),
+            );
                     let _ = tx.send(Msg::Doctor(findings));
                     let _ = tx.send(Msg::Finished(format!("{subject}: {msg}")));
                 }
@@ -605,6 +621,22 @@ impl App {
             }
             if ui.button("Storage Roots…").clicked() {
                 self.show_roots = true;
+                ui.close();
+            }
+            if ui
+                .button("Settings…")
+                .on_hover_text("Shelf directories and store discovery — the last config.json hand-edits, retired")
+                .clicked()
+            {
+                let cfg = settings::AppConfig::load(&settings::config_file());
+                self.settings_dirs = cfg
+                    .scan_dirs
+                    .iter()
+                    .map(|d| d.display().to_string())
+                    .collect();
+                self.settings_discover = cfg.discover_stores;
+                self.settings_add.clear();
+                self.show_settings = true;
                 ui.close();
             }
             ui.separator();
@@ -2333,6 +2365,99 @@ impl App {
         }
     }
 
+    /// Shelf directories + store discovery, editable without touching
+    /// config.json by hand. Validation (exists, non-empty, deduped) is
+    /// core's normalize_scan_dirs; nothing saves until it passes.
+    fn settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_settings {
+            return;
+        }
+        let mut open = self.show_settings;
+        let mut save = false;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Shelf directories — warden-owned model folders. Downloads, \
+                     archives, and restores land in the FIRST one.",
+                );
+                let mut remove: Option<usize> = None;
+                for (i, d) in self.settings_dirs.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("✕").on_hover_text("Remove from the list").clicked() {
+                            remove = Some(i);
+                        }
+                        if i == 0 {
+                            ui.label(format!("{d}  (primary shelf)"));
+                        } else {
+                            ui.label(d);
+                        }
+                    });
+                }
+                if let Some(i) = remove {
+                    self.settings_dirs.remove(i);
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Add:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.settings_add).desired_width(280.0),
+                    );
+                    if ui.button("Browse…").clicked()
+                        && let Some(dir) = rfd::FileDialog::new().pick_folder()
+                    {
+                        self.settings_add = dir.display().to_string();
+                    }
+                    if ui.button("Add").clicked() && !self.settings_add.trim().is_empty() {
+                        self.settings_dirs.push(self.settings_add.trim().to_string());
+                        self.settings_add.clear();
+                    }
+                });
+                ui.separator();
+                ui.checkbox(
+                    &mut self.settings_discover,
+                    "Discover Ollama and HuggingFace stores automatically",
+                )
+                .on_hover_text(
+                    "Off = warden watches only the shelf directories and \
+                     registered drives listed above",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Save").clicked() {
+                        save = true;
+                    }
+                    ui.weak("changes apply on the next catalog update");
+                });
+            });
+        if save {
+            let dirs: Vec<std::path::PathBuf> = self
+                .settings_dirs
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            match settings::normalize_scan_dirs(&dirs) {
+                Ok(normalized) => {
+                    let mut cfg = settings::AppConfig::load(&settings::config_file());
+                    cfg.scan_dirs = normalized;
+                    cfg.discover_stores = self.settings_discover;
+                    match cfg.save(&settings::config_file()) {
+                        Ok(()) => {
+                            self.activity.push(
+                                "settings saved — File → Update Catalog to rescan".into(),
+                            );
+                            self.show_settings = false;
+                            return;
+                        }
+                        Err(e) => self.activity.push(format!("error saving settings: {e:#}")),
+                    }
+                }
+                Err(e) => self.activity.push(format!("settings not saved: {e:#}")),
+            }
+        }
+        self.show_settings = open;
+    }
+
     fn roots_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_roots {
             return;
@@ -2518,6 +2643,7 @@ impl eframe::App for App {
         self.delete_dialog(ui.ctx());
         self.empty_confirm_dialog(ui.ctx());
         self.forget_dialog(ui.ctx());
+        self.settings_dialog(ui.ctx());
         self.reclaim_dialog(ui.ctx());
         self.fetch_dialog(ui.ctx());
         self.fix_dialog(ui.ctx());

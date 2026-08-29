@@ -342,11 +342,16 @@ Built test-first (see CLAUDE.md methodology). Priority order:
    works without warden); the GUI journals its whole durable activity
    stream via one hook, the CLI jots every result line; `warden journal
    [N|--all]` reads it back; E2E proves persistence across processes.
-5. **Settings dialog** — shelf/scan_dirs editable in the GUI (last
-   remaining hand-edit of config.json).
-6. **Verification-freshness advisory** — doctor warns when a backup
-   root's oldest `verified_unix` ages past a threshold ("Archive 2 last
-   verified 94 days ago") — offline drives silently age out of trust.
+5. ~~**Settings dialog**~~ **DONE 2026-08-29** (test-first:
+   settings::normalize_scan_dirs — exists/non-empty/deduped — guards the
+   save): File → Settings… edits shelf dirs (first = primary) and the
+   discover-stores toggle. config.json hand-edits: retired.
+6. ~~**Verification-freshness advisory**~~ **DONE 2026-08-29**
+   (test-first): doctor's `stale verification` finding — a registered
+   drive whose oldest per-file verification exceeds 90 days (or never)
+   is named with its at-risk bytes and the exact `warden verify`
+   command. Drives only; the scrub covers whatever is online. **M17
+   complete.**
 
 ## Smaller items (fold in opportunistically)
 
