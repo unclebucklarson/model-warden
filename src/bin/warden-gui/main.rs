@@ -55,6 +55,7 @@ enum InvCol {
     Quant,
     Size,
     Where,
+    Backup,
     State,
 }
 
@@ -125,6 +126,9 @@ struct App {
     cold_target: String,
     cold_remove: bool,
     fix_confirm: Option<usize>,
+    /// Write requests made while a job runs wait here instead of being
+    /// ignored — one worker at a time, nothing lost.
+    pending_jobs: std::collections::VecDeque<(String, Box<dyn FnOnce(&Sender<Msg>) + Send>)>,
     inv_sort_col: InvCol,
     inv_sort_asc: bool,
     inv_filter: String,
@@ -181,6 +185,7 @@ impl App {
             cold_target: String::new(),
             cold_remove: false,
             fix_confirm: None,
+            pending_jobs: std::collections::VecDeque::new(),
             inv_sort_col: InvCol::Name,
             inv_sort_asc: true,
             inv_filter: String::new(),
@@ -214,9 +219,14 @@ impl App {
     fn spawn(&mut self, label: &str, job: impl FnOnce(&Sender<Msg>) + Send + 'static) {
         if let Some(current) = &self.busy {
             self.activity
-                .push(format!("busy with {current} — ignored: {label}"));
+                .push(format!("queued after {current}: {label}"));
+            self.pending_jobs.push_back((label.to_string(), Box::new(job)));
             return;
         }
+        self.start_job(label, Box::new(job));
+    }
+
+    fn start_job(&mut self, label: &str, job: Box<dyn FnOnce(&Sender<Msg>) + Send>) {
         self.busy = Some(label.to_string());
         self.activity.push(format!("{label}…"));
         let tx = self.tx.clone();
@@ -565,6 +575,12 @@ impl App {
                 }
             }
         }
+        // A finished job hands the worker to the next in line.
+        if self.busy.is_none()
+            && let Some((label, job)) = self.pending_jobs.pop_front()
+        {
+            self.start_job(&label, job);
+        }
     }
 
     fn menu_bar(&mut self, ui: &mut egui::Ui) {
@@ -647,6 +663,9 @@ impl App {
             if let Some(label) = &self.busy {
                 ui.spinner();
                 ui.label(self.progress.as_ref().unwrap_or(label));
+                if !self.pending_jobs.is_empty() {
+                    ui.weak(format!("(+{} queued)", self.pending_jobs.len()));
+                }
                 return;
             }
             let Some(inv) = &self.inv else {
@@ -659,8 +678,9 @@ impl App {
                 .values()
                 .filter(|m| !m.locations.iter().any(|l| inv.live_accessible(l)))
                 .count();
+            let (backed, cov_total) = manifest::backup_coverage(inv);
             let mut line = format!(
-                "{} contents, {} unique — generated {}",
+                "{} contents, {} unique — {backed}/{cov_total} backed up to a drive — generated {}",
                 inv.models.len(),
                 human_size(total),
                 ago(inv.generated_unix)
@@ -720,6 +740,9 @@ impl App {
                 InvCol::Quant => quant_of(a.1).cmp(&quant_of(b.1)),
                 InvCol::Size => a.1.size.cmp(&b.1.size),
                 InvCol::Where => where_of(a.1).cmp(&where_of(b.1)),
+                InvCol::Backup => {
+                    manifest::is_backed_up(a.1).cmp(&manifest::is_backed_up(b.1))
+                }
                 InvCol::State => a.2.cmp(&b.2),
             };
             let ord = if sort_asc { ord } else { ord.reverse() };
@@ -868,6 +891,7 @@ impl App {
                     header(ui, "Quant", InvCol::Quant);
                     header(ui, "Size", InvCol::Size);
                     header(ui, "Where", InvCol::Where);
+                    header(ui, "Backup", InvCol::Backup);
                     header(ui, "State", InvCol::State);
                     ui.strong("");
                     ui.end_row();
@@ -934,6 +958,14 @@ impl App {
                         ui.label(text(quant_of(entry)));
                         ui.label(text(human_size(entry.size)));
                         ui.label(text(where_of(entry)));
+                        if manifest::is_backed_up(entry) {
+                            ui.label("✓").on_hover_text("Has a copy on a registered drive");
+                        } else {
+                            ui.weak("—").on_hover_text(
+                                "No copy on any registered drive — this model would not \
+                                 survive this machine's disk failing",
+                            );
+                        }
                         if offline_only {
                             ui.weak("OFFLINE");
                         } else {
@@ -2508,3 +2540,40 @@ fn human_size(bytes: u64) -> String {
     modelwarden::core::format::human_size(bytes)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_second_job_queues_and_runs_after_the_first_finishes() {
+        // Regression for "busy with downloading — ignored: moving to
+        // trash": a request during a running job must queue, not vanish.
+        let mut app = App::new();
+        app.spawn("first", |tx| {
+            let _ = tx.send(Msg::Finished("one done".into()));
+        });
+        assert!(app.busy.is_some());
+        app.spawn("second", |tx| {
+            let _ = tx.send(Msg::Finished("two done".into()));
+        });
+        assert_eq!(app.pending_jobs.len(), 1, "second must queue, not be ignored");
+        assert!(
+            app.activity.iter().any(|l| l.contains("queued")),
+            "the user is told it queued: {:?}",
+            app.activity
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            app.drain_messages();
+            if app.busy.is_none()
+                && app.pending_jobs.is_empty()
+                && app.activity.iter().any(|l| l.contains("two done"))
+            {
+                return; // both ran, in order, nothing lost
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        panic!("queued job never ran: {:?}", app.activity);
+    }
+}

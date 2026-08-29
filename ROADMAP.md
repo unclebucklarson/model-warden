@@ -313,6 +313,30 @@ scrub timer is enabled on the dev machine. What remains:
 Release routine: bump Cargo.toml version → commit → `git tag vX.Y.Z &&
 git push origin vX.Y.Z` (GH release builds itself) → `cargo publish`.
 
+## M17 — usability & performance backlog (2026-08-29 assessment, user-approved)
+
+Built test-first (see CLAUDE.md methodology). Priority order:
+
+1. **Backup-coverage visibility in the GUI** — the status bar states the
+   CLI's core safety sentence ("N of M contents have a copy on a
+   registered drive") and Inventory rows show a backed-up indicator.
+   Small; the classifier lives in core, shared with `warden status`.
+2. **GUI job queue** — a write request during a running job queues with a
+   visible "next: …" instead of "busy — ignored" (user hit this during a
+   20 GiB download).
+3. **Parallel + checkpointed hashing** — hash N files concurrently
+   (first-run wall time 2–4× better on NVMe) and persist manifests
+   periodically so an interrupted first hash resumes instead of
+   restarting. First-impression-critical for incoming testers.
+4. **Persistent operations journal** — append-only log under the state
+   dir of every write operation (what moved/trashed/destroyed, when);
+   the activity log currently dies with the session.
+5. **Settings dialog** — shelf/scan_dirs editable in the GUI (last
+   remaining hand-edit of config.json).
+6. **Verification-freshness advisory** — doctor warns when a backup
+   root's oldest `verified_unix` ages past a threshold ("Archive 2 last
+   verified 94 days ago") — offline drives silently age out of trust.
+
 ## Smaller items (fold in opportunistically)
 
 - (none — the activity-log mirror landed as M13.1)

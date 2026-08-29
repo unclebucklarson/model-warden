@@ -21,6 +21,25 @@ update it when milestones land.
 - Config: `~/.config/modelwarden/config.json` (records only what the user changed).
 - State (manifests, merged inventory): `~/.local/state/modelwarden/`.
 
+## Development methodology: test-first
+
+As of 2026-08-29 (user decision), warden is built **test-first**:
+
+- **Write the failing test before the implementation** — unit tests for
+  core logic, integration/E2E tests (isolated env: XDG overrides +
+  `discover_stores:false`, fresh dirs each run) for behavior that spans
+  modules or binaries. Red → green → refactor.
+- **Design for testability**: decisions live in `src/core/` where they
+  can be unit-tested; the bins render and dispatch. If GUI/CLI logic is
+  hard to test, that's the signal to move the decision into core (this
+  is how log_line, bundle_union, companion_parents, deletable_set came
+  to exist — the pattern is proven here).
+- **A bug fix starts with a regression test** that reproduces it and
+  fails on the old code (see the dedup-symlink and split-delete
+  inversion fixes for the standard).
+- Tests assert *behavior and invariants* (bytes never lost, bundles move
+  whole, refuse-overwrite), not implementation details.
+
 ## Architecture (big picture)
 
 Single crate, strict core/ui split: `src/core/` is GUI-free and testable;

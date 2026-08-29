@@ -270,18 +270,8 @@ fn cmd_status(json: bool) -> ExitCode {
             human_size(reclaimable)
         );
     }
-    let backed_up = inv
-        .models
-        .values()
-        .filter(|m| {
-            m.locations
-                .iter()
-                .any(|l| l.kind == modelwarden::core::roots::RootKind::Removable)
-        })
-        .count();
-    println!(
-        "{backed_up} of {total_models} contents have a copy on a registered drive"
-    );
+    let (backed_up, total) = manifest::backup_coverage(&inv);
+    println!("{backed_up} of {total} contents have a copy on a registered drive");
     ExitCode::SUCCESS
 }
 

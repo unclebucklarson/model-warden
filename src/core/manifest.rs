@@ -267,6 +267,23 @@ pub fn merge(manifests: &[RootManifest]) -> Inventory {
     }
 }
 
+/// Warden's core safety question, per model: is there a copy on a
+/// registered drive? Offline drives count — the bytes exist on that
+/// drive whether or not it is plugged in right now. Shared by
+/// `warden status` and the GUI's coverage display.
+pub fn is_backed_up(entry: &ModelEntry) -> bool {
+    entry
+        .locations
+        .iter()
+        .any(|l| l.kind == RootKind::Removable)
+}
+
+/// The safety headline: (models with a drive copy, total models).
+pub fn backup_coverage(inv: &Inventory) -> (usize, usize) {
+    let backed = inv.models.values().filter(|e| is_backed_up(e)).count();
+    (backed, inv.models.len())
+}
+
 /// The companion relation, once: X is a companion of Y when X rides in
 /// Y's bundle but Y does not ride in X's (mmproj projectors, Ollama
 /// +projector blobs, safetensors tokenizer/config files). Returns
@@ -1028,5 +1045,59 @@ mod tests {
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].sha256, "copied");
         assert_eq!(groups[0].reclaimable, 700);
+    }
+    fn entry_with(kinds: &[(RootKind, bool)]) -> ModelEntry {
+        ModelEntry {
+            size: 1,
+            display_name: "m".into(),
+            meta: None,
+            locations: kinds
+                .iter()
+                .enumerate()
+                .map(|(i, (kind, accessible))| Location {
+                    root_id: format!("r{i}"),
+                    kind: *kind,
+                    rel_path: PathBuf::from("m.gguf"),
+                    accessible: *accessible,
+                    dev: 0,
+                    ino: 0,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn backed_up_means_a_copy_on_a_registered_drive() {
+        // Only shelf/cache copies: one disk failure loses it.
+        assert!(!is_backed_up(&entry_with(&[
+            (RootKind::Shelf, true),
+            (RootKind::HfHub, true)
+        ])));
+        // A drive copy counts — even offline: the bytes exist on that
+        // drive whether or not it is plugged in right now.
+        assert!(is_backed_up(&entry_with(&[
+            (RootKind::Shelf, true),
+            (RootKind::Removable, false)
+        ])));
+        assert!(is_backed_up(&entry_with(&[(RootKind::Removable, true)])));
+    }
+
+    #[test]
+    fn backup_coverage_counts_the_safety_headline() {
+        let mut inv = Inventory {
+            schema_version: SCHEMA_VERSION,
+            generated_unix: 0,
+            roots: Vec::new(),
+            models: BTreeMap::new(),
+        };
+        inv.models.insert(
+            "sha256:aa".into(),
+            entry_with(&[(RootKind::Shelf, true), (RootKind::Removable, true)]),
+        );
+        inv.models
+            .insert("sha256:bb".into(), entry_with(&[(RootKind::Shelf, true)]));
+        inv.models
+            .insert("sha256:cc".into(), entry_with(&[(RootKind::Ollama, true)]));
+        assert_eq!(backup_coverage(&inv), (1, 3));
     }
 }
