@@ -322,7 +322,7 @@ fn cmd_dups(json: bool) -> ExitCode {
         }
     }
     println!(
-        "\n{} duplicated contents, {} reclaimable (dedup lands in M5, owned roots only)",
+        "\n{} duplicated contents, {} reclaimable — see `warden dedup`",
         groups.len(),
         human_size(reclaimable)
     );

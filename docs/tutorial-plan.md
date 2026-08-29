@@ -1,8 +1,10 @@
 # The modelwarden Tutorial — plan
 
-*A curriculum proposal for a comprehensive, educational, hands-on
-tutorial. This document is the plan for review; the tutorial itself gets
-written after the outline is approved.*
+*Status: approved and executed — the tutorial lives at
+[tutorial.md](tutorial.md). Decisions (2026-08-29): copy-paste sandbox,
+single file, chapter 11 kept as optional-online, text-only for now —
+GUI screenshots to be added later with a guided shot list. This plan is
+retained as the curriculum's design record.*
 
 ## Goals and audience
 

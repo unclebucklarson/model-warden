@@ -116,9 +116,11 @@ versioned contract — see [docs/inventory-schema.md](docs/inventory-schema.md).
 Drives carry their own `.modelwarden/manifest.json`, so a backup drive is
 self-describing on any machine.
 
-**New to modelwarden? Start with the [User's Guide](docs/users-guide.md)** —
-a full walkthrough for newcomers: the concepts, both programs, every
-command, and the everyday recipes.
+**New to modelwarden?** Two doors: **[the Tutorial](docs/tutorial.md)**
+teaches everything hands-on in a 90-minute sandbox course (your real
+models untouched — you'll even cause and repair bit rot yourself), and
+the **[User's Guide](docs/users-guide.md)** is the full reference: every
+concept, both programs, every command, recipes, and FAQ.
 
 ## Setting up
 
