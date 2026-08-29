@@ -68,6 +68,8 @@ warden roots forget <id|label|path> --yes
                          un-register a drive that is truly gone (died,
                          reformatted) after an impact preview; removes
                          knowledge only, touches no bytes
+warden journal [N|--all]   the operations journal: every write-op line,
+                         persisted across sessions (plain text on disk)
 warden dedup [--hardlink]  collapse same-fs duplicates (dry run by default)
 warden report            disk usage by model family
 warden fetch <org/repo> [pattern] [--token T]

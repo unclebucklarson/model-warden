@@ -234,3 +234,24 @@ fn dedup_reclaims_only_with_hardlink_flag_and_verifies() {
     let m2 = std::fs::metadata(e.shelf().join("two/copy.gguf")).unwrap();
     assert_eq!(m1.ino(), m2.ino(), "same bytes now share one inode");
 }
+
+#[test]
+fn the_operations_journal_persists_across_sessions() {
+    let e = Env::new();
+    e.gguf("doomed.gguf", b"d");
+    e.ok(&["hash"]);
+    e.ok(&["delete", "doomed"]);
+    e.ok(&["trash", "empty", "--yes"]);
+    // Three separate processes ran; the journal remembers all of it.
+    let journal = e.ok(&["journal"]);
+    assert!(journal.contains("hashed doomed"), "{journal}");
+    assert!(journal.contains("trashed doomed"), "{journal}");
+    assert!(journal.contains("destroyed 1 files"), "{journal}");
+    // Human-rescuable: plain text with readable timestamps.
+    let raw = std::fs::read_to_string(
+        e.root.path().join("state/modelwarden/journal.log"),
+    )
+    .unwrap();
+    assert!(raw.lines().count() >= 3, "{raw}");
+    assert!(raw.lines().all(|l| l.starts_with("20")), "dated lines: {raw}");
+}

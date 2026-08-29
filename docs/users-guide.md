@@ -499,6 +499,13 @@ hash prefix matters when two different models share a name.
 - **`warden trash empty --yes`** — stage 2: permanently destroy the
   trash's contents. Without `--yes` it only reports what would be
   destroyed. This is warden's one irreversible command.
+- **`warden journal [N|--all]`** — the operations journal: every durable
+  write-operation line (copied, demoted, trashed, destroyed, fetched,
+  forgot…) is appended to `~/.local/state/modelwarden/journal.log` as it
+  happens, from both the CLI and the GUI. "What did I do last Tuesday?"
+  now has an answer after the session that did it is gone. Plain text
+  with readable timestamps — `cat` works without warden; the file is
+  yours to rotate or delete.
 - **`warden version`** / **`warden help`** — what they say.
 
 ---

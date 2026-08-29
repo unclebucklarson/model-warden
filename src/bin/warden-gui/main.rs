@@ -547,7 +547,12 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Progress(line) => self.progress = Some(line),
-                Msg::Activity(line) => self.activity.push(line),
+                Msg::Activity(line) => {
+                    // The activity panel, persisted: every durable line is
+                    // also an operations-journal entry.
+                    modelwarden::core::journal::record(&settings::state_dir(), &line);
+                    self.activity.push(line);
+                }
                 Msg::RemoteFiles(files) => {
                     self.fetch_models = modelwarden::core::acquire::group_listing(&files);
                     self.fetch_files = Some(files);
@@ -564,12 +569,17 @@ impl App {
                     self.pane = Pane::Health;
                 }
                 Msg::Finished(line) => {
+                    if !line.is_empty() {
+                        modelwarden::core::journal::record(&settings::state_dir(), &line);
+                    }
                     self.activity.push(line);
                     self.busy = None;
                     self.progress = None;
                 }
                 Msg::Error(line) => {
-                    self.activity.push(format!("error: {line}"));
+                    let line = format!("error: {line}");
+                    modelwarden::core::journal::record(&settings::state_dir(), &line);
+                    self.activity.push(line);
                     self.busy = None;
                     self.progress = None;
                 }

@@ -74,6 +74,9 @@ Commands (landing per ROADMAP.md milestone):
                                    parts, projector) like delete took it
   trash empty --yes                stage 2: permanently destroy the trash —
                                    warden's only irreversible act
+  journal [N|--all]                the operations journal: every durable
+                                   write-op line, persisted across
+                                   sessions (default: last 50)
 ";
 
 fn main() -> ExitCode {
@@ -106,6 +109,7 @@ fn main() -> ExitCode {
         Some("fetch") => cmd_fetch(&args, json),
         Some("delete") => cmd_delete(&args),
         Some("trash") => cmd_trash(&args, json),
+        Some("journal") => cmd_journal(&args, json),
         Some(cmd) => {
             eprintln!("warden: `{cmd}` is not implemented yet — see ROADMAP.md");
             ExitCode::from(2)
@@ -197,6 +201,7 @@ fn cmd_hash(json: bool) -> ExitCode {
                 if matches!(ev, manifest::RefreshEvent::HashDone { .. }) {
                     hashed_count += 1;
                 }
+                jot(&line);
                 // Clear any transient progress residue before the line.
                 eprintln!("\r  {line}                              ");
             }
@@ -473,12 +478,14 @@ fn cmd_roots(args: &[String], json: bool) -> ExitCode {
                         return ExitCode::FAILURE;
                     }
                     manifest::remove_manifest(&state, &root.id);
-                    println!(
-                        "forgot {} ({}){}",
+                    let l = format!(
+                        "forgot root {} ({}){}",
                         root.id,
                         root.path.display(),
                         root.label.map(|l| format!(" \"{l}\"")).unwrap_or_default()
                     );
+                    jot(&l);
+                    println!("{l}");
                     rerun_hash_quietly();
                     ExitCode::SUCCESS
                 }
@@ -697,12 +704,16 @@ fn cmd_archive(args: &[String]) -> ExitCode {
                 print_backup_event(&ev)
             }) {
                 Ok(out) => {
-                    println!("demoted {} to {}", e.display_name, out.dest.display());
+                    let l = format!("demoted {} to {}", e.display_name, out.dest.display());
+                    jot(&l);
+                    println!("{l}");
                     if let Some(src) = out.removed_source {
-                        println!(
+                        let l = format!(
                             "removed shelf copy {} (verified on cold storage first)",
                             src.display()
                         );
+                        jot(&l);
+                        println!("{l}");
                     }
                 }
                 Err(err) => {
@@ -784,9 +795,13 @@ fn cmd_dedup(args: &[String], json: bool) -> ExitCode {
     let result = modelwarden::core::dedup::reclaim(&inv, !hardlink, |ev| {
         use modelwarden::core::dedup::ReclaimEvent;
         // Shared wording (log_line); groups flush-left, members indented.
+        let line = ev.log_line();
+        if !matches!(ev, ReclaimEvent::Group { .. }) {
+            jot(&line);
+        }
         match &ev {
-            ReclaimEvent::Group { .. } => eprintln!("{}", ev.log_line()),
-            _ => eprintln!("  {}", ev.log_line()),
+            ReclaimEvent::Group { .. } => eprintln!("{line}"),
+            _ => eprintln!("  {line}"),
         }
     });
     match result {
@@ -860,7 +875,11 @@ fn cmd_restore(args: &[String]) -> ExitCode {
         match modelwarden::core::archive::restore(&inv, &k, e, &shelf_root, &mut |ev| {
             print_backup_event(&ev)
         }) {
-            Ok(dest) => println!("restored {} to {}", e.display_name, dest.display()),
+            Ok(dest) => {
+                let l = format!("restored {} to {}", e.display_name, dest.display());
+                jot(&l);
+                println!("{l}");
+            }
             Err(err) => {
                 eprintln!("warden: {}: {err:#}", e.display_name);
                 failed = true;
@@ -1087,12 +1106,14 @@ fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode
                         if let Err(e) = acquire::record_provenance(&state, &hash, &prov) {
                             eprintln!("warden: recording provenance: {e:#}");
                         }
-                        println!(
+                        let l = format!(
                             "fetched {} ({} rev {})",
                             dest.display(),
                             &hash[..12],
                             prov.revision.as_deref().unwrap_or("unknown")
                         );
+                        jot(&l);
+                        println!("{l}");
                     }
                     Err(e) => eprintln!("warden: hashing download: {e:#}"),
                 }
@@ -1146,7 +1167,9 @@ fn cmd_delete(args: &[String]) -> ExitCode {
     match trash::move_to_trash(&inv, &del) {
         Ok(report) => {
             for (name, path) in &report.trashed {
-                println!("trashed {name} → {}", path.display());
+                let l = format!("trashed {name} → {}", path.display());
+                jot(&l);
+                println!("{l}");
             }
             for (name, root) in &report.offline {
                 println!("left {name} on offline root {root} — rerun `warden delete` when it's plugged in");
@@ -1251,7 +1274,11 @@ fn cmd_trash(args: &[String], json: bool) -> ExitCode {
             for (root_id, rel) in &expanded {
                 let Some(root) = roots.iter().find(|r| r.id == *root_id) else { continue };
                 match trash::restore(root, rel) {
-                    Ok(dst) => println!("restored {}", dst.display()),
+                    Ok(dst) => {
+                        let l = format!("restored {}", dst.display());
+                        jot(&l);
+                        println!("{l}");
+                    }
                     Err(e) => {
                         eprintln!("warden: {e:#}");
                         failed = true;
@@ -1293,7 +1320,9 @@ fn cmd_trash(args: &[String], json: bool) -> ExitCode {
                     Err(e) => eprintln!("warden: {}: {e:#}", root.id),
                 }
             }
-            println!("destroyed {count} files, {} reclaimed", human_size(bytes));
+            let l = format!("destroyed {count} files, {} reclaimed", human_size(bytes));
+            jot(&l);
+            println!("{l}");
             ExitCode::SUCCESS
         }
         _ => {
@@ -1352,10 +1381,16 @@ fn print_backup_event(ev: &backup::BackupEvent) {
         }
         backup::BackupEvent::FileProgress { .. } => {}
         // Completes the inline prefix; same vocabulary as log_line.
-        backup::BackupEvent::FileDone { secs, .. } => eprintln!("verified in {secs:.0}s"),
+        backup::BackupEvent::FileDone { secs, .. } => {
+            if let Some(line) = ev.log_line() {
+                jot(&line);
+            }
+            eprintln!("verified in {secs:.0}s");
+        }
         // Standalone lines share log_line's wording exactly.
         ev => {
             if let Some(line) = ev.log_line() {
+                jot(&line);
                 eprintln!("  {line}");
             }
         }
@@ -1667,6 +1702,37 @@ fn cmd_scrub(args: &[String]) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn cmd_journal(args: &[String], json: bool) -> ExitCode {
+    use modelwarden::core::journal;
+    let limit = if args.iter().any(|a| a == "--all") {
+        None
+    } else {
+        Some(
+            args.get(1)
+                .and_then(|a| a.parse::<usize>().ok())
+                .unwrap_or(50),
+        )
+    };
+    let entries = journal::tail(&settings::state_dir(), limit);
+    if json {
+        return print_json(&entries);
+    }
+    if entries.is_empty() {
+        println!("journal is empty — write operations record here as they happen");
+        return ExitCode::SUCCESS;
+    }
+    for (ts, line) in &entries {
+        println!("{ts}  {line}");
+    }
+    ExitCode::SUCCESS
+}
+
+/// Journal a durable operation line — the CLI's half of "the activity
+/// log, persisted". Best-effort: never fails the operation it records.
+fn jot(line: &str) {
+    modelwarden::core::journal::record(&settings::state_dir(), line);
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> ExitCode {

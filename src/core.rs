@@ -11,6 +11,7 @@ pub mod doctor;
 pub mod format;
 pub mod gguf;
 pub mod identity;
+pub mod journal;
 pub mod lock;
 pub mod manifest;
 pub mod roots;

@@ -336,9 +336,12 @@ Built test-first (see CLAUDE.md methodology). Priority order:
    hash resumes via fingerprint carry. Measured: 2 GiB in 0.28 s at
    397% CPU (was single-core ~700 MB/s). CLI hash output switched to
    interleave-safe standalone lines.
-4. **Persistent operations journal** — append-only log under the state
-   dir of every write operation (what moved/trashed/destroyed, when);
-   the activity log currently dies with the session.
+4. ~~**Persistent operations journal**~~ **DONE 2026-08-29**
+   (test-first): core `journal` module (append-only
+   `<state>/journal.log`, plain text + readable UTC timestamps — cat
+   works without warden); the GUI journals its whole durable activity
+   stream via one hook, the CLI jots every result line; `warden journal
+   [N|--all]` reads it back; E2E proves persistence across processes.
 5. **Settings dialog** — shelf/scan_dirs editable in the GUI (last
    remaining hand-edit of config.json).
 6. **Verification-freshness advisory** — doctor warns when a backup
