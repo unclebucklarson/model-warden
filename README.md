@@ -20,6 +20,8 @@ cache, shelf directories, NAS mounts, and removable drives — can always
 answer: *what do I have, where is it, is it reachable, is it backed up, and
 which of these are the same bytes?* And nothing warden does can lose bytes.
 
+![The Inventory: models grouped with their parts and companions, backup coverage at a glance](docs/img/inventory.png)
+
 Identity is content: SHA-256, never path. A cheap `(size, mtime, dev, ino)`
 fingerprint detects change; hashes are computed lazily by a background
 worker (~680 MB/s measured; ~8 min for 300 GiB, then near-instant reruns).

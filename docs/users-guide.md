@@ -292,6 +292,8 @@ Launch `warden-gui`. The window has a menu bar, four tabs, an activity log
 
 ### 4.1 The Inventory tab 📦
 
+![Inventory tab](img/inventory.png)
+
 One row per model in the catalog, across *all* roots: name, quantization,
 size, and where it lives. Click a **column heading** to sort by it (click
 again to reverse), and use the **filter box** to narrow the list by name,
@@ -323,10 +325,16 @@ Row actions — behind each row's **⋯** menu:
   filter helps), pick the target, and one confirmation moves them all —
   required files included, shared companions moved once. (CLI:
   `warden archive demote`.)
+
+  ![Move to Cold Storage: checkboxes, target drive, remove-after-verify](img/cold-dialog.png)
+
 - **Back up…** — back up this model (and everything it needs — its whole
   bundle) to a drive.
 - **Delete…** — move the model's bundle to the trash (see the Trash tab
-  below). The confirmation shows exactly what will move, what is kept
+  below).
+
+  ![The Move to Trash confirmation: bundle size, foreign-store command, offline copies — all before anything moves](img/delete-confirm.png)
+ The confirmation shows exactly what will move, what is kept
   because another model needs it, and — for copies in Ollama or the HF
   cache — the owning tool's command for you to run yourself (warden never
   touches foreign stores). Nothing is destroyed by this action.
@@ -347,6 +355,8 @@ how much is unique bytes vs. duplicate copies. This is the "what's actually
 eating my disk?" view.
 
 ### 4.4 The Health tab 🩺
+
+![Health tab — the goal state](img/health.png)
 
 The GUI face of the doctor. Run **Tools → Check store health**, and each
 finding appears as a row: what kind of problem, where, how big, and the
@@ -381,7 +391,10 @@ destruction never happens on a schedule.
   (type a path or **Browse…**; optionally give the drive a label like
   "Archive 2"). Register a drive once; it's recognized forever after.
 - **Tools → Back up…** — back up everything (or a filtered selection) to a
-  target folder or drive. Type or **Browse…** to the destination, filter
+  target folder or drive.
+
+  ![The Back Up dialog names every model the copy will contain](img/backup-dialog.png)
+ Type or **Browse…** to the destination, filter
   the model list, and watch the live bundle/size preview update before you
   commit.
 - **Tools → Download from HuggingFace…** — see 6.5. Lists a repo's downloadable
@@ -393,7 +406,11 @@ destruction never happens on a schedule.
   so hunting the same quant through several repos is one keystroke per
   repo. Has a masked token field for gated repos with a "Remember"
   option.
-- **Help → About** — version and license.
+- **Help → About** — version, build id (with a Copy button for bug
+  reports), links, and license.
+
+  ![About dialog](img/about.png)
+
 
 The **activity log** at the bottom keeps a durable line for everything that
 happened this session — the same wording the CLI prints — while the status

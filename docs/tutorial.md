@@ -158,6 +158,11 @@ wt hash
 Exactly one file re-hashes. The fingerprint is only ever a *change
 detector* — identity is always the hash.
 
+*In the GUI, all of this is the Inventory tab — the same catalog, with
+models grouped with their parts and companions:*
+
+![The Inventory tab](img/inventory.png)
+
 What hashing produced: a **manifest** per store (what's in this root)
 and the merged **inventory** — one entry per distinct content, listing
 every place its bytes live. `wt status` is its summary; its last line —
@@ -472,6 +477,11 @@ another surviving model needed that projector, it would have been
 auto-kept and the output would say so. Foreign-store copies are never
 touched; warden prints the owner's command for you instead.
 
+*In the GUI, Delete… previews all of this before anything moves — the
+bundle, spared companions, foreign-store commands, offline copies:*
+
+![The Move to Trash confirmation](img/delete-confirm.png)
+
 ```sh
 wt trash                       # what's inside, sizes, ages
 wt trash restore pixel         # the whole bundle comes back
@@ -563,6 +573,11 @@ and a 401 error means *either* "gated" or "no such repo id" (HF hides
 which; warden suggests close matches for likely typos). In the GUI,
 **Tools → Download from HuggingFace…** adds a filter box for 40-quant
 repos and shows split models as one row with their true combined size.
+
+*The GUI's download dialog shows a split model as one row with its true
+combined size:*
+
+![Download from HuggingFace](img/fetch-dialog.png)
 
 ✅ **Checkpoint:** `where bert` shows an `origin:` line naming repo and
 revision.
