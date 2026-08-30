@@ -978,7 +978,7 @@ impl App {
                 .show(ui, |ui| {
                     let mut header = |ui: &mut egui::Ui, label: &str, col: InvCol| {
                         let marker = if sort_col == col {
-                            if sort_asc { " ▲" } else { " ▼" }
+                            if sort_asc { " ⬆" } else { " ⬇" }
                         } else {
                             ""
                         };
