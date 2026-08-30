@@ -1,6 +1,6 @@
 [package]
 name = "modelwarden"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.88"
 description = "Inventory, backup, and archival for local LLM model files — GGUFs and safetensors directories across Ollama, HF cache, shelves, and removable drives"
