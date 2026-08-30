@@ -301,6 +301,45 @@ pub fn companion_parents(inv: &Inventory) -> BTreeMap<String, Vec<String>> {
     out
 }
 
+/// Display grouping for split models: maps every non-first part to its
+/// part-1 sibling, so views can show ONE model row ("(N parts)",
+/// combined size) instead of peer rows with misleading per-part sizes.
+/// Split parts are symmetric bundle members — neither *requires* the
+/// other — so this is presentation truth, distinct from the asymmetric
+/// companion relation.
+pub fn split_primary_of(inv: &Inventory) -> BTreeMap<String, String> {
+    let filename_of = |key: &str| -> Option<String> {
+        inv.models
+            .get(key)?
+            .locations
+            .first()
+            .and_then(|l| l.rel_path.file_name())
+            .map(|f| f.to_string_lossy().into_owned())
+    };
+    let mut out = BTreeMap::new();
+    for k in inv.models.keys() {
+        let Some(name) = filename_of(k) else { continue };
+        let Some((_, idx, _)) = crate::core::acquire::split_parts(&name) else {
+            continue;
+        };
+        if idx == 1 {
+            continue;
+        }
+        for m in bundle_for(inv, k) {
+            if m == *k {
+                continue;
+            }
+            if let Some(f2) = filename_of(&m)
+                && crate::core::acquire::split_parts(&f2).is_some_and(|(_, i2, _)| i2 == 1)
+            {
+                out.insert(k.clone(), m);
+                break;
+            }
+        }
+    }
+    out
+}
+
 /// A selection expands to the union of its bundles, shared companions
 /// once — the contract every multi-model operation (backup, demote,
 /// delete) applies before moving anything.
@@ -1218,5 +1257,42 @@ mod tests {
         assert!(checkpoint_seen);
         assert_eq!(inv.models.len(), 5);
         assert!(inv.models.keys().all(|k| k.starts_with("sha256:")));
+    }
+    #[test]
+    fn split_parts_group_under_part_one_for_display() {
+        use crate::core::gguf::tests::synthetic_gguf;
+        let shelf = tempfile::tempdir().unwrap();
+        let base = synthetic_gguf("llama", 8192, 15);
+        let mut p2 = base.clone();
+        p2.extend_from_slice(b"2");
+        let mut proj = base.clone();
+        proj.extend_from_slice(b"p");
+        let mut other = base.clone();
+        other.extend_from_slice(b"o");
+        std::fs::write(shelf.path().join("big-00001-of-00002.gguf"), &base).unwrap();
+        std::fs::write(shelf.path().join("big-00002-of-00002.gguf"), &p2).unwrap();
+        std::fs::write(shelf.path().join("mmproj-F16.gguf"), &proj).unwrap();
+        std::fs::write(shelf.path().join("other-Q4.gguf"), &other).unwrap();
+        let spec = RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        };
+        let inv = merge(&[build_root_manifest(&spec, None)]);
+        let key_of = |frag: &str| {
+            inv.models
+                .iter()
+                .find(|(_, e)| e.display_name.contains(frag))
+                .map(|(k, _)| k.clone())
+                .unwrap()
+        };
+        let map = split_primary_of(&inv);
+        // Part 2 groups under part 1 — one model, one display row.
+        assert_eq!(map.get(&key_of("big-00002-of")), Some(&key_of("big-00001-of")), "{map:?}");
+        // Part 1 is the primary, never a child; non-splits stay out.
+        assert!(!map.contains_key(&key_of("big-00001-of")));
+        assert!(!map.contains_key(&key_of("mmproj")));
+        assert!(!map.contains_key(&key_of("other")));
     }
 }

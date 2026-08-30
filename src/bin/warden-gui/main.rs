@@ -807,11 +807,39 @@ impl App {
                 (k, e, live)
             })
             .collect();
+        // The "required by" relation comes from core — the single source
+        // of truth shared with the cold-storage dialog and delete.
+        let parents_of = manifest::companion_parents(inv);
+        // Split models display as ONE row: parts 2..N group under part 1
+        // with a combined size and "(N parts)" — per-part rows showed a
+        // 51 GiB model as misleading 46.5 + 4.5 GiB peers.
+        let split_of = manifest::split_primary_of(inv);
+        let mut split_extra: std::collections::BTreeMap<String, (u64, usize, bool)> =
+            std::collections::BTreeMap::new();
+        for (child, parent) in &split_of {
+            let (csz, cbacked) = inv
+                .models
+                .get(child)
+                .map(|e| (e.size, manifest::is_backed_up(e)))
+                .unwrap_or((0, false));
+            let slot = split_extra.entry(parent.clone()).or_insert((0, 1, true));
+            slot.0 += csz;
+            slot.1 += 1;
+            slot.2 &= cbacked;
+        }
+        for (parent, slot) in split_extra.iter_mut() {
+            slot.0 += inv.models.get(parent).map(|e| e.size).unwrap_or(0);
+        }
+        let disp_size = |k: &String, e: &manifest::ModelEntry| {
+            split_extra.get(k).map(|(s, _, _)| *s).unwrap_or(e.size)
+        };
+        let is_child = |k: &String| parents_of.contains_key(k) || split_of.contains_key(k);
+
         rows.sort_by(|a, b| {
             let ord = match sort_col {
                 InvCol::Name => a.1.display_name.to_lowercase().cmp(&b.1.display_name.to_lowercase()),
                 InvCol::Quant => quant_of(a.1).cmp(&quant_of(b.1)),
-                InvCol::Size => a.1.size.cmp(&b.1.size),
+                InvCol::Size => disp_size(a.0, a.1).cmp(&disp_size(b.0, b.1)),
                 InvCol::Where => where_of(a.1).cmp(&where_of(b.1)),
                 InvCol::Backup => {
                     manifest::is_backed_up(a.1).cmp(&manifest::is_backed_up(b.1))
@@ -822,9 +850,6 @@ impl App {
             ord.then_with(|| a.1.display_name.cmp(&b.1.display_name))
         });
 
-        // The "required by" relation comes from core — the single source
-        // of truth shared with the cold-storage dialog and delete.
-        let parents_of = manifest::companion_parents(inv);
 
         // Cold-stored = every copy lives on a registered (cold) root. Those
         // models leave the Active view but never the catalog.
@@ -834,12 +859,13 @@ impl App {
         let cold_count = rows
             .iter()
             .filter(|(k, e, _)| {
-                !parents_of.contains_key(*k)
+                !is_child(k)
                     && is_cold(e)
                     && rows
                         .iter()
                         .filter(|(ck, _, _)| {
                             parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
+                                || split_of.get(*ck) == Some(*k)
                         })
                         .all(|(_, ce, _)| is_cold(ce))
             })
@@ -887,13 +913,14 @@ impl App {
         }
         let mut display: Vec<DispRow> = Vec::new();
         for (k, e, live) in &rows {
-            if parents_of.contains_key(*k) {
+            if is_child(k) {
                 continue; // rendered under its parent below
             }
             let children: Vec<_> = rows
                 .iter()
                 .filter(|(ck, _, _)| {
                     parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
+                        || split_of.get(*ck) == Some(*k)
                 })
                 .collect();
             // Active view: a group leaves only when EVERY member is cold —
@@ -919,15 +946,23 @@ impl App {
             });
             if expanded {
                 for (ck, ce, clive) in children {
-                    let req: Vec<&str> = parents_of[*ck]
-                        .iter()
-                        .filter_map(|p| inv.models.get(p).map(|pe| pe.display_name.as_str()))
-                        .collect();
+                    let note = if split_of.get(*ck).is_some() {
+                        format!(
+                            "part of {}",
+                            e.display_name
+                        )
+                    } else {
+                        let req: Vec<&str> = parents_of[*ck]
+                            .iter()
+                            .filter_map(|p| inv.models.get(p).map(|pe| pe.display_name.as_str()))
+                            .collect();
+                        format!("required by {}", req.join(", "))
+                    };
                     display.push(DispRow {
                         key: ck,
                         entry: ce,
                         live: *clive,
-                        required_by: Some(format!("required by {}", req.join(", "))),
+                        required_by: Some(note),
                         kids: 0,
                         expanded: false,
                     });
@@ -995,13 +1030,18 @@ impl App {
                                 p.revision.as_deref().map(|r| &r[..12.min(r.len())]).unwrap_or("?")
                             ));
                         }
+                        let shown_name = match split_extra.get(key) {
+                            Some((_, parts, _)) => {
+                                format!("{} ({parts} parts)", entry.display_name)
+                            }
+                            None => entry.display_name.clone(),
+                        };
                         match &required_by {
                             Some(note) => {
-                                ui.vertical(|ui| {
-                                    ui.label(text(format!("    ↳ {}", entry.display_name)))
-                                        .on_hover_text(format!("{note}\n{}", hover.join("\n")));
-                                    ui.weak(format!("       {note}"));
-                                });
+                                // One line, so the row's other cells stay
+                                // aligned with the name.
+                                ui.label(text(format!("    ↳ {} — {note}", entry.display_name)))
+                                    .on_hover_text(format!("{note}\n{}", hover.join("\n")));
                             }
                             None if kids > 0 => {
                                 ui.horizontal(|ui| {
@@ -1016,7 +1056,7 @@ impl App {
                                     {
                                         toggled = Some(key.clone());
                                     }
-                                    ui.label(text(entry.display_name.clone()))
+                                    ui.label(text(shown_name.clone()))
                                         .on_hover_text(hover.join("\n"));
                                     if !expanded {
                                         ui.weak(format!("+{kids}"));
@@ -1024,14 +1064,16 @@ impl App {
                                 });
                             }
                             None => {
-                                ui.label(text(entry.display_name.clone()))
+                                ui.label(text(shown_name.clone()))
                                     .on_hover_text(hover.join("\n"));
                             }
                         }
                         ui.label(text(quant_of(entry)));
-                        ui.label(text(human_size(entry.size)));
+                        ui.label(text(human_size(disp_size(key, entry))));
                         ui.label(text(where_of(entry)));
-                        if manifest::is_backed_up(entry) {
+                        let row_backed = manifest::is_backed_up(entry)
+                            && split_extra.get(key).map(|(_, _, b)| *b).unwrap_or(true);
+                        if row_backed {
                             ui.label("✓").on_hover_text("Has a copy on a registered drive");
                         } else {
                             ui.weak("—").on_hover_text(
@@ -1386,6 +1428,7 @@ impl App {
             self.cold_target = targets.first().map(|(id, _)| id.clone()).unwrap_or_default();
         }
         let companions = companion_keys(&inv);
+        let split_children = manifest::split_primary_of(&inv);
         // Selectable: primary models with a live shelf copy to move.
         let eligible: Vec<(&String, &manifest::ModelEntry)> = inv
             .models
@@ -1393,6 +1436,7 @@ impl App {
             .filter(|(k, e)| {
                 k.starts_with("sha256:")
                     && !companions.contains(*k)
+                    && !split_children.contains_key(*k)
                     && e.locations
                         .iter()
                         .any(|l| l.kind == RootKind::Shelf && inv.live_accessible(l))
