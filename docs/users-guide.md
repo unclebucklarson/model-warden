@@ -307,18 +307,20 @@ models on an unplugged drive appear greyed with the drive's label —
 offline, not gone. Hover a row for details, including **provenance** if
 warden downloaded it (which repo, revision, and when).
 
-Row actions:
+Row actions — behind each row's **⋯** menu:
 
-- **Archive** — copy a cache-owned model (e.g. one Ollama pulled) to your
-  shelf, so no cache pruner can take it from you. Uses a hardlink when both
-  are on the same filesystem, costing zero extra bytes.
-- **Demote…** — move a model to cold storage (a registered root — a drive,
-  NAS mount, or any folder you registered). A dialog asks which target,
-  and whether to remove the shelf copy afterwards — the removal happens
-  only after the target's copy hash-verifies (see 2.5). For many models at
-  once, use **Tools → Move to Cold Storage…**: check off models (a filter
-  helps), pick the target, and one confirmation moves them all — required
-  files included, shared companions moved once.
+- **Keep on shelf** — copy a cache-owned model (e.g. one Ollama pulled)
+  to your shelf, so no cache pruner can take it from you. Uses a
+  hardlink when both are on the same filesystem, costing zero extra
+  bytes. (The CLI verb for this is `warden archive`.)
+- **Cold storage…** — move a model to a registered root (a drive, NAS
+  mount, or any folder you registered). A dialog asks which target, and
+  whether to remove the shelf copy afterwards — the removal happens only
+  after the target's copy hash-verifies (see 2.5). For many models at
+  once, use **Tools → Move to Cold Storage…**: check off models (a
+  filter helps), pick the target, and one confirmation moves them all —
+  required files included, shared companions moved once. (CLI:
+  `warden archive demote`.)
 - **Back up…** — back up this model (and everything it needs — its whole
   bundle) to a drive.
 - **Delete…** — move the model's bundle to the trash (see the Trash tab

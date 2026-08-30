@@ -255,3 +255,22 @@ fn the_operations_journal_persists_across_sessions() {
     assert!(raw.lines().count() >= 3, "{raw}");
     assert!(raw.lines().all(|l| l.starts_with("20")), "dated lines: {raw}");
 }
+
+#[test]
+fn help_is_grouped_and_release_framed() {
+    let e = Env::new();
+    let help = e.ok(&["help"]);
+    // Development-era framing must not ship to end users.
+    assert!(!help.contains("ROADMAP"), "stale dev framing: {help}");
+    assert!(!help.contains("landing per"), "{help}");
+    // Twenty-plus commands need a map: the guide's own section headers.
+    for h in [
+        "Seeing what you have",
+        "Protecting it",
+        "Organizing it",
+        "Health",
+        "history",
+    ] {
+        assert!(help.contains(h), "missing section {h:?}:\n{help}");
+    }
+}

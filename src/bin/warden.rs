@@ -8,75 +8,64 @@ use std::process::ExitCode;
 const USAGE: &str = "\
 modelwarden — inventory, backup, and archival for local model files
 
-Usage: warden <command>
+Usage: warden <command>    (every read command also takes --json)
 
-Commands (landing per ROADMAP.md milestone):
-  scan [--json]     list every model across every store (live view, no writes)
-  hash [--json]     update manifests; compute missing SHA-256 identities
-  status [--json]   manifest + identity summary
-  dups [--json]     hash-identical duplicates and reclaimable bytes
-  doctor [--fix] [--json]
-                    store health: dangling refs, orphans, interrupted
-                    downloads — each finding explained, with a remedy.
-                    --fix executes owner-tool remedies (hf cache rm,
-                    ollama rm) and removes *.incomplete debris; manual
-                    remedies are printed for you
-  roots list [--json]              all roots incl. offline drives
-  roots add <path> [--label X]     register a drive/NAS mount by fs UUID
-  roots forget <id|label|path> [--yes]
-                                   un-register a root that is truly gone
-                                   (died, reformatted); removes knowledge
-                                   only — no bytes touched. Models known
-                                   nowhere else leave the catalog
-  where <query> [--json]           locate a model across roots, incl. offline
+Seeing what you have:
+  scan                             live view of every store (no writes)
+  hash                             update the catalog: rescan, hash new/changed
+  status                           roots, identity coverage, backup headline
+  dups                             hash-identical duplicates + reclaimable bytes
+  where <query>                    locate by name, path, or sha256 prefix —
+                                   including offline drives
+  report                           disk usage grouped by model family
+
+Protecting it:
   backup <path> [query…] [--label X]
                                    verified copy to a target (registered as a
                                    root). No query = everything; queries pick
                                    models, each expanded to its full bundle
-                                   (split parts, vision projectors)
   verify <path|root-id|label> [--repair]
-  verify --all [--repair]          re-hash roots against their manifests;
-                                   --all covers every online owned root,
-                                   --repair re-copies mismatched/missing
-                                   files from a live source elsewhere
+  verify --all [--repair]          re-read roots against the catalog (bit-rot
+                                   check); --repair re-copies bad files from a
+                                   live source, replacing them atomically
   scrub install [--daily|--weekly|--monthly] [--enable]
-                                   write a systemd user timer that runs
-                                   `hash && verify --all` on a schedule;
-                                   --enable also starts it
-  archive <query>                  promote a cache-owned model to the shelf
+                                   systemd user timer running `hash && verify
+                                   --all` on a schedule; --enable starts it
+
+Organizing it:
+  roots add <path> [--label X]     register a drive/NAS mount (durable identity)
+  roots list                       all roots, offline drives included
+  roots forget <id|label|path> [--yes]
+                                   un-register a truly-gone drive after an
+                                   impact preview; knowledge only, no bytes
+  archive <query>                  keep a cache-owned model on the shelf
   archive demote <query…> --to <path|id|label> [--remove-source]
-                                   verified copy to cold storage; the shelf
-                                   copy is deleted only with --remove-source
+                                   cold storage: verified move to a drive; the
+                                   shelf copy goes only with --remove-source
   restore <query>                  verified copy from a drive back to the shelf
   dedup [--hardlink]               collapse same-fs duplicate copies in owned
-                                   roots (default: dry run report)
-  report [--json]                  disk usage grouped by model family
-  fetch <org/repo> [pattern] [--token T [--save-token]]
-                                   list a repo's GGUFs; with a pattern
-                                   matching one file (or one split set),
-                                   download to the shelf: Range-resume,
-                                   split parts fetched together, provenance
-                                   recorded. Token: --token, $HF_TOKEN, or
-                                   the hf CLI's saved login
-  fetch <org/repo> --snapshot      download the repo's whole snapshot —
-                                   for safetensors-style repos, where the
-                                   directory is the model (weights,
-                                   tokenizer, configs, subdirs together)
-  delete <query…>                  stage 1 of deletion: move each model's
-                                   bundle into its root's trash (a rename —
-                                   nothing destroyed, fully restorable).
-                                   Companions another model still needs are
-                                   kept; foreign-store copies get the owner
-                                   command printed, never executed
+                                   roots (default: dry-run report)
+  delete <query…>                  stage 1 of deletion: bundles move to the
+                                   root's trash (restorable, nothing destroyed);
+                                   needed companions kept, foreign copies get
+                                   the owner command printed, never run
   trash [list]                     what the trash holds, where, how old
-  trash restore <query>            bring matching models back — each match
-                                   expands to its trash bundle (split
-                                   parts, projector) like delete took it
-  trash empty --yes                stage 2: permanently destroy the trash —
-                                   warden's only irreversible act
-  journal [N|--all]                the operations journal: every durable
-                                   write-op line, persisted across
-                                   sessions (default: last 50)
+  trash restore <query>            bring models back, whole bundles at a time
+  trash empty --yes                stage 2: destroy the trash — warden's only
+                                   irreversible act
+
+Health, acquisition, and history:
+  doctor [--fix]                   store health, every finding explained with a
+                                   remedy and its cost; --fix runs the safe ones
+  fetch <org/repo> [pattern] [--token T [--save-token]]
+                                   download from HuggingFace: split sets and one
+                                   vision projector travel together, dropped
+                                   connections auto-resume, provenance recorded
+  fetch <org/repo> --snapshot      whole-snapshot download for safetensors-style
+                                   repos — the directory is the model
+  journal [N|--all]                the operations journal: every write-op line,
+                                   persisted across sessions
+  version | help
 ";
 
 fn main() -> ExitCode {

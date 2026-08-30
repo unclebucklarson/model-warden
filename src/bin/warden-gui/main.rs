@@ -133,6 +133,10 @@ struct App {
     /// Write requests made while a job runs wait here instead of being
     /// ignored — one worker at a time, nothing lost.
     pending_jobs: std::collections::VecDeque<(String, Box<dyn FnOnce(&Sender<Msg>) + Send>)>,
+    /// The most recent failure, held as a status-bar banner until the
+    /// user starts the next job (or dismisses it) — errors must not
+    /// scroll away with the activity log.
+    last_error: Option<String>,
     inv_sort_col: InvCol,
     inv_sort_asc: bool,
     inv_filter: String,
@@ -194,6 +198,7 @@ impl App {
             cold_remove: false,
             fix_confirm: None,
             pending_jobs: std::collections::VecDeque::new(),
+            last_error: None,
             inv_sort_col: InvCol::Name,
             inv_sort_asc: true,
             inv_filter: String::new(),
@@ -235,6 +240,7 @@ impl App {
     }
 
     fn start_job(&mut self, label: &str, job: Box<dyn FnOnce(&Sender<Msg>) + Send>) {
+        self.last_error = None; // a new action supersedes the banner
         self.busy = Some(label.to_string());
         self.activity.push(format!("{label}…"));
         let tx = self.tx.clone();
@@ -595,6 +601,7 @@ impl App {
                 Msg::Error(line) => {
                     let line = format!("error: {line}");
                     modelwarden::core::journal::record(&settings::state_dir(), &line);
+                    self.last_error = Some(line.clone());
                     self.activity.push(line);
                     self.busy = None;
                     self.progress = None;
@@ -710,6 +717,19 @@ impl App {
                 }
                 return;
             }
+            if let Some(err) = self.last_error.clone() {
+                if ui
+                    .label(
+                        egui::RichText::new(format!("⚠ {err}"))
+                            .color(egui::Color32::from_rgb(220, 80, 60)),
+                    )
+                    .on_hover_text("Click to dismiss — full detail is in the activity log and journal")
+                    .clicked()
+                {
+                    self.last_error = None;
+                }
+                ui.separator();
+            }
             let Some(inv) = &self.inv else {
                 ui.label("catalog empty — File → Update Catalog");
                 return;
@@ -743,10 +763,21 @@ impl App {
     }
 
     fn inventory_pane(&mut self, ui: &mut egui::Ui) {
-        let Some(inv) = &self.inv else {
-            ui.label("No catalog yet. File → Update Catalog scans every root and hashes new files.");
+        if self.inv.is_none() {
+            ui.label("No catalog yet — warden hasn't looked at your stores.");
+            if ui
+                .button("Build the catalog now")
+                .on_hover_text(
+                    "Scans every store (read-only) and hashes new files — \
+                     minutes on a large collection, then near-instant reruns",
+                )
+                .clicked()
+            {
+                self.spawn_hash();
+            }
             return;
-        };
+        }
+        let Some(inv) = &self.inv else { return };
         let can_demote = inv
             .roots
             .iter()
@@ -1020,15 +1051,22 @@ impl App {
                                 }
                             ));
                         }
-                        ui.horizontal(|ui| {
+                        // One compact menu per row beats four crowded
+                        // buttons — and the labels say what happens, not
+                        // what the CLI verb is called.
+                        ui.menu_button("⋯", |ui| {
                             if modelwarden::core::archive::promotable_location(inv, entry)
                                 .is_some()
                                 && ui
-                                    .small_button("Archive")
-                                    .on_hover_text("Pull onto the shelf (hardlink or verified copy)")
+                                    .button("Keep on shelf")
+                                    .on_hover_text(
+                                        "Copy this cache-owned model onto the shelf so no \
+                                         cache pruner can take it (CLI: warden archive)",
+                                    )
                                     .clicked()
                             {
                                 actions.push(RowAction::Promote(key.clone()));
+                                ui.close();
                             }
                             let on_shelf = entry.locations.iter().any(|l| {
                                 l.kind == RootKind::Shelf && inv.live_accessible(l)
@@ -1037,25 +1075,32 @@ impl App {
                                 && can_demote
                                 && key.starts_with("sha256:")
                                 && ui
-                                    .small_button("Demote…")
-                                    .on_hover_text("Verified move to a cold-storage drive")
+                                    .button("Cold storage…")
+                                    .on_hover_text(
+                                        "Verified move to a registered drive \
+                                         (CLI: warden archive demote)",
+                                    )
                                     .clicked()
                             {
                                 actions.push(RowAction::DemoteDialog(key.clone()));
+                                ui.close();
                             }
                             if key.starts_with("sha256:")
                                 && !offline_only
                                 && ui
-                                    .small_button("Back up…")
-                                    .on_hover_text("Back up this model (and everything it needs) to a drive")
+                                    .button("Back up…")
+                                    .on_hover_text(
+                                        "Back up this model (and everything it needs) to a drive",
+                                    )
                                     .clicked()
                             {
                                 actions.push(RowAction::BackupDialog(key.clone()));
+                                ui.close();
                             }
                             if key.starts_with("sha256:")
                                 && required_by.is_none()
                                 && ui
-                                    .small_button("Delete…")
+                                    .button("Delete…")
                                     .on_hover_text(
                                         "Move this model's bundle to the trash — a rename, \
                                          nothing destroyed; restorable until you empty the trash",
@@ -1063,6 +1108,7 @@ impl App {
                                     .clicked()
                             {
                                 actions.push(RowAction::DeleteDialog(key.clone()));
+                                ui.close();
                             }
                         });
                         ui.end_row();
@@ -1137,8 +1183,11 @@ impl App {
 
     fn duplicates_pane(&mut self, ui: &mut egui::Ui) {
         if self.dups.is_empty() {
-            ui.label("No hash-identical duplicates known. File → Update Catalog to refresh.");
+            ui.label("No hash-identical duplicates known.");
             ui.label("(Hardlinked copies and cross-device backups don't count.)");
+            if ui.button("Update the catalog to refresh").clicked() {
+                self.spawn_hash();
+            }
             return;
         }
         let reclaimable: u64 = self.dups.iter().map(|d| d.reclaimable).sum();
@@ -1207,10 +1256,18 @@ impl App {
     }
 
     fn health_pane(&mut self, ui: &mut egui::Ui) {
-        let Some(findings) = &self.findings else {
-            ui.label("Not checked yet — Tools → Check store health.");
+        if self.findings.is_none() {
+            ui.label("Store health hasn't been checked yet.");
+            if ui
+                .button("Check store health now")
+                .on_hover_text("Read-only: scans the stores for damage and debris, fixes nothing")
+                .clicked()
+            {
+                self.spawn_doctor();
+            }
             return;
-        };
+        }
+        let Some(findings) = &self.findings else { return };
         if findings.is_empty() {
             ui.label("All stores healthy.");
             return;
@@ -1592,7 +1649,7 @@ impl App {
             if ui.button("Empty Trash…").clicked() {
                 self.show_empty_confirm = true;
             }
-            if ui.small_button("⟳").on_hover_text("Refresh").clicked() {
+            if ui.small_button("⟳ Refresh").clicked() {
                 self.trash_items = None;
             }
         });
@@ -1811,7 +1868,7 @@ impl App {
         }
         let mut open = true;
         let mut start = false;
-        egui::Window::new("Demote to Cold Storage")
+        egui::Window::new("Cold Storage")
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
@@ -2401,7 +2458,9 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.label("Add:");
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.settings_add).desired_width(280.0),
+                        egui::TextEdit::singleline(&mut self.settings_add)
+                            .hint_text("path to a model folder")
+                            .desired_width(280.0),
                     );
                     if ui.button("Browse…").clicked()
                         && let Some(dir) = rfd::FileDialog::new().pick_folder()
@@ -2654,22 +2713,35 @@ impl eframe::App for App {
                 .resizable(false)
                 .open(&mut self.show_about)
                 .show(ui.ctx(), |ui| {
-                    ui.label(format!("modelwarden {}", env!("CARGO_PKG_VERSION")));
+                    ui.strong(format!("modelwarden {}", env!("CARGO_PKG_VERSION")));
                     ui.label("Inventory, backup, and archival for local model files.");
                     ui.label("Owns storage truth. Never loses bytes.");
+                    ui.add_space(6.0);
+                    ui.hyperlink_to(
+                        "Project home (GitHub)",
+                        "https://github.com/unclebucklarson/model-warden",
+                    );
+                    ui.hyperlink_to(
+                        "Hands-on tutorial",
+                        "https://github.com/unclebucklarson/model-warden/blob/main/docs/tutorial.md",
+                    );
+                    ui.hyperlink_to(
+                        "User's guide",
+                        "https://github.com/unclebucklarson/model-warden/blob/main/docs/users-guide.md",
+                    );
+                    ui.hyperlink_to(
+                        "Report a bug or send feedback",
+                        "https://github.com/unclebucklarson/model-warden/issues/new/choose",
+                    );
+                    ui.add_space(4.0);
+                    ui.weak("Dual-licensed MIT OR Apache-2.0.");
                 });
         }
     }
 }
 
 fn ago(unix: u64) -> String {
-    let d = manifest::now_unix().saturating_sub(unix);
-    match d {
-        0..=90 => format!("{d}s ago"),
-        91..=5400 => format!("{} min ago", d / 60),
-        5401..=172_800 => format!("{} hours ago", d / 3600),
-        _ => format!("{} days ago", d / 86_400),
-    }
+    modelwarden::core::format::ago(unix)
 }
 
 fn human_size(bytes: u64) -> String {
@@ -2680,6 +2752,31 @@ fn human_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn errors_stay_visible_until_the_next_job_starts() {
+        // An error must not scroll away with the activity log: it stays
+        // as a status-bar banner until the user starts something new.
+        let mut app = App::new();
+        app.spawn("boom", |tx| {
+            let _ = tx.send(Msg::Error("it broke".into()));
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while app.busy.is_some() && std::time::Instant::now() < deadline {
+            app.drain_messages();
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            app.last_error.as_deref().is_some_and(|e| e.contains("it broke")),
+            "{:?}",
+            app.last_error
+        );
+        // Starting the next job clears the banner.
+        app.spawn("next", |tx| {
+            let _ = tx.send(Msg::Finished("done".into()));
+        });
+        assert!(app.last_error.is_none());
+    }
 
     #[test]
     fn a_second_job_queues_and_runs_after_the_first_finishes() {

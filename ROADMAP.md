@@ -353,6 +353,18 @@ Built test-first (see CLAUDE.md methodology). Priority order:
    command. Drives only; the scrub covers whatever is online. **M17
    complete.**
 
+- **Usability review implemented (2026-08-29, user-approved, all 7).**
+  "Archive" row action renamed **Keep on shelf** (the old label read as
+  its own opposite); "Demote…" → **Cold storage…** (one operation, one
+  name — demote survives as the CLI verb, cited in tooltips); row
+  actions collapsed into a per-row **⋯ menu**; empty states became
+  clickable buttons (build catalog / check health / refresh dups);
+  errors persist as a dismissable red status-bar banner until the next
+  job (bin-tested); CLI help reframed for release and grouped under the
+  guide's section headers (E2E-tested); About dialog carries project /
+  tutorial / guide / feedback links; Settings hint text + labeled trash
+  refresh. 99 tests green.
+
 ## Smaller items (fold in opportunistically)
 
 - (none — the activity-log mirror landed as M13.1)
