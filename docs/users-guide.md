@@ -301,7 +301,7 @@ companions — appear **indented under the model that needs them**, marked
 "required by …"; and a **split multi-part model shows as one row** with
 its combined size and a "(N parts)" note, the other parts indented as
 "part of …" beneath it. The list reads as models, not as loose files;
-groups are collapsed behind a **▸** toggle by default. The **Active / All** switch
+groups are collapsed behind a **⏵** toggle by default. The **Active / All** switch
 controls whether cold-stored models (every copy on a registered cold-
 storage root) appear: Active shows your working set, All shows the whole
 catalog. Rows for

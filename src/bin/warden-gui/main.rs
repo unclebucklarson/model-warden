@@ -877,7 +877,7 @@ impl App {
                     .hint_text("name, quant, location, hash…")
                     .desired_width(280.0),
             );
-            if !self.inv_filter.is_empty() && ui.small_button("✕").clicked() {
+            if !self.inv_filter.is_empty() && ui.small_button("✖").clicked() {
                 self.inv_filter.clear();
             }
             ui.separator();
@@ -1040,13 +1040,13 @@ impl App {
                             Some(note) => {
                                 // One line, so the row's other cells stay
                                 // aligned with the name.
-                                ui.label(text(format!("    ↳ {} — {note}", entry.display_name)))
+                                ui.label(text(format!("      {} — {note}", entry.display_name)))
                                     .on_hover_text(format!("{note}\n{}", hover.join("\n")));
                             }
                             None if kids > 0 => {
                                 ui.horizontal(|ui| {
                                     if ui
-                                        .small_button(if expanded { "▾" } else { "▸" })
+                                        .small_button(if expanded { "⏷" } else { "⏵" })
                                         .on_hover_text(format!(
                                             "{} {kids} required file{}",
                                             if expanded { "Hide" } else { "Show" },
@@ -1074,7 +1074,7 @@ impl App {
                         let row_backed = manifest::is_backed_up(entry)
                             && split_extra.get(key).map(|(_, _, b)| *b).unwrap_or(true);
                         if row_backed {
-                            ui.label("✓").on_hover_text("Has a copy on a registered drive");
+                            ui.label("✔").on_hover_text("Has a copy on a registered drive");
                         } else {
                             ui.weak("—").on_hover_text(
                                 "No copy on any registered drive — this model would not \
@@ -1096,7 +1096,7 @@ impl App {
                         // One compact menu per row beats four crowded
                         // buttons — and the labels say what happens, not
                         // what the CLI verb is called.
-                        ui.menu_button("⋯", |ui| {
+                        ui.menu_button("…", |ui| {
                             if modelwarden::core::archive::promotable_location(inv, entry)
                                 .is_some()
                                 && ui
@@ -1693,7 +1693,7 @@ impl App {
             if ui.button("Empty Trash…").clicked() {
                 self.show_empty_confirm = true;
             }
-            if ui.small_button("⟳ Refresh").clicked() {
+            if ui.small_button("Refresh").clicked() {
                 self.trash_items = None;
             }
         });
@@ -2144,7 +2144,7 @@ impl App {
                                 .hint_text("quant or name, e.g. UD-Q3_K_XL")
                                 .desired_width(220.0),
                         );
-                        if !self.fetch_filter.is_empty() && ui.small_button("✕").clicked() {
+                        if !self.fetch_filter.is_empty() && ui.small_button("✖").clicked() {
                             self.fetch_filter.clear();
                         }
                         if !q.is_empty() {
@@ -2486,7 +2486,7 @@ impl App {
                 let mut remove: Option<usize> = None;
                 for (i, d) in self.settings_dirs.iter().enumerate() {
                     ui.horizontal(|ui| {
-                        if ui.small_button("✕").on_hover_text("Remove from the list").clicked() {
+                        if ui.small_button("✖").on_hover_text("Remove from the list").clicked() {
                             remove = Some(i);
                         }
                         if i == 0 {
