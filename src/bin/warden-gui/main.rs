@@ -2331,17 +2331,30 @@ impl App {
                             .collect()
                     })
                 };
+                // The preview must NAME the models, not just count them —
+                // nobody should commit a 200 GiB copy on a number alone.
                 let preview = match (&selection, &self.inv) {
                     (Some(keys), Some(inv)) => {
-                        let expanded: std::collections::BTreeSet<String> = keys
-                            .iter()
-                            .flat_map(|k| manifest::bundle_for(inv, k))
-                            .collect();
+                        let expanded = manifest::bundle_union(inv, keys);
                         let bytes: u64 = expanded
                             .iter()
                             .filter_map(|k| inv.models.get(k))
                             .map(|e| e.size)
                             .sum();
+                        let mut rows: Vec<(String, u64)> = expanded
+                            .iter()
+                            .filter_map(|k| inv.models.get(k))
+                            .map(|e| (e.display_name.clone(), e.size))
+                            .collect();
+                        rows.sort_by(|a, b| b.1.cmp(&a.1));
+                        egui::ScrollArea::vertical()
+                            .id_salt("backup_preview")
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for (name, size) in &rows {
+                                    ui.weak(format!("{:>10}  {}", human_size(*size), name));
+                                }
+                            });
                         format!(
                             "{} matched, {} with bundles — {}",
                             keys.len(),
