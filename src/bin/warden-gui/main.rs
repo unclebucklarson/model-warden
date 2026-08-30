@@ -2758,6 +2758,20 @@ impl eframe::App for App {
                 .open(&mut self.show_about)
                 .show(ui.ctx(), |ui| {
                     ui.strong(format!("modelwarden {}", env!("CARGO_PKG_VERSION")));
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("build {}", env!("WARDEN_BUILD_ID")));
+                        if ui
+                            .small_button("Copy")
+                            .on_hover_text("Copy the full version for a bug report")
+                            .clicked()
+                        {
+                            ui.ctx().copy_text(format!(
+                                "modelwarden {} ({})",
+                                env!("CARGO_PKG_VERSION"),
+                                env!("WARDEN_BUILD_ID")
+                            ));
+                        }
+                    });
                     ui.label("Inventory, backup, and archival for local model files.");
                     ui.label("Owns storage truth. Never loses bytes.");
                     ui.add_space(6.0);

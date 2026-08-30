@@ -274,3 +274,21 @@ fn help_is_grouped_and_release_framed() {
         assert!(help.contains(h), "missing section {h:?}:\n{help}");
     }
 }
+
+#[test]
+fn version_carries_a_build_id() {
+    // "warden X.Y.Z (<id>)" — the id pins the exact source, so an issue
+    // report identifies the build, not just the nearest tag. Git builds
+    // carry the commit hash (with -modified for dirty trees); crates.io
+    // builds carry the packaged sha; never an empty "()".
+    let e = Env::new();
+    let v = e.ok(&["version"]);
+    let inside = v
+        .split_once('(')
+        .and_then(|(_, rest)| rest.split_once(')'))
+        .map(|(id, _)| id.trim().to_string());
+    assert!(
+        inside.as_deref().is_some_and(|id| !id.is_empty()),
+        "no build id in: {v}"
+    );
+}
