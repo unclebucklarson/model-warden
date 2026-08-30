@@ -1,0 +1,10 @@
+# cargo-audit configuration.
+#
+# Ignored advisories — each entry needs a reason and a revisit trigger:
+#
+# RUSTSEC-2026-0192: ttf-parser is unmaintained (informational, not a
+# vulnerability). It reaches us only transitively through the pinned GUI
+# stack: eframe 0.36 -> egui-winit -> winit -> sctk-adwaita -> ab_glyph.
+# Nothing at our level can swap it; revisit when eframe is next bumped.
+[advisories]
+ignore = ["RUSTSEC-2026-0192"]

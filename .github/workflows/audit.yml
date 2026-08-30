@@ -1,8 +1,9 @@
 name: Security audit
 
 # Known-vulnerability check over the dependency tree (RustSec advisory
-# DB): weekly, on any dependency change, and on demand. Findings open
-# issues rather than failing unrelated CI.
+# DB): weekly, on any dependency change, and on demand. Runs cargo-audit
+# directly — no third-party action, no Node runtime to deprecate.
+# Ignored advisories live in .cargo/audit.toml, each with its reason.
 
 on:
   schedule:
@@ -11,17 +12,17 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".cargo/audit.toml"
       - ".github/workflows/audit.yml"
   workflow_dispatch:
 
 jobs:
   audit:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      issues: write
     steps:
       - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit
+        run: cargo audit
