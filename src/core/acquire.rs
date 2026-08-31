@@ -409,10 +409,7 @@ fn origin_checksum(repo: &str, filename: &str, token: Option<&str>) -> Option<St
 /// Temp name for an in-flight download, always `.partial`-suffixed so an
 /// interrupted transfer can never be scanned as a model.
 fn partial_path(dest: &Path) -> PathBuf {
-    match dest.extension() {
-        Some(e) => dest.with_extension(format!("{}.partial", e.to_string_lossy())),
-        None => dest.with_extension("partial"),
-    }
+    crate::core::fsx::temp_sibling(dest, "partial")
 }
 
 /// Download one file with Range resume. Returns (final path, provenance).
@@ -629,7 +626,8 @@ pub fn fetch(
         let _ = std::fs::remove_file(&tmp);
         return Err(e.context("the partial was discarded"));
     }
-    std::fs::rename(&tmp, &dest).with_context(|| format!("finalizing {}", dest.display()))?;
+    crate::core::fsx::rename_noreplace(&tmp, &dest)
+        .with_context(|| format!("finalizing {}", dest.display()))?;
 
     let prov = Provenance {
         tool: "warden-fetch".into(),

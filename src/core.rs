@@ -9,6 +9,7 @@ pub mod backup;
 pub mod dedup;
 pub mod doctor;
 pub mod format;
+pub mod fsx;
 pub mod gguf;
 pub mod identity;
 pub mod journal;

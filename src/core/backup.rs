@@ -149,7 +149,7 @@ pub fn backup(
             size: entry.size,
         });
         let started = std::time::Instant::now();
-        match copy_verified(&src, &dest, hash, entry.size, &label, &mut on) {
+        match copy_verified(&src, &dest, hash, entry.size, &label, Publish::New, &mut on) {
             Ok(fingerprint) => {
                 man.files.push(FileRecord {
                     rel_path: rel_dest,
@@ -212,6 +212,18 @@ fn dest_layout(entry: &ModelEntry, loc: &Location) -> PathBuf {
     }
 }
 
+/// What a finished copy may do to an existing destination.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Publish {
+    /// Refuse if anything is there — enforced by the rename itself, so
+    /// there is no window between checking and publishing.
+    New,
+    /// Deliberately replace it. Only `repair` does this: the whole point
+    /// is to overwrite bytes already known to be corrupt, and the old
+    /// file stays put until the verified replacement is ready.
+    Replace,
+}
+
 /// Copy `src` → `dest` through a `.partial` temp: hash the source as it is
 /// read, require it to match `expected`, then read the finished temp back
 /// and require that to match too. Only then rename into place. Returns the
@@ -222,13 +234,14 @@ pub(crate) fn copy_verified(
     expected: &str,
     total: u64,
     label: &str,
+    publish: Publish,
     on: &mut impl FnMut(BackupEvent),
 ) -> Result<identity::Fingerprint> {
     use sha2::{Digest, Sha256};
     if let Some(dir) = dest.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    let tmp = dest.with_extension("gguf.partial");
+    let tmp = crate::core::fsx::temp_sibling(dest, "partial");
 
     let mut reader = std::io::BufReader::with_capacity(
         4 * 1024 * 1024,
@@ -296,7 +309,16 @@ pub(crate) fn copy_verified(
         bail!("read-back hash mismatch — target wrote bad bytes, nothing kept");
     }
 
-    std::fs::rename(&tmp, dest).with_context(|| format!("finalizing {}", dest.display()))?;
+    // Refuse-overwrite is enforced by the rename itself, not by an
+    // exists() check that another process can win.
+    let published = match publish {
+        Publish::New => crate::core::fsx::rename_noreplace(&tmp, dest),
+        Publish::Replace => std::fs::rename(&tmp, dest).map_err(anyhow::Error::from),
+    };
+    if let Err(e) = published {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("finalizing {}", dest.display()));
+    }
     identity::Fingerprint::of(dest)
 }
 
@@ -392,7 +414,7 @@ pub fn repair(
             size: rec.size,
         });
         let started = std::time::Instant::now();
-        match copy_verified(&src, &dest, &hash, rec.size, &label, &mut on) {
+        match copy_verified(&src, &dest, &hash, rec.size, &label, Publish::Replace, &mut on) {
             Ok(fingerprint) => {
                 rec.fingerprint = Some(fingerprint);
                 rec.accessible = true;

@@ -120,7 +120,7 @@ pub fn move_to_trash(inv: &Inventory, del: &BTreeSet<String>) -> Result<TrashRep
                 dst = dst.with_file_name(name);
                 n += 1;
             }
-            std::fs::rename(&src, &dst)
+            crate::core::fsx::rename_noreplace(&src, &dst)
                 .with_context(|| format!("moving {} to trash", src.display()))?;
             // Rename preserves mtime, but the trash listing derives its
             // "trashed N ago" age from it — stamp now, or a year-old file
@@ -294,7 +294,8 @@ pub fn restore(root: &RootSpec, rel: &Path) -> Result<PathBuf> {
     if let Some(dir) = dst.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
-    std::fs::rename(&src, &dst).with_context(|| format!("restoring {}", dst.display()))?;
+    crate::core::fsx::rename_noreplace(&src, &dst)
+        .with_context(|| format!("restoring {}", dst.display()))?;
     prune_empty_dirs(&trash_dir(&root.path));
     Ok(dst)
 }

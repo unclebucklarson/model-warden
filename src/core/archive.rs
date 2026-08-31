@@ -87,7 +87,7 @@ pub fn promote(
                 entry.display_name
             );
         };
-        backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, on)?;
+        backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, backup::Publish::New, on)?;
     }
     Ok(dest)
 }
@@ -139,7 +139,7 @@ pub fn demote(
         }
         identity::Fingerprint::of(&dest)?
     } else {
-        backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, on)?
+        backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, backup::Publish::New, on)?
     };
 
     // Record on the drive's own manifest before anything is removed.
@@ -233,7 +233,7 @@ pub fn restore(
     if dest.exists() {
         bail!("{} already exists — refusing to overwrite", dest.display());
     }
-    backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, on)?;
+    backup::copy_verified(&src, &dest, hash, entry.size, &entry.display_name, backup::Publish::New, on)?;
     Ok(dest)
 }
 

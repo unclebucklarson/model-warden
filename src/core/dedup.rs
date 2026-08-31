@@ -203,9 +203,13 @@ fn relink(survivor: &std::path::Path, victim: &std::path::Path) -> Result<()> {
     let real = survivor
         .canonicalize()
         .with_context(|| format!("resolving {}", survivor.display()))?;
-    let tmp = victim.with_extension("gguf.wardenlink");
+    let tmp = crate::core::fsx::temp_sibling(victim, "wardenlink");
+    // A stale temp from a crashed run must not block dedup forever.
+    let _ = std::fs::remove_file(&tmp);
     std::fs::hard_link(&real, &tmp)
         .with_context(|| format!("linking {} → {}", real.display(), tmp.display()))?;
+    // This rename deliberately replaces the victim — that IS the
+    // operation, and both sides were just hash-verified as identical.
     std::fs::rename(&tmp, victim).with_context(|| format!("replacing {}", victim.display()))
 }
 
