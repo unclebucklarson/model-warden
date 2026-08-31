@@ -288,6 +288,22 @@ backed up, which are the same bytes — without ever losing bytes.**
   Delete dialog also now surfaces offline copies up front. Proven E2E.
   77 tests green.
 
+- **Full review pass (2026-08-30, user-requested).** Three
+  documents in **docs/reviews/**: code (20 findings), efficiency (17),
+  security (13), each prioritised with a dependency-ordered fix list, plus
+  a combined execution order in docs/reviews/README.md. Headlines:
+  `save_json` is not atomic (a crash between its two renames loses a root
+  manifest — and the hash checkpoint hits that window once per file); the
+  write lock has two races that let two wardens both hold it; a corrupt
+  manifest panics `verify` via `&hash[..12]`; a removable drive's own
+  manifest is trusted for path construction and backup completeness
+  (arbitrary write via `verify --repair`, silent backup forgery); the HF
+  token is stored world-readable (0664, proven); downloads are the one
+  byte path never verified against a hash; symlinked shelf models record
+  the symlink's size, not the model's (proven: 114 B vs 5,000,024).
+  Nothing here blocks shipping — the design holds; these are places the
+  implementation doesn't yet keep the documentation's promises.
+
 ## ⇒ PICK UP HERE (state as of 2026-08-26, v0.2.0)
 
 **Everything through M15 + the use-in-anger wave is complete and
