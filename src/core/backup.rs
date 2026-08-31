@@ -77,7 +77,13 @@ pub fn backup(
     if !target.path.is_dir() {
         bail!("backup target {} is not a directory (offline?)", target.path.display());
     }
-    let mut man = manifest::load_manifest(&target_manifest_path(&target.path)).unwrap_or(
+    // The target's own manifest is untrusted (it lives on removable
+    // media): scrub it before its records are believed. A forged
+    // "already have this hash" record would otherwise make backup copy
+    // nothing and report success.
+    let mut man = manifest::load_manifest(&target_manifest_path(&target.path))
+        .map(|m| manifest::sanitize_carried(m, &target.path).0)
+        .unwrap_or(
         RootManifest {
             schema_version: SCHEMA_VERSION,
             root: target.clone(),
@@ -340,6 +346,16 @@ pub fn repair(
         .cloned()
         .collect();
     for rel in broken {
+        // Defence in depth: a manifest record must never steer a write
+        // outside its own root, even if it reached here unscrubbed.
+        if manifest::sanitize_rel(&rel).is_err() {
+            on(BackupEvent::Failed {
+                label: rel.display().to_string(),
+                error: "unsafe path in manifest — refusing to write".into(),
+            });
+            out.unrepairable.push(rel);
+            continue;
+        }
         let Some(rec) = man.files.iter_mut().find(|f| f.rel_path == rel) else {
             continue;
         };
@@ -416,11 +432,19 @@ pub fn verify(
             report.unhashed += 1;
             continue;
         };
-        let abs = man.root.path.join(&f.rel_path);
         let label = f
             .name
             .clone()
             .unwrap_or_else(|| f.rel_path.display().to_string());
+        if manifest::sanitize_rel(&f.rel_path).is_err() {
+            report.mismatched.push(f.rel_path.clone());
+            on(BackupEvent::Failed {
+                label,
+                error: "unsafe path in manifest — not part of this root".into(),
+            });
+            continue;
+        }
+        let abs = man.root.path.join(&f.rel_path);
         if !abs.is_file() {
             report.missing.push(f.rel_path.clone());
             on(BackupEvent::Failed {
@@ -722,5 +746,62 @@ mod tests {
         let mut tspec = target_spec(target.path());
         tspec.kind = RootKind::HfHub;
         assert!(backup(&inv, &tspec, None, |_| {}).is_err());
+    }
+
+    #[test]
+    fn repair_refuses_to_write_outside_its_root() {
+        // Defence in depth: even if a poisoned manifest reaches this far
+        // (it should be scrubbed at load), the write sink must refuse.
+        // A live source IS available, so nothing but the guard stops it.
+        use crate::core::gguf::tests::synthetic_gguf;
+        let world = tempfile::tempdir().unwrap();
+        let shelf = world.path().join("shelf");
+        let drive = world.path().join("drive");
+        std::fs::create_dir_all(&shelf).unwrap();
+        std::fs::create_dir_all(&drive).unwrap();
+        let bytes = synthetic_gguf("llama", 8192, 15);
+        std::fs::write(shelf.join("m.gguf"), &bytes).unwrap();
+        let shelf_spec = RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.clone(),
+            label: None,
+        };
+        let mut shelf_man = manifest::build_root_manifest(&shelf_spec, None);
+        let hash = identity::sha256_file(&shelf.join("m.gguf"), |_, _| {}).unwrap();
+        shelf_man.files[0].sha256 = Some(hash.clone());
+        let inv = manifest::merge(&[shelf_man]);
+
+        let mut man = RootManifest {
+            schema_version: SCHEMA_VERSION,
+            root: RootSpec {
+                id: "ext-x".into(),
+                kind: RootKind::Removable,
+                path: drive.clone(),
+                label: None,
+            },
+            generated_unix: 0,
+            files: vec![FileRecord {
+                rel_path: PathBuf::from("../escape.gguf"),
+                size: bytes.len() as u64,
+                fingerprint: None,
+                sha256: Some(hash),
+                name: None,
+                meta: None,
+                accessible: true,
+                verified_unix: None,
+            }],
+        };
+        let report = VerifyReport {
+            mismatched: vec![PathBuf::from("../escape.gguf")],
+            ..Default::default()
+        };
+        let out = repair(&inv, &mut man, &report, |_| {}).unwrap();
+        assert_eq!(out.repaired, 0, "must not write outside the root");
+        assert_eq!(out.unrepairable.len(), 1);
+        assert!(
+            !world.path().join("escape.gguf").exists(),
+            "escaped the root!"
+        );
     }
 }

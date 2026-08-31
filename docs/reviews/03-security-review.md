@@ -134,7 +134,7 @@ The docstring says the token is stored "plainly, like the hf CLI's own
 Consider not persisting the token at all by default — `$HF_TOKEN` and the
 `hf` login file already work.
 
-## H4 — Downloaded bytes are never verified against anything
+## H4 — Downloaded bytes are never verified against anything *(FIXED — see note)*
 `src/core/acquire.rs:356-530`, `src/bin/warden.rs:1096-1112`
 
 Every other byte-movement in warden is hash-verified end to end. Downloads
@@ -156,6 +156,19 @@ under warden's own "verified" branding.
 against it before the rename and refuse on mismatch. This closes the last
 unverified byte path in the product and costs nothing — the hash is
 already computed.
+
+**Implementation note (2026-08-31), and a finding the fix uncovered:**
+the obvious implementation is wrong. `resolve/` answers **302** with
+`x-linked-etag` (the object's SHA-256) and redirects to a CDN whose own
+`etag` is a Xet content-addressed id — also 64 hex characters, but *not*
+the file hash. ureq follows the redirect, so reading the header off the
+final response silently yields the wrong value: verification rejected a
+perfectly good 17 MB download on the first live test (wanted
+`05526191ad0e…`, got `dab2c2bddcfb…` — the *second* being the truth).
+This also means the `etag` warden has been recording as provenance all
+along was, for Xet-backed files, a storage id rather than a checksum.
+The fix asks the origin with redirects disabled
+(`acquire::origin_checksum`) and records that value instead.
 
 ---
 

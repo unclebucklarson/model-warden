@@ -70,6 +70,9 @@ Health, acquisition, and history:
 
 fn main() -> ExitCode {
     env_logger::init();
+    // Self-heal permissions left loose by an older version: the config
+    // holds the HF token, the state dir every model path.
+    settings::harden_existing();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let json = args.iter().any(|a| a == "--json");
     match args.first().map(String::as_str) {
@@ -1092,24 +1095,19 @@ fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode
             }
         });
         match result {
-            Ok((dest, prov)) => {
+            Ok((dest, prov, hash)) => {
                 eprintln!();
-                match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
-                    Ok(hash) => {
-                        if let Err(e) = acquire::record_provenance(&state, &hash, &prov) {
-                            eprintln!("warden: recording provenance: {e:#}");
-                        }
-                        let l = format!(
-                            "fetched {} ({} rev {})",
-                            dest.display(),
-                            &hash[..12],
-                            prov.revision.as_deref().unwrap_or("unknown")
-                        );
-                        jot(&l);
-                        println!("{l}");
-                    }
-                    Err(e) => eprintln!("warden: hashing download: {e:#}"),
+                if let Err(e) = acquire::record_provenance(&state, &hash, &prov) {
+                    eprintln!("warden: recording provenance: {e:#}");
                 }
+                let l = format!(
+                    "fetched {} ({} rev {})",
+                    dest.display(),
+                    &hash[..12.min(hash.len())],
+                    prov.revision.as_deref().unwrap_or("unknown")
+                );
+                jot(&l);
+                println!("{l}");
             }
             Err(e) => {
                 eprintln!("\nwarden: {e:#}");
@@ -1556,6 +1554,15 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
                 match manifest::load_manifest(&backup::target_manifest_path(c)) {
                     Some(mut m) => {
                         m.root.path = c.clone();
+                        // This manifest came off the drive itself — scrub
+                        // it before verify/repair act on its paths.
+                        let (m, dropped) = manifest::sanitize_carried(m, c);
+                        if dropped > 0 {
+                            eprintln!(
+                                "warden: ignored {dropped} unusable record(s) in the drive's \
+                                 own manifest (bad paths or files that aren't there)"
+                            );
+                        }
                         m
                     }
                     None => {

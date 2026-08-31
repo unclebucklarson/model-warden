@@ -92,8 +92,13 @@ pub fn move_to_trash(inv: &Inventory, del: &BTreeSet<String>) -> Result<TrashRep
                 report.offline.push((entry.display_name.clone(), label));
                 continue;
             }
-            let src = root.path.join(&loc.rel_path);
-            let mut dst = trash_dir(&root.path).join(&loc.rel_path);
+            // A catalog path must be genuinely inside its root before
+            // anything is moved: deletion is not a place to trust input.
+            let Ok(safe_rel) = manifest::sanitize_rel(&loc.rel_path) else {
+                continue;
+            };
+            let src = root.path.join(&safe_rel);
+            let mut dst = trash_dir(&root.path).join(&safe_rel);
             if let Some(dir) = dst.parent() {
                 std::fs::create_dir_all(dir)
                     .with_context(|| format!("creating {}", dir.display()))?;
@@ -102,8 +107,7 @@ pub fn move_to_trash(inv: &Inventory, del: &BTreeSet<String>) -> Result<TrashRep
             // and is never overwritten — the new arrival gets a counter
             // BEFORE the extension ("model.1.gguf", never "model.gguf.1"),
             // so a later restore yields a name the scanner still catalogs.
-            let base = loc
-                .rel_path
+            let base = safe_rel
                 .file_name()
                 .map(|f| f.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "file".into());
@@ -278,6 +282,7 @@ pub fn restore_set(root: &RootSpec, rel: &Path) -> Vec<PathBuf> {
 /// Rename a trashed file back to its place in the root. Refuses to
 /// overwrite anything that reappeared there in the meantime.
 pub fn restore(root: &RootSpec, rel: &Path) -> Result<PathBuf> {
+    let rel = &manifest::sanitize_rel(rel)?;
     let src = trash_dir(&root.path).join(rel);
     if !src.is_file() {
         bail!("{} is not in the trash of {}", rel.display(), root.path.display());

@@ -24,12 +24,17 @@ pub fn record(state_dir: &Path, line: &str) {
 
 fn record_at(state_dir: &Path, unix: u64, line: &str) {
     use std::io::Write;
-    let _ = std::fs::create_dir_all(state_dir);
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(journal_path(state_dir))
+    let _ = crate::core::settings::create_private_dir(state_dir);
+    let path = journal_path(state_dir);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).append(true);
+    #[cfg(unix)]
     {
+        use std::os::unix::fs::OpenOptionsExt;
+        // The journal names every model path on the machine.
+        opts.mode(0o600);
+    }
+    if let Ok(mut f) = opts.open(&path) {
         let _ = writeln!(f, "{}\t{}", utc_datetime(unix), line);
     }
 }

@@ -54,20 +54,144 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
+    /// Infallible load for read paths: a missing config means defaults.
+    /// A *corrupt* config also yields defaults here, but `save` will
+    /// refuse to overwrite it — see `load_checked`.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+        if path.exists() {
+            tighten(path);
+        }
+        Self::load_checked(path).unwrap_or_default()
     }
 
-    pub fn save(&self, path: &Path) -> Result<()> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)?;
-        }
-        std::fs::write(path, serde_json::to_string_pretty(self)?)
-            .with_context(|| format!("writing {}", path.display()))
+    /// Distinguish "no config" (defaults, fine) from "unreadable config"
+    /// (an error). Silently treating corruption as absence used to lose
+    /// every registered root the moment anything called `save`.
+    pub fn load_checked(path: &Path) -> Result<Self> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+        serde_json::from_str(&text)
+            .with_context(|| format!("{} is not valid JSON", path.display()))
     }
+
+    /// Write the config owner-only, atomically, and never over a file we
+    /// could not parse (that file may hold roots this process never saw).
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if path.exists() {
+            Self::load_checked(path).with_context(|| {
+                format!(
+                    "refusing to overwrite {} — fix or remove it first",
+                    path.display()
+                )
+            })?;
+        }
+        if let Some(dir) = path.parent() {
+            create_private_dir(dir)?;
+        }
+        write_private(path, serde_json::to_string_pretty(self)?.as_bytes())
+    }
+}
+
+/// Create a directory tree that only the owner can enter — warden's
+/// state and config hold a token, full paths of every model, and the
+/// manifests that other code trusts.
+pub fn create_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+/// Write a file owner-only and atomically (temp + rename, so a crash
+/// mid-write cannot leave the truncated file that `load` would then
+/// treat as corrupt).
+pub fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!(
+        "{}.tmp",
+        path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default()
+    ));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", tmp.display()))?;
+    f.sync_all().ok();
+    drop(f);
+    tighten(&tmp);
+    std::fs::rename(&tmp, path).with_context(|| format!("finalizing {}", path.display()))
+}
+
+/// Tighten anything an older version left group- or world-readable:
+/// the config (it holds the HF token), the state directory, and every
+/// file in it (manifests and the journal name every model path on the
+/// machine). Cheap, idempotent, and self-healing across upgrades — both
+/// binaries call this once at startup.
+pub fn harden_existing() {
+    let cfg = config_file();
+    if cfg.exists() {
+        tighten(&cfg);
+    }
+    for dir in [config_dir(), state_dir()] {
+        if !dir.exists() {
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(md) = std::fs::metadata(&dir)
+                && md.permissions().mode() & 0o077 != 0
+            {
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        harden_tree(&dir, 0);
+    }
+}
+
+fn harden_tree(dir: &Path, depth: usize) {
+    if depth > 3 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let p = e.path();
+        match e.file_type() {
+            Ok(t) if t.is_dir() => harden_tree(&p, depth + 1),
+            Ok(t) if t.is_file() => tighten(&p),
+            _ => {}
+        }
+    }
+}
+
+/// Repair permissions on a file an older version left world-readable.
+pub fn tighten(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = std::fs::metadata(path)
+            && md.permissions().mode() & 0o077 != 0
+        {
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
 }
 
 /// `$XDG_CONFIG_HOME/modelwarden` (fallback `~/.config/modelwarden`).
@@ -160,5 +284,49 @@ mod tests {
         // Valid dirs canonicalize; duplicates collapse; order survives.
         let out = normalize_scan_dirs(&[a.clone(), a.clone()]).unwrap();
         assert_eq!(out, vec![a.canonicalize().unwrap()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_and_state_are_private_and_get_repaired() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("nested/config.json");
+        let cfg = AppConfig {
+            hf_token: Some("hf_secret".into()),
+            ..Default::default()
+        };
+        cfg.save(&cfg_path).unwrap();
+
+        // The token lives here: owner-only, like hf's own token file.
+        let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config must not be readable by others");
+        let dmode = std::fs::metadata(cfg_path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dmode, 0o700, "its directory must not be traversable");
+
+        // A file left world-readable by an older version is tightened on
+        // load rather than silently leaking forever.
+        std::fs::set_permissions(&cfg_path, std::fs::Permissions::from_mode(0o664)).unwrap();
+        let _ = AppConfig::load(&cfg_path);
+        let mode = std::fs::metadata(&cfg_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "load must repair loose permissions");
+    }
+
+    #[test]
+    fn a_corrupt_config_is_refused_not_silently_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        std::fs::write(&path, b"{ this is not json").unwrap();
+        // Absence means defaults; corruption must NOT, or the next save
+        // overwrites the user's registered roots with an empty list.
+        assert!(AppConfig::load_checked(&path).is_err());
+        assert!(AppConfig::load_checked(&dir.path().join("missing.json")).is_ok());
+        // And save must refuse to clobber a file it could not parse.
+        let cfg = AppConfig::default();
+        assert!(cfg.save(&path).is_err());
     }
 }

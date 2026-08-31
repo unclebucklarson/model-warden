@@ -158,19 +158,79 @@ pub fn load_all_manifests(state_dir: &Path) -> Vec<RootManifest> {
     out
 }
 
-/// Atomic write with a `.bak` of what was there before.
+/// Validate a manifest-declared relative path before it is joined to a
+/// root. Manifest records are untrusted the moment they come off
+/// removable media — they are joined to a root and then read, written,
+/// moved, and deleted — so every join site must pass through here.
+/// Refuses absolute paths, any `..` component, and empty paths; strips
+/// harmless `.` components.
+pub fn sanitize_rel(rel: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in rel.components() {
+        match c {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("refusing unsafe manifest path {}", rel.display())
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        anyhow::bail!("refusing empty manifest path");
+    }
+    Ok(out)
+}
+
+/// Scrub a manifest that came off media warden does not control (a
+/// drive's carried `.modelwarden/manifest.json`) before any of it is
+/// believed. A record survives only if its path is safe AND a real file
+/// of exactly the recorded size sits there right now. Returns the
+/// cleaned manifest and how many records were dropped.
+///
+/// This is deliberately a *hint filter*, not authentication: it defeats
+/// path traversal and wholesale fabrication (including the forged
+/// "already backed up" claims that would make `backup` copy nothing),
+/// but a drive can still lie about the content of a file that really
+/// exists at the right size. Only `warden verify` settles that.
+pub fn sanitize_carried(mut man: RootManifest, root_path: &Path) -> (RootManifest, usize) {
+    let before = man.files.len();
+    man.files.retain_mut(|f| {
+        let Ok(safe) = sanitize_rel(&f.rel_path) else {
+            return false;
+        };
+        let Ok(md) = std::fs::metadata(root_path.join(&safe)) else {
+            return false;
+        };
+        if !md.is_file() || md.len() != f.size {
+            return false;
+        }
+        f.rel_path = safe;
+        true
+    });
+    let dropped = before - man.files.len();
+    (man, dropped)
+}
+
+/// Atomic, owner-only write, keeping a `.bak` of the previous version.
+///
+/// The backup is taken by **copying** the old file aside before the new
+/// one is written — never by renaming the live file out of the way. The
+/// old shape (rename target→bak, then rename tmp→target) left a window
+/// with no manifest at `path`; a crash there — and the hash checkpoint
+/// opens that window once per file — silently reverted a whole root to
+/// "never catalogued".
 pub fn save_json<T: Serialize>(value: &T, path: &Path) -> Result<()> {
     if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        crate::core::settings::create_private_dir(dir)?;
     }
-    let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(value)?)
-        .with_context(|| format!("writing {}", tmp.display()))?;
     if path.exists() {
         let bak = path.with_extension("json.bak");
-        std::fs::rename(path, &bak).with_context(|| format!("keeping {}", bak.display()))?;
+        // Best-effort: a failed backup must not block the real write.
+        let _ = std::fs::copy(path, &bak);
+        crate::core::settings::tighten(&bak);
     }
-    std::fs::rename(&tmp, path).with_context(|| format!("finalizing {}", path.display()))
+    crate::core::settings::write_private(path, serde_json::to_string_pretty(value)?.as_bytes())
 }
 
 // ---- merged inventory ----
@@ -402,11 +462,14 @@ pub fn refresh(
         // demote (or by another machine entirely) re-catalogs with its
         // hashes intact instead of pending a rehash.
         let stored = load_manifest(&manifest_path(state, &spec.id));
+        // A drive's carried manifest is untrusted input: scrub it before
+        // any of it is believed (see sanitize_carried).
         let carried = spec
             .kind
             .owned()
             .then(|| load_manifest(&spec.path.join(".modelwarden/manifest.json")))
-            .flatten();
+            .flatten()
+            .map(|m| sanitize_carried(m, &spec.path).0);
         let previous = match (stored, carried) {
             (Some(mut s), Some(c)) => {
                 let by_rel: BTreeMap<&Path, &FileRecord> =
@@ -1294,5 +1357,111 @@ mod tests {
         assert!(!map.contains_key(&key_of("big-00001-of")));
         assert!(!map.contains_key(&key_of("mmproj")));
         assert!(!map.contains_key(&key_of("other")));
+    }
+    #[test]
+    fn unsafe_relative_paths_are_refused() {
+        // A manifest's rel_path is untrusted input the moment it comes
+        // off removable media: it is joined to a root and then read,
+        // written, moved, and deleted.
+        assert!(sanitize_rel(Path::new("Vision/model.gguf")).is_ok());
+        assert!(sanitize_rel(Path::new("a/b/c/model.gguf")).is_ok());
+        for bad in [
+            "../escape.gguf",
+            "a/../../escape.gguf",
+            "/etc/passwd",
+            "",
+            "..",
+        ] {
+            assert!(
+                sanitize_rel(Path::new(bad)).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+        // A trailing/interior CurDir is harmless but normalized away.
+        assert_eq!(
+            sanitize_rel(Path::new("./a/./b.gguf")).unwrap(),
+            PathBuf::from("a/b.gguf")
+        );
+    }
+
+    #[test]
+    fn a_carried_manifest_is_scrubbed_before_it_is_trusted() {
+        use crate::core::gguf::tests::synthetic_gguf;
+        let drive = tempfile::tempdir().unwrap();
+        let real = synthetic_gguf("llama", 8192, 15);
+        std::fs::write(drive.path().join("present.gguf"), &real).unwrap();
+        let rec = |rel: &str, size: u64| FileRecord {
+            rel_path: PathBuf::from(rel),
+            size,
+            fingerprint: None,
+            sha256: Some("a".repeat(64)),
+            name: None,
+            meta: None,
+            accessible: true,
+            verified_unix: None,
+        };
+        let man = RootManifest {
+            schema_version: SCHEMA_VERSION,
+            root: RootSpec {
+                id: "ext-x".into(),
+                kind: RootKind::Removable,
+                path: drive.path().to_path_buf(),
+                label: None,
+            },
+            generated_unix: 0,
+            files: vec![
+                rec("present.gguf", real.len() as u64), // real: kept
+                rec("../../../../etc/passwd", 10),      // traversal: dropped
+                rec("/etc/shadow", 10),                 // absolute: dropped
+                rec("ghost.gguf", 999),                 // fabricated: dropped
+                rec("present.gguf.2", real.len() as u64), // fabricated: dropped
+            ],
+        };
+        let (clean, dropped) = sanitize_carried(man, drive.path());
+        assert_eq!(dropped, 4, "{:?}", clean.files);
+        assert_eq!(clean.files.len(), 1);
+        assert_eq!(clean.files[0].rel_path, PathBuf::from("present.gguf"));
+
+        // A record that exists but lies about its size is dropped too —
+        // that lie is what makes backup skip copying the real model.
+        let man = RootManifest {
+            files: vec![rec("present.gguf", 999_999)],
+            ..clean.clone()
+        };
+        let (clean2, dropped2) = sanitize_carried(man, drive.path());
+        assert_eq!(dropped2, 1);
+        assert!(clean2.files.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_json_never_leaves_the_target_missing_and_stays_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("roots/x.json");
+        save_json(&vec![1, 2, 3], &path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().replace(['\n', ' '], ""),
+            "[1,2,3]"
+        );
+        // The previous version is kept by COPYING it aside, never by
+        // moving the live file out of the way — the old code renamed the
+        // target to .bak first, so a crash in that window left no
+        // manifest at all and the root silently reverted to unknown.
+        save_json(&vec![4, 5], &path).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().replace(['\n', ' '], ""),
+            "[4,5]"
+        );
+        let bak = path.with_extension("json.bak");
+        assert_eq!(
+            std::fs::read_to_string(&bak).unwrap().replace(['\n', ' '], ""),
+            "[1,2,3]"
+        );
+        // Manifests carry every model path on the machine.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dmode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(dmode, 0o700);
     }
 }

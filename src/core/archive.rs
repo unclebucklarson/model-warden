@@ -144,7 +144,9 @@ pub fn demote(
 
     // Record on the drive's own manifest before anything is removed.
     let mpath = backup::target_manifest_path(&target.path);
-    let mut man = manifest::load_manifest(&mpath).unwrap_or(RootManifest {
+    let mut man = manifest::load_manifest(&mpath)
+        .map(|m| manifest::sanitize_carried(m, &target.path).0)
+        .unwrap_or(RootManifest {
         schema_version: manifest::SCHEMA_VERSION,
         root: target.clone(),
         generated_unix: manifest::now_unix(),

@@ -18,6 +18,9 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 
 fn main() -> eframe::Result {
     env_logger::init();
+    // Self-heal permissions left loose by an older version: the config
+    // holds the HF token, the state dir every model path.
+    settings::harden_existing();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1150.0, 720.0])
@@ -2045,15 +2048,13 @@ impl App {
                         let _ = txp.send(Msg::Progress(line));
                     });
                 match result {
-                    Ok((dest, prov)) => {
-                        match modelwarden::core::identity::sha256_file(&dest, |_, _| {}) {
-                            Ok(hash) => {
-                                let _ = acquire::record_provenance(&state, &hash, &prov);
-                                summary.push(format!("fetched {} ({})", dest.display(), &hash[..12]));
-                            }
-                            Err(e) => summary
-                                .push(format!("fetched {} (hash failed: {e:#})", dest.display())),
-                        }
+                    Ok((dest, prov, hash)) => {
+                        let _ = acquire::record_provenance(&state, &hash, &prov);
+                        summary.push(format!(
+                            "fetched {} ({})",
+                            dest.display(),
+                            &hash[..12.min(hash.len())]
+                        ));
                     }
                     Err(e) => {
                         summary.push(format!("FAILED {filename}: {e:#}"));

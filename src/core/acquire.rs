@@ -346,6 +346,66 @@ pub fn dest_for(shelf_root: &Path, repo: &str, filename: &str) -> Result<PathBuf
     Ok(shelf_root.join(family).join(rel))
 }
 
+/// HuggingFace serves LFS objects with the content's SHA-256 in
+/// `x-linked-etag`. When the header is exactly 64 hex characters it IS a
+/// checksum and warden verifies against it; anything else (a weak
+/// validator, a plain MD5-style etag) is not a hash and must not be
+/// treated as one.
+pub fn etag_sha256(etag: Option<&str>) -> Option<String> {
+    let raw = etag?.trim();
+    if raw.starts_with("W/") {
+        return None; // weak validator: not a content hash
+    }
+    let hex = raw.trim_matches('"');
+    (hex.len() == 64 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| hex.to_ascii_lowercase())
+}
+
+/// The download's last gate: when the origin declared a checksum, the
+/// bytes on disk must match it. No checksum available (a small non-LFS
+/// file, an offline-ish origin) means the download proceeds unverified —
+/// absence of a checksum must never fail a good download.
+fn check_download(got: &str, declared: Option<&str>) -> Result<()> {
+    match declared {
+        Some(want) if got != want => bail!(
+            "downloaded bytes do not match the checksum the server declared \
+             (wanted {}…, got {}…)",
+            &want[..12.min(want.len())],
+            &got[..12.min(got.len())]
+        ),
+        _ => Ok(()),
+    }
+}
+
+/// Ask the origin — not the CDN — for the content checksum.
+///
+/// `huggingface.co/.../resolve/...` answers 302 with `x-linked-etag`
+/// (the object's SHA-256) and redirects to a CDN whose *own* `etag` is a
+/// content-addressed id that is also 64 hex characters but is NOT the
+/// file hash. Since ureq follows redirects, reading the header off the
+/// final response silently yields the wrong value — so this asks with
+/// redirects disabled and reads the authoritative header.
+///
+/// Best-effort: any failure yields `None`, which means "no checksum
+/// available", never a failed download.
+fn origin_checksum(repo: &str, filename: &str, token: Option<&str>) -> Option<String> {
+    let agent = ureq::AgentBuilder::new()
+        .timeout_connect(std::time::Duration::from_secs(15))
+        .timeout_read(std::time::Duration::from_secs(15))
+        .redirects(0)
+        .user_agent(concat!("modelwarden/", env!("CARGO_PKG_VERSION")))
+        .build();
+    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let resp = match with_auth(agent.head(&url), token).call() {
+        Ok(r) => r,
+        // A 3xx with redirects(0) surfaces as Status — its headers are
+        // exactly the ones we want.
+        Err(ureq::Error::Status(_, r)) => r,
+        Err(_) => return None,
+    };
+    etag_sha256(resp.header("x-linked-etag"))
+}
+
 /// Temp name for an in-flight download, always `.partial`-suffixed so an
 /// interrupted transfer can never be scanned as a model.
 fn partial_path(dest: &Path) -> PathBuf {
@@ -356,13 +416,16 @@ fn partial_path(dest: &Path) -> PathBuf {
 }
 
 /// Download one file with Range resume. Returns (final path, provenance).
+/// Returns (final path, provenance, sha256 of the bytes on disk). The
+/// hash is computed once, before the rename, and handed back so callers
+/// never re-read a 20 GiB file to learn what they just downloaded.
 pub fn fetch(
     repo: &str,
     filename: &str,
     shelf_root: &Path,
     token: Option<&str>,
     mut on: impl FnMut(FetchEvent),
-) -> Result<(PathBuf, Provenance)> {
+) -> Result<(PathBuf, Provenance, String)> {
     let dest = dest_for(shelf_root, repo, filename)?;
     if dest.exists() {
         bail!("{} already exists — refusing to overwrite", dest.display());
@@ -550,6 +613,22 @@ pub fn fetch(
             }
         }
     }
+    // Every other byte-movement in warden is hash-verified end to end;
+    // downloads were the exception. Hash the finished temp BEFORE it is
+    // published, and when the server gave us a content hash, refuse
+    // anything that does not match it.
+    on(FetchEvent::Hashing {
+        label: label.clone(),
+    });
+    let got = crate::core::identity::sha256_file(&tmp, |_, _| {})
+        .with_context(|| format!("hashing {}", tmp.display()))?;
+    let declared = origin_checksum(repo, filename, token);
+    if let Err(e) = check_download(&got, declared.as_deref()) {
+        // The bytes are provably not what was asked for; resuming would
+        // only re-derive the same wrong file.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e.context("the partial was discarded"));
+    }
     std::fs::rename(&tmp, &dest).with_context(|| format!("finalizing {}", dest.display()))?;
 
     let prov = Provenance {
@@ -557,10 +636,12 @@ pub fn fetch(
         repo: repo.to_string(),
         filename: filename.to_string(),
         revision,
-        etag,
+        // Prefer the origin's content hash; the CDN etag we may have
+        // seen is a storage id, not a checksum.
+        etag: declared.or(etag),
         fetched_unix: crate::core::manifest::now_unix(),
     };
-    Ok((dest, prov))
+    Ok((dest, prov, got))
 }
 
 /// Provenance store: `<state>/provenance.json`, keyed by sha256 — content
@@ -814,5 +895,40 @@ mod tests {
         // Second record for another content joins the first.
         record_provenance(state.path(), "beef02", &prov).unwrap();
         assert_eq!(load_provenance(state.path()).len(), 2);
+    }
+
+    #[test]
+    fn etag_is_recognised_as_a_checksum_only_when_it_is_one() {
+        // HF serves LFS objects with the content SHA-256 in x-linked-etag.
+        // warden already captured it as provenance and never checked it —
+        // downloads were the one byte path with no verification.
+        let sha = "a".repeat(64);
+        assert_eq!(etag_sha256(Some(&sha)).as_deref(), Some(sha.as_str()));
+        assert_eq!(etag_sha256(Some(&format!("\"{sha}\""))).as_deref(), Some(sha.as_str()));
+        assert_eq!(
+            etag_sha256(Some(&sha.to_uppercase())).as_deref(),
+            Some(sha.as_str()),
+            "normalised to lowercase for comparison"
+        );
+        // Non-LFS files get a plain MD5-ish etag; weak validators and
+        // anything that isn't 64 hex chars must NOT be treated as a hash.
+        assert_eq!(etag_sha256(Some("\"5d41402abc4b2a76b9719d911017c592\"")), None);
+        assert_eq!(etag_sha256(Some(&format!("W/\"{sha}\""))), None);
+        assert_eq!(etag_sha256(Some("")), None);
+        assert_eq!(etag_sha256(None), None);
+    }
+
+    #[test]
+    fn a_download_is_refused_when_it_contradicts_the_declared_checksum() {
+        let good = "d".repeat(64);
+        let other = "e".repeat(64);
+        // Verified when the origin gave us a checksum.
+        assert!(check_download(&good, Some(&good)).is_ok());
+        let err = check_download(&other, Some(&good)).unwrap_err().to_string();
+        assert!(err.contains("do not match"), "{err}");
+        assert!(err.contains(&good[..12]) && err.contains(&other[..12]), "{err}");
+        // No checksum offered (small non-LFS files carry a weak etag):
+        // proceed rather than fail a perfectly good download.
+        assert!(check_download(&good, None).is_ok());
     }
 }

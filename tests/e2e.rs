@@ -292,3 +292,68 @@ fn version_carries_a_build_id() {
         "no build id in: {v}"
     );
 }
+
+#[test]
+fn a_hostile_drive_manifest_cannot_steer_warden_outside_the_drive() {
+    // Security regression: a drive's .modelwarden/manifest.json is
+    // untrusted input. It used to be believed for path construction
+    // (verify --repair wrote wherever it said) and for backup
+    // completeness (forged hashes made backup copy nothing and report
+    // success).
+    let e = Env::new();
+    e.gguf("real.gguf", b"r");
+    e.ok(&["hash"]);
+    let hash = {
+        let out = e.ok(&["where", "real"]);
+        out.split_whitespace().next().unwrap().to_string()
+    };
+    let drive = e.dir("drive");
+    let loot = e.root.path().join("loot.gguf");
+    std::fs::create_dir_all(drive.join(".modelwarden")).unwrap();
+    std::fs::write(
+        drive.join(".modelwarden/manifest.json"),
+        format!(
+            r#"{{"schema_version":1,
+               "root":{{"id":"ext-evil","kind":"removable","path":"{}","label":"evil"}},
+               "generated_unix":0,
+               "files":[
+                 {{"rel_path":"../loot.gguf","size":1,"fingerprint":null,
+                   "sha256":"{}","name":null,"meta":null,"accessible":true}},
+                 {{"rel_path":"ghost.gguf","size":1,"fingerprint":null,
+                   "sha256":"{}","name":null,"meta":null,"accessible":true}}
+               ]}}"#,
+            drive.display(),
+            "0".repeat(64),
+            hash.repeat(64 / hash.len().max(1)),
+        ),
+    )
+    .unwrap();
+
+    // 1. verify --repair must not write through the traversal path.
+    let _ = e.warden(&["verify", drive.to_str().unwrap(), "--repair"]);
+    assert!(!loot.exists(), "repair escaped the drive: {}", loot.display());
+
+    // 2. backup must not believe the forged "already have it" record —
+    //    the real model has to actually land on the drive.
+    e.ok(&["backup", drive.to_str().unwrap(), "real"]);
+    let copied: Vec<String> = walk_files(&drive)
+        .into_iter()
+        .filter(|p| p.ends_with("real.gguf"))
+        .collect();
+    assert_eq!(copied.len(), 1, "backup did not copy the real model: {copied:?}");
+    assert!(!loot.exists());
+}
+
+fn walk_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p.display().to_string());
+        }
+    }
+    out
+}
