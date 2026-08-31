@@ -1592,6 +1592,9 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
                 continue;
             }
         };
+        // Unreadable files are NOT repairable-by-recopy in the same
+        // sense: warden never proved them wrong, it failed to read them.
+        // They count as failures, and they are never silently omitted.
         let failures = report.mismatched.len() + report.missing.len();
         if failures > 0 && do_repair {
             if let Some(inv) = &inv {
@@ -1614,17 +1617,18 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
                 eprintln!("warden: --repair needs an inventory — run `warden hash` first");
             }
         }
-        bad += report.mismatched.len() + report.missing.len();
+        bad += report.mismatched.len() + report.missing.len() + report.unreadable.len();
         let _ = manifest::save_json(man, &manifest::manifest_path(&state, &man.root.id));
         if man.root.kind.owned() && man.root.path.is_dir() {
             let _ = manifest::save_json(man, &backup::target_manifest_path(&man.root.path));
         }
         println!(
-            "{}: {} ok, {} mismatched, {} missing, {} unhashed",
+            "{}: {} ok, {} mismatched, {} missing, {} unreadable, {} unhashed",
             man.root.id,
             report.ok,
             report.mismatched.len(),
             report.missing.len(),
+            report.unreadable.len(),
             report.unhashed
         );
         for p in &report.mismatched {
@@ -1632,6 +1636,9 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
         }
         for p in &report.missing {
             println!("  MISSING:  {}", p.display());
+        }
+        for p in &report.unreadable {
+            println!("  UNREADABLE: {} (permissions, or failing media)", p.display());
         }
         reports.push((man.root.id.clone(), report));
     }

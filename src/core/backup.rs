@@ -337,6 +337,11 @@ pub struct VerifyReport {
     pub ok: usize,
     pub mismatched: Vec<PathBuf>,
     pub missing: Vec<PathBuf>,
+    /// Present, but the bytes would not come off the disk: permission
+    /// denied, an I/O error, a bad sector. Distinct from `mismatched`
+    /// — warden did NOT prove these wrong, it failed to read them — and
+    /// distinct from `missing`, which is a file that isn't there.
+    pub unreadable: Vec<PathBuf>,
     pub unhashed: usize,
 }
 
@@ -449,11 +454,22 @@ pub fn verify(
         bail!("{} is offline — nothing to verify against", man.root.path.display());
     }
     let mut report = VerifyReport::default();
-    for f in &mut man.files {
-        let Some(expected) = f.sha256.clone() else {
+
+    // Everything decidable without reading bytes is decided here, in
+    // order, on this thread — so the report reads the same as it always
+    // did no matter how the hashing below is scheduled.
+    struct Job {
+        f_i: usize,
+        path: PathBuf,
+        label: String,
+        size: u64,
+    }
+    let mut jobs: Vec<Job> = Vec::new();
+    for (f_i, f) in man.files.iter().enumerate() {
+        if f.sha256.is_none() {
             report.unhashed += 1;
             continue;
-        };
+        }
         let label = f
             .name
             .clone()
@@ -475,38 +491,117 @@ pub fn verify(
             });
             continue;
         }
-        on(BackupEvent::FileStart {
-            label: label.clone(),
-            size: f.size,
-        });
-        let started = std::time::Instant::now();
-        let mut last = 0u64;
-        let actual = identity::sha256_file(&abs, |done, total| {
-            if done - last >= 64 * 1024 * 1024 {
-                last = done;
-                on(BackupEvent::FileProgress {
-                    label: label.clone(),
-                    phase: "verify",
-                    done,
-                    total,
+        // The expected hash is re-read from the manifest when the answer
+        // comes back, so no worker carries a copy that could drift.
+        jobs.push(Job { f_i, path: abs, label, size: f.size });
+    }
+
+    // Re-reading the collection is exactly the work `refresh` already
+    // parallelises, and the weekly scrub is `hash && verify --all`: with
+    // one thread here the second half of that job ran at a quarter
+    // speed. Same pool shape — workers only read and hash; the report,
+    // the manifest write-back and the `on` callback stay on this thread.
+    enum Msg {
+        Start { label: String, size: u64 },
+        Progress { label: String, done: u64, total: u64 },
+        Hashed { f_i: usize, label: String, actual: String, secs: f32 },
+        Unreadable { f_i: usize, label: String, error: String },
+    }
+    if !jobs.is_empty() {
+        let threads = jobs
+            .len()
+            .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .min(4);
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let (etx, erx) = std::sync::mpsc::channel::<Msg>();
+        std::thread::scope(|sc| {
+            for _ in 0..threads {
+                let etx = etx.clone();
+                let jobs = &jobs;
+                let next = &next;
+                sc.spawn(move || {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(job) = jobs.get(i) else { break };
+                        let _ = etx.send(Msg::Start {
+                            label: job.label.clone(),
+                            size: job.size,
+                        });
+                        let started = std::time::Instant::now();
+                        let mut last = 0u64;
+                        let result = identity::sha256_file(&job.path, |done, total| {
+                            if done - last >= 64 * 1024 * 1024 {
+                                last = done;
+                                let _ = etx.send(Msg::Progress {
+                                    label: job.label.clone(),
+                                    done,
+                                    total,
+                                });
+                            }
+                        });
+                        // An unreadable file is a FINDING, not a reason
+                        // to stop: the `?` that used to be here threw
+                        // away the whole report and every verified_unix
+                        // already earned, so one bad sector cost a week.
+                        let _ = etx.send(match result {
+                            Ok(actual) => Msg::Hashed {
+                                f_i: job.f_i,
+                                label: job.label.clone(),
+                                actual,
+                                secs: started.elapsed().as_secs_f32(),
+                            },
+                            Err(e) => Msg::Unreadable {
+                                f_i: job.f_i,
+                                label: job.label.clone(),
+                                error: e.to_string(),
+                            },
+                        });
+                    }
                 });
             }
-        })?;
-        if actual == expected {
-            report.ok += 1;
-            f.verified_unix = Some(manifest::now_unix());
-            on(BackupEvent::FileDone {
-                label,
-                secs: started.elapsed().as_secs_f32(),
-            });
-        } else {
-            report.mismatched.push(f.rel_path.clone());
-            on(BackupEvent::Failed {
-                label,
-                error: format!("hash mismatch: bytes on disk are not {}", crate::core::format::short_hash(&expected)),
-            });
-        }
+            drop(etx); // the loop below ends when the last worker exits
+            for msg in erx {
+                match msg {
+                    Msg::Start { label, size } => on(BackupEvent::FileStart { label, size }),
+                    Msg::Progress { label, done, total } => on(BackupEvent::FileProgress {
+                        label,
+                        phase: "verify",
+                        done,
+                        total,
+                    }),
+                    Msg::Hashed { f_i, label, actual, secs } => {
+                        let f = &mut man.files[f_i];
+                        if Some(&actual) == f.sha256.as_ref() {
+                            report.ok += 1;
+                            f.verified_unix = Some(manifest::now_unix());
+                            on(BackupEvent::FileDone { label, secs });
+                        } else {
+                            report.mismatched.push(f.rel_path.clone());
+                            let expected = f.sha256.clone().unwrap_or_default();
+                            on(BackupEvent::Failed {
+                                label,
+                                error: format!(
+                                    "hash mismatch: bytes on disk are not {}",
+                                    crate::core::format::short_hash(&expected)
+                                ),
+                            });
+                        }
+                    }
+                    Msg::Unreadable { f_i, label, error } => {
+                        report.unreadable.push(man.files[f_i].rel_path.clone());
+                        on(BackupEvent::Failed {
+                            label,
+                            error: format!("unreadable: {error}"),
+                        });
+                    }
+                }
+            }
+        });
     }
+
+    // Workers finish out of order; the report must not.
+    report.mismatched.sort();
+    report.unreadable.sort();
     man.generated_unix = manifest::now_unix();
     Ok(report)
 }
@@ -516,6 +611,7 @@ mod tests {
     use super::*;
     use crate::core::gguf::tests::synthetic_gguf;
     use crate::core::manifest::{build_root_manifest, merge};
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn log_lines_mirror_the_cli_wording() {
@@ -768,6 +864,62 @@ mod tests {
         let mut tspec = target_spec(target.path());
         tspec.kind = RootKind::HfHub;
         assert!(backup(&inv, &tspec, None, |_| {}).is_err());
+    }
+
+    #[test]
+    fn one_unreadable_file_does_not_abandon_the_rest_of_a_verify() {
+        // A permission-denied file, or one bad sector on an ageing
+        // backup drive, used to propagate out of verify with `?`. That
+        // threw away the entire report AND every verified_unix already
+        // earned, so the weekly scrub reported nothing useful and
+        // re-read the whole collection again next week. An unreadable
+        // file is a finding, not a reason to stop.
+        if unsafe { libc::geteuid() } == 0 {
+            return; // root reads anything; the permission trick can't be staged
+        }
+        let drive = tempfile::tempdir().unwrap();
+        let mut files = Vec::new();
+        for (i, name) in ["a.gguf", "locked.gguf", "z.gguf"].iter().enumerate() {
+            let mut bytes = synthetic_gguf("llama", 8192, 15);
+            bytes.push(i as u8);
+            let path = drive.path().join(name);
+            std::fs::write(&path, &bytes).unwrap();
+            files.push(FileRecord {
+                rel_path: PathBuf::from(name),
+                size: bytes.len() as u64,
+                fingerprint: None,
+                sha256: Some(crate::core::identity::sha256_file(&path, |_, _| {}).unwrap()),
+                name: None,
+                meta: None,
+                accessible: true,
+                verified_unix: None,
+            });
+        }
+        let locked = drive.path().join("locked.gguf");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let mut man = RootManifest {
+            schema_version: manifest::SCHEMA_VERSION,
+            root: target_spec(drive.path()),
+            generated_unix: 0,
+            files,
+        };
+        let report = verify(&mut man, |_| {}).expect("a bad file must not fail the scrub");
+
+        assert_eq!(report.ok, 2, "the readable files were still verified");
+        assert_eq!(report.unreadable, vec![PathBuf::from("locked.gguf")]);
+        assert!(report.mismatched.is_empty(), "unreadable is not corrupt");
+        assert!(report.missing.is_empty(), "unreadable is not missing");
+        // And the work already done is durable, not discarded.
+        let verified: Vec<_> = man
+            .files
+            .iter()
+            .filter(|f| f.verified_unix.is_some())
+            .map(|f| f.rel_path.clone())
+            .collect();
+        assert_eq!(verified, vec![PathBuf::from("a.gguf"), PathBuf::from("z.gguf")]);
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]
