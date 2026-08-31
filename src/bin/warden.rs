@@ -1396,22 +1396,71 @@ fn cmd_report(json: bool) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+thread_local! {
+    /// Set by `verify`, which is always a parallel read: without it the
+    /// first file still gets an inline prefix that the second file's
+    /// start then has to abandon, leaving one stub line per run.
+    static EXPECT_CONCURRENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Print one operation event.
+///
+/// Copies happen one at a time, and for a 46 GiB file a line that starts
+/// and then completes in place is the right shape. `verify` hashes up to
+/// four files at once, where that shape stops describing reality: four
+/// prefixes collided into one unreadable line. So the inline form is
+/// used until a second file starts before the first finishes, and from
+/// then on every completion prints its own line, named.
 fn print_backup_event(ev: &backup::BackupEvent) {
+    use std::cell::{Cell, RefCell};
+    thread_local! {
+        static PENDING: RefCell<Option<String>> = const { RefCell::new(None) };
+        static CONCURRENT: Cell<bool> = const { Cell::new(false) };
+    }
+    if EXPECT_CONCURRENT.with(std::cell::Cell::get) {
+        CONCURRENT.with(|c| c.set(true));
+    }
+    /// Close a prefix nothing is going to complete.
+    fn end_prefix() {
+        PENDING.with(|p| {
+            if p.borrow_mut().take().is_some() {
+                eprintln!();
+            }
+        });
+    }
     match ev {
         backup::BackupEvent::FileStart { label, size } => {
+            if CONCURRENT.with(Cell::get) {
+                return;
+            }
+            let busy = PENDING.with(|p| p.borrow().is_some());
+            if busy {
+                CONCURRENT.with(|c| c.set(true));
+                end_prefix();
+                return;
+            }
             eprint!("  {label} ({})… ", human_size(*size));
             let _ = std::io::stderr().flush();
+            PENDING.with(|p| *p.borrow_mut() = Some(label.clone()));
         }
         backup::BackupEvent::FileProgress { .. } => {}
-        // Completes the inline prefix; same vocabulary as log_line.
-        backup::BackupEvent::FileDone { secs, .. } => {
+        // Completes the inline prefix when there is one; same vocabulary
+        // as log_line either way.
+        backup::BackupEvent::FileDone { label, secs } => {
             if let Some(line) = ev.log_line() {
                 jot(&line);
             }
-            eprintln!("verified in {secs:.0}s");
+            let mine = PENDING.with(|p| p.borrow().as_deref() == Some(label.as_str()));
+            if mine {
+                PENDING.with(|p| *p.borrow_mut() = None);
+                eprintln!("verified in {secs:.0}s");
+            } else {
+                eprintln!("  {label} verified in {secs:.0}s");
+            }
         }
         // Standalone lines share log_line's wording exactly.
         ev => {
+            end_prefix();
             if let Some(line) = ev.log_line() {
                 jot(&line);
                 eprintln!("  {line}");
@@ -1616,6 +1665,9 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
     let mut bad = 0usize;
     for man in &mut targets {
         eprintln!("verifying {} ({})", man.root.id, man.root.path.display());
+        // Verify reads several files at once; say so before the first
+        // event, so no line starts a prefix that cannot be completed.
+        EXPECT_CONCURRENT.with(|c| c.set(true));
         let mut report = match backup::verify(man, |ev| print_backup_event(&ev)) {
             Ok(r) => r,
             Err(e) => {
@@ -1630,6 +1682,8 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
         let failures = report.mismatched.len() + report.missing.len();
         if failures > 0 && do_repair {
             if let Some(inv) = &inv {
+                // Repair copies one file at a time again.
+                EXPECT_CONCURRENT.with(|c| c.set(false));
                 match backup::repair(inv, man, &report, |ev| print_backup_event(&ev)) {
                     Ok(rep) => {
                         println!(
@@ -1638,6 +1692,7 @@ fn cmd_verify(args: &[String], json: bool) -> ExitCode {
                             rep.unrepairable.len()
                         );
                         // What matters now is what is STILL wrong.
+                        EXPECT_CONCURRENT.with(|c| c.set(true));
                         report = match backup::verify(man, |_| {}) {
                             Ok(r) => r,
                             Err(_) => report,

@@ -17,6 +17,44 @@ Nothing here is a reason to stop shipping — warden's *design* is sound and
 its test discipline is real. These are the places where the
 implementation does not yet keep the promises the documentation makes.
 
+## Status — all six phases complete (2026-08-31)
+
+Every one of the 50 findings has been acted on, and each document carries
+a dated note under the finding saying what happened. Fixed in six pushes,
+test-first: 118 unit tests plus a 10-test whole-binary suite, green on
+Linux and macOS.
+
+| Phase | Findings | Outcome |
+|---|---|---|
+| 1 — write primitives | C1, C7, C8, H1, H2 | Atomic `save_json`; `fsx::rename_noreplace` via `renameat2`; a hostile drive manifest is sanitised before any of it is believed. |
+| 2 — the lock | C2 | pid-file protocol replaced with `flock`; the kernel arbitrates. |
+| 3 — secrets and config | C4, H3, H4, L1c, L1e | `0600`/`0700` everywhere and self-healing at startup; downloads verified against the origin's `x-linked-etag`. |
+| 4 — truth and robustness | C3, C5, C6, C9, C10, C12, C13, C14, C15, C16, E5, E6 | One symlink policy, one liveness predicate (`LocationState`), no unchecked slices, verify survives a bad sector and uses the cores. |
+| 5 — performance | E1–E4, E7–E17 | `hash` on an unchanged catalog 0.60 s → 0.02 s; the GUI's per-frame relation cost 234 ms → 4.5 ms at n=2,000, then out of the frame entirely. |
+| 6 — remaining | C11, C17–C20, M1–M5, L1a–L1f | A verified move is now undoable; no shell in the systemd unit; URLs encoded; `--token-file`. |
+
+**Four findings were wrong, and are corrected in place rather than
+quietly dropped** — the same standard the reviews were written to:
+
+- **C12** was written up as a stack overflow. It is not: the kernel's
+  `ELOOP` limit bounds the walk. The real defect was a 42× inflated
+  trash listing, measured. Severity downgraded, fix kept.
+- **E4** predicted `warden scan` would get faster. It cannot — `scan` has
+  no manifest to carry anything forward, by design. The win is in the
+  refresh path, and it is large.
+- **E11** claimed 32 MiB of resident memory across the hashing pool.
+  Measured: none of it was resident. The allocation was virtual.
+- **E13** predicted 5–15% CPU from the release profile. Measured: noise.
+  The 27–33% size reduction is real; the speed claim was not.
+
+**Three findings were deliberately not fixed**, each with the reasoning
+recorded next to it: the grid virtualisation in E2 (needs
+`egui_extras::TableBuilder` and a visual check no test here can do), the
+`DirEntry::file_type()` half of E8 (would silently stop the shelf walker
+descending through symlinked directories), and the fs-UUID precedence in
+M2 (would silently re-id existing drives — a security nicety bought with
+a catalog that has lost track of real backups).
+
 ## Findings that share a root cause
 
 Fix once, close several:
