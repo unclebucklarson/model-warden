@@ -302,7 +302,7 @@ fn cmd_dups(json: bool) -> ExitCode {
         reclaimable += g.reclaimable;
         println!(
             "{}  {}  ({}, {} reclaimable)",
-            &g.sha256[..12],
+            modelwarden::core::format::short_hash(&g.sha256),
             g.display_name,
             human_size(g.size),
             human_size(g.reclaimable)
@@ -561,7 +561,7 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
     for (key, e) in &matches {
         let ident = key
             .strip_prefix("sha256:")
-            .map(|h| &h[..12])
+            .map(|h| modelwarden::core::format::short_hash(h))
             .unwrap_or("unhashed");
         println!("{}  {}  ({})", ident, e.display_name, human_size(e.size));
         if let Some(p) = key
@@ -572,7 +572,7 @@ fn cmd_where(args: &[String], json: bool) -> ExitCode {
                 "    origin: {}/{} @ {} — fetched {}",
                 p.repo,
                 p.filename,
-                p.revision.as_deref().map(|r| &r[..12.min(r.len())]).unwrap_or("?"),
+                p.revision.as_deref().map(modelwarden::core::format::short_hash).unwrap_or("?"),
                 ago(p.fetched_unix)
             );
         }
@@ -609,7 +609,7 @@ fn resolve_one<'a>(
             for (key, e) in matches.iter().take(10) {
                 let ident = key
                     .strip_prefix("sha256:")
-                    .map(|h| &h[..12])
+                    .map(|h| modelwarden::core::format::short_hash(h))
                     .unwrap_or("unhashed");
                 eprintln!("  {ident}  {}  ({})", e.display_name, human_size(e.size));
             }
@@ -1103,7 +1103,7 @@ fn download_files(repo: &str, parts: &[String], token: Option<&str>) -> ExitCode
                 let l = format!(
                     "fetched {} ({} rev {})",
                     dest.display(),
-                    &hash[..12.min(hash.len())],
+                    modelwarden::core::format::short_hash(&hash),
                     prov.revision.as_deref().unwrap_or("unknown")
                 );
                 jot(&l);

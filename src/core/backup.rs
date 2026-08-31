@@ -503,7 +503,7 @@ pub fn verify(
             report.mismatched.push(f.rel_path.clone());
             on(BackupEvent::Failed {
                 label,
-                error: format!("hash mismatch: bytes on disk are not {}", &expected[..12]),
+                error: format!("hash mismatch: bytes on disk are not {}", crate::core::format::short_hash(&expected)),
             });
         }
     }

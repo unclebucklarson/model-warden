@@ -116,7 +116,13 @@ pub fn register_root(
         Some(id) => id,
         None => {
             let id = match &fs_uuid {
-                Some(u) => format!("ext-{}", &u.replace('-', "").to_lowercase()[..8.min(u.len())]),
+                Some(u) => {
+                    // The bound must be the STRIPPED string's length: a
+                    // dash-heavy or non-ASCII uuid used to panic here.
+                    let hex = u.replace('-', "").to_lowercase();
+                    let n = hex.char_indices().nth(8).map(|(i, _)| i).unwrap_or(hex.len());
+                    format!("ext-{}", &hex[..n])
+                }
                 None => generated_id(&path),
             };
             write_marker(&path, &id)?;

@@ -370,8 +370,8 @@ fn check_download(got: &str, declared: Option<&str>) -> Result<()> {
         Some(want) if got != want => bail!(
             "downloaded bytes do not match the checksum the server declared \
              (wanted {}…, got {}…)",
-            &want[..12.min(want.len())],
-            &got[..12.min(got.len())]
+            crate::core::format::short_hash(want),
+            crate::core::format::short_hash(got)
         ),
         _ => Ok(()),
     }

@@ -268,19 +268,49 @@ pub struct Location {
     pub ino: u64,
 }
 
+/// What a cataloged location is *right now* — warden's three
+/// accessibility states, derived and never stored, because a stored flag
+/// is only a claim about the last scan and drives move between scans.
+///
+/// Keeping these three apart is the whole point: readers that conflate
+/// "the drive is unplugged" with "the file will not open" either drop
+/// offline drives (bytes reported lost that are safe on a shelf) or
+/// promise a restore from a copy that cannot be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocationState {
+    /// The root is attached and the file was readable when last scanned.
+    Present,
+    /// The root is not attached. The bytes travel with it; they are fine.
+    Offline,
+    /// The root IS attached and the file still would not open: a pruned
+    /// blob behind a snapshot symlink, a permission change, a deletion
+    /// by another tool. The one state a backup promise must not count.
+    Unreadable,
+}
+
 impl Inventory {
     pub fn root(&self, id: &str) -> Option<&RootSpec> {
         self.roots.iter().find(|r| r.id == id)
     }
 
-    /// Stored accessibility can go stale the moment a drive is unplugged;
-    /// this re-checks the root's presence right now.
+    /// THE liveness question, asked in one place. Everything that cares
+    /// whether bytes are reachable — coverage, dedup, usage, restore
+    /// source selection — resolves through here, so two views of the
+    /// same catalog can never describe different worlds.
+    pub fn location_state(&self, loc: &Location) -> LocationState {
+        // An unregistered root is treated as offline, not broken: the
+        // same "missing is offline, not gone" rule roots follow.
+        let online = self.root(&loc.root_id).is_some_and(|r| r.path.exists());
+        match (online, loc.accessible) {
+            (false, _) => LocationState::Offline,
+            (true, true) => LocationState::Present,
+            (true, false) => LocationState::Unreadable,
+        }
+    }
+
+    /// Can warden read these bytes right now?
     pub fn live_accessible(&self, loc: &Location) -> bool {
-        loc.accessible
-            && self
-                .root(&loc.root_id)
-                .map(|r| r.path.exists())
-                .unwrap_or(false)
+        self.location_state(loc) == LocationState::Present
     }
 }
 
@@ -328,19 +358,19 @@ pub fn merge(manifests: &[RootManifest]) -> Inventory {
 }
 
 /// Warden's core safety question, per model: is there a copy on a
-/// registered drive? Offline drives count — the bytes exist on that
-/// drive whether or not it is plugged in right now. Shared by
-/// `warden status` and the GUI's coverage display.
-pub fn is_backed_up(entry: &ModelEntry) -> bool {
-    entry
-        .locations
-        .iter()
-        .any(|l| l.kind == RootKind::Removable)
+/// registered drive that could actually be restored from? Offline
+/// drives count — the bytes exist on that drive whether or not it is
+/// plugged in right now — but a copy warden can see and cannot read
+/// does not. Shared by `warden status` and the GUI's coverage display.
+pub fn is_backed_up(inv: &Inventory, entry: &ModelEntry) -> bool {
+    entry.locations.iter().any(|l| {
+        l.kind == RootKind::Removable && inv.location_state(l) != LocationState::Unreadable
+    })
 }
 
 /// The safety headline: (models with a drive copy, total models).
 pub fn backup_coverage(inv: &Inventory) -> (usize, usize) {
-    let backed = inv.models.values().filter(|e| is_backed_up(e)).count();
+    let backed = inv.models.values().filter(|e| is_backed_up(inv, e)).count();
     (backed, inv.models.len())
 }
 
@@ -809,7 +839,13 @@ pub fn dup_groups(inv: &Inventory) -> Vec<DupGroup> {
             continue;
         };
         let mut by_dev: BTreeMap<u64, std::collections::BTreeSet<u64>> = BTreeMap::new();
-        for l in entry.locations.iter().filter(|l| l.accessible && l.dev != 0) {
+        // Live, not "was accessible at the last hash": reclaim is
+        // hardlinking, which needs the filesystem mounted right now.
+        for l in entry
+            .locations
+            .iter()
+            .filter(|l| l.dev != 0 && inv.live_accessible(l))
+        {
             by_dev.entry(l.dev).or_default().insert(l.ino);
         }
         let extra_inodes: u64 = by_dev
@@ -1156,6 +1192,7 @@ mod tests {
 
     #[test]
     fn dup_groups_ignore_hardlinks_and_rank_by_reclaimable() {
+        let mounted = tempfile::tempdir().unwrap();
         let mut models = BTreeMap::new();
         let loc = |root: &str, ino: u64| Location {
             root_id: root.into(),
@@ -1209,7 +1246,15 @@ mod tests {
         let inv = Inventory {
             schema_version: SCHEMA_VERSION,
             generated_unix: 0,
-            roots: vec![],
+            roots: ["a", "b"]
+                .into_iter()
+                .map(|id| RootSpec {
+                    id: id.into(),
+                    kind: RootKind::Shelf,
+                    path: mounted.path().to_path_buf(),
+                    label: None,
+                })
+                .collect(),
             models,
         };
         let groups = dup_groups(&inv);
@@ -1239,18 +1284,139 @@ mod tests {
 
     #[test]
     fn backed_up_means_a_copy_on_a_registered_drive() {
+        // No roots registered here: every drive reads as offline, which
+        // is exactly the "unplugged drive still counts" case.
+        let inv = inv_with(vec![], BTreeMap::new());
         // Only shelf/cache copies: one disk failure loses it.
-        assert!(!is_backed_up(&entry_with(&[
-            (RootKind::Shelf, true),
-            (RootKind::HfHub, true)
-        ])));
+        assert!(!is_backed_up(
+            &inv,
+            &entry_with(&[(RootKind::Shelf, true), (RootKind::HfHub, true)])
+        ));
         // A drive copy counts — even offline: the bytes exist on that
         // drive whether or not it is plugged in right now.
-        assert!(is_backed_up(&entry_with(&[
-            (RootKind::Shelf, true),
-            (RootKind::Removable, false)
-        ])));
-        assert!(is_backed_up(&entry_with(&[(RootKind::Removable, true)])));
+        assert!(is_backed_up(
+            &inv,
+            &entry_with(&[(RootKind::Shelf, true), (RootKind::Removable, false)])
+        ));
+        assert!(is_backed_up(
+            &inv,
+            &entry_with(&[(RootKind::Removable, true)])
+        ));
+    }
+
+    /// One location on a named root, so a test can say exactly which
+    /// root each copy lives on.
+    fn loc_on(root_id: &str, kind: RootKind, accessible: bool) -> Location {
+        Location {
+            root_id: root_id.into(),
+            kind,
+            rel_path: PathBuf::from("m.gguf"),
+            accessible,
+            dev: 0,
+            ino: 0,
+        }
+    }
+
+    fn inv_with(roots: Vec<RootSpec>, models: BTreeMap<String, ModelEntry>) -> Inventory {
+        Inventory {
+            schema_version: SCHEMA_VERSION,
+            generated_unix: 0,
+            roots,
+            models,
+        }
+    }
+
+    #[test]
+    fn a_location_is_present_offline_or_unreadable_and_nothing_else() {
+        let attached = tempfile::tempdir().unwrap();
+        let inv = inv_with(
+            vec![
+                RootSpec { id: "on".into(), kind: RootKind::Removable, path: attached.path().into(), label: None },
+                RootSpec { id: "off".into(), kind: RootKind::Removable, path: attached.path().join("unplugged"), label: None },
+            ],
+            BTreeMap::new(),
+        );
+        use LocationState::*;
+        assert_eq!(inv.location_state(&loc_on("on", RootKind::Removable, true)), Present);
+        assert_eq!(inv.location_state(&loc_on("on", RootKind::Removable, false)), Unreadable);
+        // An unplugged drive is Offline whatever the stored flag says —
+        // the flag describes the last scan, not now.
+        assert_eq!(inv.location_state(&loc_on("off", RootKind::Removable, true)), Offline);
+        assert_eq!(inv.location_state(&loc_on("off", RootKind::Removable, false)), Offline);
+        // Liveness is that one state, not a second opinion.
+        assert!(inv.live_accessible(&loc_on("on", RootKind::Removable, true)));
+        assert!(!inv.live_accessible(&loc_on("off", RootKind::Removable, true)));
+    }
+
+    #[test]
+    fn backup_coverage_never_counts_a_copy_it_knows_is_unreadable() {
+        // The safety headline decided ✓ from `kind == Removable` alone,
+        // so a drive copy that is attached and WILL NOT OPEN — pruned
+        // blob, permission change, deleted behind warden's back —
+        // promised a restore that cannot happen. An *offline* drive is a
+        // different thing and must still count: the bytes travel with it.
+        let attached = tempfile::tempdir().unwrap();
+        let roots = vec![
+            RootSpec { id: "here".into(), kind: RootKind::Removable, path: attached.path().into(), label: None },
+            RootSpec { id: "away".into(), kind: RootKind::Removable, path: attached.path().join("unplugged"), label: None },
+        ];
+        let mut models = BTreeMap::new();
+        let mk = |loc: Location| ModelEntry {
+            size: 1,
+            display_name: "m".into(),
+            meta: None,
+            locations: vec![loc_on("shelf", RootKind::Shelf, true), loc],
+        };
+        models.insert("sha256:present".into(), mk(loc_on("here", RootKind::Removable, true)));
+        models.insert("sha256:offline".into(), mk(loc_on("away", RootKind::Removable, true)));
+        models.insert("sha256:broken".into(), mk(loc_on("here", RootKind::Removable, false)));
+        let inv = inv_with(roots, models);
+
+        assert!(is_backed_up(&inv, &inv.models["sha256:present"]));
+        assert!(is_backed_up(&inv, &inv.models["sha256:offline"]), "offline is not gone");
+        assert!(
+            !is_backed_up(&inv, &inv.models["sha256:broken"]),
+            "an unreadable drive copy is not a backup"
+        );
+        assert_eq!(backup_coverage(&inv), (2, 3));
+    }
+
+    #[test]
+    fn duplicate_reporting_and_family_usage_agree_about_liveness() {
+        // The CLI reads a serialized inventory, so `accessible` is a
+        // claim about the last hash. dup_groups trusted that stale flag
+        // while family_usage re-checked the root: unplug the drive and
+        // the two views described different worlds — one offering to
+        // reclaim bytes on a filesystem that is not mounted.
+        let attached = tempfile::tempdir().unwrap();
+        let roots = vec![RootSpec {
+            id: "away".into(),
+            kind: RootKind::Removable,
+            path: attached.path().join("unplugged"),
+            label: None,
+        }];
+        let mut models = BTreeMap::new();
+        let mut two_copies = |a: u64, b: u64| ModelEntry {
+            size: 100,
+            display_name: "m".into(),
+            meta: None,
+            locations: vec![
+                Location { ino: a, dev: 9, ..loc_on("away", RootKind::Removable, true) },
+                Location { ino: b, dev: 9, ..loc_on("away", RootKind::Removable, true) },
+            ],
+        };
+        models.insert("sha256:copied".into(), two_copies(1, 2));
+        let inv = inv_with(roots, models);
+
+        assert!(
+            dup_groups(&inv).is_empty(),
+            "nothing is reclaimable on an unmounted drive"
+        );
+        assert_eq!(
+            family_usage(&inv)[0].stored_bytes,
+            100,
+            "and usage counts no live copy either"
+        );
     }
 
     #[test]

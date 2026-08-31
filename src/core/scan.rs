@@ -36,6 +36,30 @@ fn is_weights(path: &Path) -> bool {
         .is_some_and(|f| is_weights_filename(&f.to_string_lossy()))
 }
 
+/// Size and reachability for one cataloged file — decided in ONE place.
+///
+/// Shelf entries can be symlinks (a curated shelf of links into a big
+/// drive is a normal layout, and the HF cache builds every snapshot that
+/// way). The fingerprint and the SHA-256 both describe the *target*, so
+/// the size must too: `DirEntry::metadata` does NOT follow links, and
+/// using it made a 5 GB model report the byte length of its own path —
+/// wrong in status, report, the backup preview, the delete confirmation,
+/// and the trash's reclaim figure. When the target is gone the file is
+/// listed at size 0 and `accessible: false`: visible and honestly
+/// broken, never silently dropped.
+fn stat_target(path: &Path) -> (u64, bool) {
+    match std::fs::metadata(path) {
+        Ok(m) if m.is_file() => (m.len(), true),
+        _ => (0, false),
+    }
+}
+
+/// A symlink whose target is missing. `is_file()` follows links and so
+/// answers `false` here, which would drop the entry entirely.
+fn is_dangling_link(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.is_file()
+}
+
 fn is_gguf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
@@ -175,12 +199,11 @@ pub fn hf_hub_models(hub: &Path) -> Vec<ModelFile> {
 }
 
 fn hf_entry(path: &Path, repo: &str, meta: Option<GgufMeta>) -> ModelFile {
-    // Snapshot entries are usually symlinks into blobs/; metadata() follows
-    // them, so it fails when the blob has been pruned even though the
-    // symlink is still there. That file is listed as inaccessible, not
-    // skipped.
-    let accessible = std::fs::metadata(path).is_ok();
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // Snapshot entries are usually symlinks into blobs/, so this is the
+    // same question the shelf asks: how big is the target, and is it
+    // still there? A pruned blob leaves the symlink behind; that file is
+    // listed as inaccessible, not skipped.
+    let (file_size, accessible) = stat_target(path);
     ModelFile {
         meta,
         path: path.to_path_buf(),
@@ -314,13 +337,13 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
         if path.is_dir() {
             walk_gguf(&path, depth + 1, out);
         } else if is_gguf(&path) {
-            let file_size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            let (file_size, accessible) = stat_target(&path);
             out.push(ModelFile {
                 meta: gguf::read_meta(&path).ok(),
                 path,
                 file_size,
                 source: Source::Shelf,
-                accessible: true,
+                accessible,
             });
         }
     }
@@ -343,7 +366,7 @@ fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
         }
         if path.is_dir() {
             emit_dir_as_model(&path, depth + 1, out);
-        } else if path.is_file() {
+        } else if path.is_file() || is_dangling_link(&path) {
             let meta = if is_gguf(&path) {
                 gguf::read_meta(&path).ok()
             } else if is_weights(&path) {
@@ -351,13 +374,13 @@ fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
             } else {
                 None
             };
-            let file_size = e.metadata().map(|m| m.len()).unwrap_or(0);
+            let (file_size, accessible) = stat_target(&path);
             out.push(ModelFile {
                 meta,
                 path,
                 file_size,
                 source: Source::Shelf,
-                accessible: true,
+                accessible,
             });
         }
     }
@@ -431,8 +454,7 @@ fn ollama_models_from_manifest(
         let blob = store.join("blobs").join(digest.replace(':', "-"));
         // A manifest naming a blob that's gone is the same incident class
         // as a pruned HF snapshot: list it, honestly inaccessible.
-        let accessible = blob.is_file();
-        let file_size = std::fs::metadata(&blob).map(|m| m.len()).unwrap_or(0);
+        let (file_size, accessible) = stat_target(&blob);
         out.push(ModelFile {
             meta: gguf::read_meta(&blob).ok(),
             path: blob,
@@ -613,6 +635,41 @@ mod tests {
                 .iter()
                 .all(|m| matches!(&m.source, Source::HfHub { repo } if repo == "unsloth/Test-GGUF"))
         );
+    }
+
+    #[test]
+    fn a_symlinked_model_is_sized_by_its_target() {
+        // A shelf entry can be a symlink to the real file. The scanner
+        // used DirEntry::metadata (does NOT follow), while the
+        // fingerprint and the hash both describe the target — so one
+        // FileRecord claimed size 114 for a 5 MB model, and every size
+        // warden showed for it (status, report, backup preview, the
+        // delete confirmation, the trash's reclaim figure) was wrong by
+        // orders of magnitude.
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join("elsewhere");
+        let shelf = dir.path().join("shelf");
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::create_dir_all(&shelf).unwrap();
+        let bytes = synthetic_gguf("llama", 8192, 15);
+        let real = store.join("real.gguf");
+        std::fs::write(&real, &bytes).unwrap();
+        std::os::unix::fs::symlink(&real, shelf.join("linked.gguf")).unwrap();
+
+        let models = shelf_models(&shelf);
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            models[0].file_size,
+            bytes.len() as u64,
+            "the model's size, not the symlink inode's"
+        );
+        assert!(models[0].accessible);
+
+        // A dangling link is still listed — visible, honestly broken.
+        std::fs::remove_file(&real).unwrap();
+        let models = shelf_models(&shelf);
+        assert_eq!(models.len(), 1);
+        assert!(!models[0].accessible, "a broken link must not read as fine");
     }
 
     #[test]

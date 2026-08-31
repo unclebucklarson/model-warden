@@ -31,6 +31,18 @@ pub fn ago(unix: u64) -> String {
     }
 }
 
+/// The first 12 characters of an identity, for display. Never panics:
+/// hashes are read from manifests on disk (including a drive's own), so
+/// a corrupt or hand-edited one can hold anything at all — and
+/// `&hash[..12]` on a short or non-ASCII value aborted the process,
+/// inside `verify`, which is what the scrub timer runs.
+pub fn short_hash(hash: &str) -> &str {
+    match hash.char_indices().nth(12) {
+        Some((byte_idx, _)) => &hash[..byte_idx],
+        None => hash,
+    }
+}
+
 /// Unix seconds → "YYYY-MM-DD HH:MM:SS" (UTC), no dependencies —
 /// Howard Hinnant's civil-from-days algorithm. Journal lines must stay
 /// readable to a human with cat, forever.
@@ -67,6 +79,19 @@ mod tests {
         assert_eq!(utc_datetime(1_786_912_200), "2026-08-16 20:30:00");
         // Leap-year February.
         assert_eq!(utc_datetime(1_709_164_800), "2024-02-29 00:00:00");
+    }
+
+    #[test]
+    fn short_hashes_never_panic_on_junk() {
+        assert_eq!(short_hash(&"a".repeat(64)), "aaaaaaaaaaaa");
+        assert_eq!(short_hash("abc"), "abc", "shorter than 12");
+        assert_eq!(short_hash(""), "");
+        // Multi-byte characters: byte 12 is mid-character here, which is
+        // precisely what used to abort.
+        // Multi-byte characters: byte 12 lands mid-character here, which
+        // is precisely what used to abort.
+        assert_eq!(short_hash("日本語日本語日本語"), "日本語日本語日本語");
+        assert_eq!(short_hash("日本語日本語日本語日本語日本語").chars().count(), 12);
     }
 
     #[test]

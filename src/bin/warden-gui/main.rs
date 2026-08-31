@@ -823,7 +823,7 @@ impl App {
             let (csz, cbacked) = inv
                 .models
                 .get(child)
-                .map(|e| (e.size, manifest::is_backed_up(e)))
+                .map(|e| (e.size, manifest::is_backed_up(inv, e)))
                 .unwrap_or((0, false));
             let slot = split_extra.entry(parent.clone()).or_insert((0, 1, true));
             slot.0 += csz;
@@ -845,7 +845,7 @@ impl App {
                 InvCol::Size => disp_size(a.0, a.1).cmp(&disp_size(b.0, b.1)),
                 InvCol::Where => where_of(a.1).cmp(&where_of(b.1)),
                 InvCol::Backup => {
-                    manifest::is_backed_up(a.1).cmp(&manifest::is_backed_up(b.1))
+                    manifest::is_backed_up(inv, a.1).cmp(&manifest::is_backed_up(inv, b.1))
                 }
                 InvCol::State => a.2.cmp(&b.2),
             };
@@ -1030,7 +1030,7 @@ impl App {
                                 "origin: {}/{} @ {}",
                                 p.repo,
                                 p.filename,
-                                p.revision.as_deref().map(|r| &r[..12.min(r.len())]).unwrap_or("?")
+                                p.revision.as_deref().map(modelwarden::core::format::short_hash).unwrap_or("?")
                             ));
                         }
                         let shown_name = match split_extra.get(key) {
@@ -1074,7 +1074,7 @@ impl App {
                         ui.label(text(quant_of(entry)));
                         ui.label(text(human_size(disp_size(key, entry))));
                         ui.label(text(where_of(entry)));
-                        let row_backed = manifest::is_backed_up(entry)
+                        let row_backed = manifest::is_backed_up(inv, entry)
                             && split_extra.get(key).map(|(_, _, b)| *b).unwrap_or(true);
                         if row_backed {
                             ui.label("✔").on_hover_text("Has a copy on a registered drive");
@@ -1170,7 +1170,7 @@ impl App {
                 RowAction::BackupDialog(key) => {
                     self.backup_filter = key
                         .strip_prefix("sha256:")
-                        .map(|h| h[..12].to_string())
+                        .map(|h| modelwarden::core::format::short_hash(h).to_string())
                         .unwrap_or(key);
                     self.show_backup = true;
                 }
@@ -1251,7 +1251,7 @@ impl App {
             for g in &self.dups {
                 ui.strong(format!(
                     "{}  {} — {} each, {} reclaimable",
-                    &g.sha256[..12],
+                    modelwarden::core::format::short_hash(&g.sha256),
                     g.display_name,
                     human_size(g.size),
                     human_size(g.reclaimable)
@@ -2053,7 +2053,7 @@ impl App {
                         summary.push(format!(
                             "fetched {} ({})",
                             dest.display(),
-                            &hash[..12.min(hash.len())]
+                            modelwarden::core::format::short_hash(&hash)
                         ));
                     }
                     Err(e) => {
