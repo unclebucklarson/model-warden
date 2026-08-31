@@ -95,6 +95,14 @@ pub fn backup(
     // registered spec.
     man.root = target.clone();
 
+    // What the drive already holds, resolved once: this was a linear
+    // scan of every file on the drive for every model in the catalog.
+    let mut already: std::collections::HashSet<String> = man
+        .files
+        .iter()
+        .filter_map(|f| f.sha256.clone())
+        .collect();
+
     let mut report = BackupReport::default();
     for (key, entry) in &inv.models {
         if let Some(sel) = &expanded
@@ -109,7 +117,7 @@ pub fn backup(
             });
             continue;
         };
-        if man.files.iter().any(|f| f.sha256.as_deref() == Some(hash)) {
+        if already.contains(hash) {
             report.skipped_already += 1;
             continue;
         }
@@ -161,6 +169,10 @@ pub fn backup(
                     accessible: true,
                     verified_unix: Some(manifest::now_unix()),
                 });
+                // Two catalog entries can share one hash (a hardlink, or
+                // the same model in two stores); the set has to learn
+                // about this copy or the second one is copied again.
+                already.insert(hash.to_string());
                 report.copied += 1;
                 report.copied_bytes += entry.size;
                 on(BackupEvent::FileDone {
@@ -284,7 +296,7 @@ pub(crate) fn copy_verified(
     }
     drop(writer);
 
-    let source_hash = hex(&hasher.finalize());
+    let source_hash = crate::core::format::hex(&hasher.finalize());
     if source_hash != expected {
         let _ = std::fs::remove_file(&tmp);
         bail!("source changed since it was cataloged (run `warden hash` again)");
@@ -320,14 +332,6 @@ pub(crate) fn copy_verified(
         return Err(e).with_context(|| format!("finalizing {}", dest.display()));
     }
     identity::Fingerprint::of(dest)
-}
-
-fn hex(digest: &[u8]) -> String {
-    let mut s = String::with_capacity(digest.len() * 2);
-    for b in digest {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
 }
 
 // ---- verify ----

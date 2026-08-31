@@ -48,8 +48,13 @@ impl Fingerprint {
 pub fn sha256_file(path: &Path, mut progress: impl FnMut(u64, u64)) -> Result<String> {
     let md = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let total = md.len();
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut reader = std::io::BufReader::with_capacity(4 * 1024 * 1024, file);
+    // Read straight from the file: a BufReader here wrapped a read
+    // buffer of its own size, and BufReader bypasses its buffer entirely
+    // for reads at or above its capacity — so the second 4 MiB was pure
+    // resident memory, 8 MiB per hashing thread and 32 MiB across the
+    // pool, bought nothing.
+    let mut reader =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; 4 * 1024 * 1024];
     let mut done = 0u64;
@@ -64,12 +69,7 @@ pub fn sha256_file(path: &Path, mut progress: impl FnMut(u64, u64)) -> Result<St
         done += n as u64;
         progress(done, total);
     }
-    let digest = hasher.finalize();
-    let mut hex = String::with_capacity(64);
-    for b in digest {
-        hex.push_str(&format!("{b:02x}"));
-    }
-    Ok(hex)
+    Ok(crate::core::format::hex(&hasher.finalize()))
 }
 
 #[cfg(test)]

@@ -247,8 +247,16 @@ impl App {
     /// while one is running — the activity log says so instead.
     fn spawn(&mut self, label: &str, job: impl FnOnce(&Sender<Msg>) + Send + 'static) {
         if let Some(current) = &self.busy {
-            self.activity
-                .push(format!("queued after {current}: {label}"));
+            // Identical work is not worth doing twice in a row. Fifty
+            // impatient clicks on Update Catalog used to queue fifty full
+            // rescans, each one re-walking every root, and the user had
+            // no way to cancel them.
+            if self.pending_jobs.iter().any(|(l, _)| l == label) || current == label {
+                self.log(format!("{label} is already queued — ignoring the repeat"));
+                return;
+            }
+            let current = current.clone();
+            self.log(format!("queued after {current}: {label}"));
             self.pending_jobs.push_back((label.to_string(), Box::new(job)));
             return;
         }

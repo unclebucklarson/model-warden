@@ -618,9 +618,15 @@ pub fn refresh(
                         f.verified_unix = cf.verified_unix;
                     }
                 }
-                let known: Vec<PathBuf> = s.files.iter().map(|f| f.rel_path.clone()).collect();
-                s.files
-                    .extend(c.files.into_iter().filter(|cf| !known.contains(&cf.rel_path)));
+                let known: std::collections::HashSet<&Path> =
+                    s.files.iter().map(|f| f.rel_path.as_path()).collect();
+                let new: Vec<FileRecord> = c
+                    .files
+                    .iter()
+                    .filter(|cf| !known.contains(cf.rel_path.as_path()))
+                    .cloned()
+                    .collect();
+                s.files.extend(new);
                 Some(s)
             }
             (s, c) => s.or(c),

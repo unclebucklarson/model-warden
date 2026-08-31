@@ -1282,9 +1282,15 @@ fn cmd_trash(args: &[String], json: bool) -> ExitCode {
             // the next `trash empty`.
             let mut expanded: std::collections::BTreeSet<(String, std::path::PathBuf)> =
                 std::collections::BTreeSet::new();
+            // One listing for the whole restore, not one per match.
+            let listing = trash::list(&roots);
             for f in &items {
-                let Some(root) = roots.iter().find(|r| r.id == f.root_id) else { continue };
-                for rel in trash::restore_set(root, &f.rel_path) {
+                let same_root: Vec<_> = listing
+                    .iter()
+                    .filter(|t| t.root_id == f.root_id)
+                    .cloned()
+                    .collect();
+                for rel in trash::restore_set_in(&same_root, &f.rel_path) {
                     expanded.insert((f.root_id.clone(), rel));
                 }
             }

@@ -36,6 +36,19 @@ pub fn ago(unix: u64) -> String {
 /// a corrupt or hand-edited one can hold anything at all — and
 /// `&hash[..12]` on a short or non-ASCII value aborted the process,
 /// inside `verify`, which is what the scrub timer runs.
+/// Lowercase hex for a digest.
+///
+/// This existed twice, both times as `format!("{b:02x}")` in a loop —
+/// 64 heap allocations to produce 64 characters, once per hashed file.
+pub fn hex(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 pub fn short_hash(hash: &str) -> &str {
     match hash.char_indices().nth(12) {
         Some((byte_idx, _)) => &hash[..byte_idx],

@@ -265,6 +265,15 @@ pub fn restore_set(root: &RootSpec, rel: &Path) -> Vec<PathBuf> {
     let td = trash_dir(&root.path);
     let mut all = Vec::new();
     walk(&td, &td, root, &mut all);
+    restore_set_in(&all, rel)
+}
+
+/// The same answer from a trash listing the caller already has.
+///
+/// Restoring a three-part bundle walked the whole trash three times —
+/// once per part — and the projector shortcut below walked it even when
+/// it was about to ignore the result entirely.
+pub fn restore_set_in(all: &[TrashedFile], rel: &Path) -> Vec<PathBuf> {
     let fname = rel
         .file_name()
         .map(|f| f.to_string_lossy().into_owned())
@@ -293,7 +302,7 @@ pub fn restore_set(root: &RootSpec, rel: &Path) -> Vec<PathBuf> {
     }
     let my_split = crate::core::acquire::split_parts(&fname).map(|(p, _, c)| (p.to_string(), c));
     let mut out = vec![rel.to_path_buf()];
-    for f in &all {
+    for f in all {
         if f.rel_path == rel || f.rel_path.parent().map(Path::to_path_buf).unwrap_or_default() != dir {
             continue;
         }
