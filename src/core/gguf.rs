@@ -129,8 +129,15 @@ fn read_string<R: Read>(r: &mut R) -> Result<String> {
     if len > 64 * 1024 * 1024 {
         bail!("implausible string length {len}");
     }
-    let mut buf = vec![0u8; len as usize];
-    read_exact(r, &mut buf)?;
+    // Grown as bytes arrive, never allocated up front: a 40-byte file
+    // declaring a 64 MiB string used to cost 64 MiB of zeroed memory
+    // before the read failed at EOF, and a header may hold up to
+    // kv_count of them.
+    let mut buf = Vec::new();
+    let read = r.take(len).read_to_end(&mut buf)?;
+    if read as u64 != len {
+        bail!("truncated string: wanted {len} bytes, file held {read}");
+    }
     Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 

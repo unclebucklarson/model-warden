@@ -88,6 +88,57 @@ fn with_auth(req: ureq::Request, token: Option<&str>) -> ureq::Request {
 /// The HF token for gated repos, most explicit source first: caller's
 /// (`--token` / the GUI field), warden's config, the env vars the HF
 /// tooling uses, then the token file the `hf` CLI writes on login.
+/// Percent-encode one URL path segment.
+///
+/// URLs were built by interpolating `repo` (from the user) and
+/// `filename` (from the *server's* listing) straight into a format
+/// string. A `?`, `#` or `%` in either silently re-partitions the URL —
+/// a server-supplied filename could append a query or truncate the path.
+/// The host is fixed before the interpolation so this was never SSRF,
+/// but building URLs by concatenating remote input is the wrong default.
+/// `/` is preserved: repo ids and hub filenames are multi-segment paths.
+pub fn url_path(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for b in segment.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// One query-string value.
+fn url_query(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for b in value.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            b' ' => out.push('+'),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
+/// A hub repo id: `org/name`, nothing else. Checked before the id is
+/// put in a URL or used to build a local path.
+pub fn valid_repo(repo: &str) -> bool {
+    let ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+    };
+    match repo.split_once('/') {
+        Some((org, name)) => ok(org) && ok(name) && !name.contains('/'),
+        None => false,
+    }
+}
+
 pub fn resolve_token(explicit: Option<String>, cfg: &crate::core::settings::AppConfig) -> Option<String> {
     explicit
         .filter(|t| !t.trim().is_empty())
@@ -250,7 +301,13 @@ pub fn list_all_files(repo: &str, token: Option<&str>) -> Result<Vec<RemoteFile>
 }
 
 fn repo_api_json(repo: &str, token: Option<&str>) -> Result<serde_json::Value> {
-    let url = format!("https://huggingface.co/api/models/{repo}?blobs=true");
+    // One gate, on the way in: every listing and every download goes
+    // through here, so nothing further down has to wonder whether the id
+    // is a repo or a path fragment.
+    if !valid_repo(repo) {
+        bail!("{repo:?} is not a repo id — expected org/name");
+    }
+    let url = format!("https://huggingface.co/api/models/{}?blobs=true", url_path(repo));
     let resp = match with_auth(agent().get(&url), token).call() {
         Ok(r) => r,
         Err(ureq::Error::Status(401 | 404, _)) => {
@@ -315,10 +372,10 @@ fn suggest_repos(repo: &str, token: Option<&str>) -> Vec<String> {
     let (author, name) = repo.split_once('/').unwrap_or(("", repo));
     let mut url = format!(
         "https://huggingface.co/api/models?search={}&limit=5",
-        name.replace(' ', "+")
+        url_query(name)
     );
     if !author.is_empty() {
-        url.push_str(&format!("&author={author}"));
+        url.push_str(&format!("&author={}", url_query(author)));
     }
     with_auth(agent().get(&url), token)
         .call()
@@ -399,7 +456,11 @@ fn origin_checksum(repo: &str, filename: &str, token: Option<&str>) -> Option<St
         .redirects(0)
         .user_agent(concat!("modelwarden/", env!("CARGO_PKG_VERSION")))
         .build();
-    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        url_path(repo),
+        url_path(filename)
+    );
     let resp = match with_auth(agent.head(&url), token).call() {
         Ok(r) => r,
         // A 3xx with redirects(0) surfaces as Status — its headers are
@@ -435,7 +496,11 @@ pub fn fetch(
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     let tmp = partial_path(&dest);
-    let url = format!("https://huggingface.co/{repo}/resolve/main/{filename}");
+    let url = format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        url_path(repo),
+        url_path(filename)
+    );
     let label = format!("{repo}/{filename}");
 
     // A dropped connection is normal on a 20 GiB transfer: warden retries
@@ -522,7 +587,7 @@ pub fn fetch(
             // moved repos) routinely eat it — the API's sha is the fallback.
             revision = resp.header("x-repo-commit").map(str::to_string).or_else(|| {
                 with_auth(
-                    agent().get(&format!("https://huggingface.co/api/models/{repo}")),
+                    agent().get(&format!("https://huggingface.co/api/models/{}", url_path(repo))),
                     token,
                 )
                 .call()
@@ -932,5 +997,34 @@ mod tests {
         // No checksum offered (small non-LFS files carry a weak etag):
         // proceed rather than fail a perfectly good download.
         assert!(check_download(&good, None).is_ok());
+    }
+
+    #[test]
+    fn remote_filenames_cannot_re_partition_the_url() {
+        // `filename` comes from the SERVER's listing, so it is remote
+        // input being interpolated into a URL. A `?` starts a query, a
+        // `#` truncates the path at a fragment, a `%` can forge an
+        // escape — none of which should be possible from a listing.
+        assert_eq!(url_path("model.gguf"), "model.gguf");
+        assert_eq!(url_path("sub/dir/model-Q4_K_M.gguf"), "sub/dir/model-Q4_K_M.gguf");
+        assert_eq!(url_path("evil?x=1"), "evil%3Fx%3D1");
+        assert_eq!(url_path("evil#frag"), "evil%23frag");
+        assert_eq!(url_path("100%.gguf"), "100%25.gguf");
+        assert_eq!(url_path("a b.gguf"), "a%20b.gguf");
+        // Non-ASCII is encoded per UTF-8 byte.
+        assert_eq!(url_path("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn a_repo_id_is_org_slash_name_and_nothing_else() {
+        assert!(valid_repo("unsloth/Qwen3-30B-GGUF"));
+        assert!(valid_repo("TheBloke/Llama-2-7B.Q4_K_M"));
+        assert!(!valid_repo("noslash"));
+        assert!(!valid_repo("too/many/slashes"));
+        assert!(!valid_repo("/leading"));
+        assert!(!valid_repo("trailing/"));
+        assert!(!valid_repo("../../etc"));
+        assert!(!valid_repo("org/name?x=1"));
+        assert!(!valid_repo("org/name#f"));
     }
 }

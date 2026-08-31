@@ -376,8 +376,17 @@ fn apply_with_min_debris_age(remedy: &Remedy, min_age: std::time::Duration) -> R
             }
             // Exit 0 is a claim, not proof — hf exits 0 saying "Nothing to
             // delete" for repos its scanner can't see. Verify the result.
+            //
+            // `exists()` was the wrong question: it follows symlinks and
+            // reports false for anything it merely cannot stat, so a
+            // path that is still there but unreadable read as "gone" —
+            // precisely the outcome this check exists to catch. Only
+            // NotFound counts as gone.
             if let Some(gone) = expect_gone
-                && gone.exists()
+                && !matches!(
+                    std::fs::symlink_metadata(gone),
+                    Err(ref e) if e.kind() == std::io::ErrorKind::NotFound
+                )
             {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 bail!(
@@ -958,5 +967,35 @@ mod tests {
         assert!(!verification_advisory(&[mk(RootKind::Removable, None)], now).is_empty());
         // Non-drive roots are the scrub's job, not this advisory's.
         assert!(verification_advisory(&[mk(RootKind::Shelf, None)], now).is_empty());
+    }
+
+    #[test]
+    fn an_unreadable_path_is_not_proof_that_it_is_gone() {
+        // The verifier asked `exists()`, which answers false for a path
+        // it merely cannot stat. An owner command that did nothing, on a
+        // directory the user cannot traverse, therefore reported success
+        // — the exact failure this check was written to catch.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let hidden = dir.path().join("locked");
+        std::fs::create_dir(&hidden).unwrap();
+        let still_there = hidden.join("repo");
+        std::fs::create_dir(&still_there).unwrap();
+        // Traversal removed: exists() now says false about a live path.
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(!still_there.exists(), "staging failed — exists() should be fooled here");
+
+        let remedy = Remedy::OwnerCommand {
+            program: "true".into(),
+            args: vec![],
+            expect_gone: Some(still_there.clone()),
+        };
+        let out = apply(&remedy);
+        std::fs::set_permissions(&hidden, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = out.expect_err("a path warden cannot see is not a path it verified gone");
+        assert!(format!("{err:#}").contains("did not act"), "{err:#}");
     }
 }

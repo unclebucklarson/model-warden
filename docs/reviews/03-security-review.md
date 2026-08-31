@@ -189,6 +189,10 @@ anyone named O'Brien.
 
 **Fix:** drop the shell. `Type=oneshot` accepts multiple `ExecStart=`
 lines, so use two, and quote the path per systemd's own escaping rules.
+**Done, 2026-08-31.** Two `ExecStart=` lines, no shell anywhere, the
+path double-quoted with `"` and `\` escaped. `Type=oneshot` runs them in
+order and stops at the first failure, which is what the `&&` meant:
+verify must not run against a catalog that failed to refresh.
 
 ## M2 — Drive identity is a plain text file on the drive
 `src/core/roots.rs:161-165`
@@ -222,7 +226,11 @@ constructing URLs by string concatenation from remote input is the wrong
 default.
 
 **Fix:** percent-encode each path segment, and validate `repo` against
-`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` before use.
+`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$` before use. **Done, 2026-08-31.**
+Both. `url_path` encodes everything outside the unreserved set (keeping
+`/`, since repo ids and hub filenames are multi-segment), `url_query`
+covers the two search parameters, and `valid_repo` gates every listing
+and download at `repo_api_json`, the one door they all pass through.
 
 ## M4 — `--token` on the command line is visible to every local process
 `src/bin/warden.rs:951-955`
@@ -243,7 +251,9 @@ string causes a 64 MiB allocation that is then thrown away on EOF. With
 KV pairs, a hostile file can force repeated large allocations. Bounded
 and not exploitable beyond memory pressure, but the fix is one line:
 allocate incrementally (`take(len).read_to_end`) so the allocation is
-paid only for bytes that actually exist.
+paid only for bytes that actually exist. **Done, 2026-08-31** — and the
+short read is now its own error rather than a silently truncated
+string.
 
 Note the surrounding parser is otherwise well defended: magic and version
 checks, a KV-count cap, `saturating_mul` on array sizes, refusal of
