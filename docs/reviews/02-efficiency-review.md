@@ -294,6 +294,15 @@ A 4 MiB `BufReader` wrapping the file *and* a separate 4 MiB read buffer.
 allocation is pure overhead — 8 MiB resident per hashing thread, 32 MiB
 across the pool, for no benefit. Read directly from the `File`.
 
+**Done, and the stated benefit was wrong.** Measured hashing 1.5 GiB
+across four files with the pool at full width: peak RSS 19,952 KB before,
+20,032 KB after — no difference. The reason is the same one that makes
+the buffer useless: `BufReader` never touches those pages, and untouched
+pages never become resident. The allocation was virtual, not resident.
+The change is still right — an allocation and a layer of indirection for
+nothing — but it saves no memory, and this document should not have put
+a number on something it had not measured.
+
 ### E12. `restore_set` re-walks the entire trash per restored file
 `src/core/trash.rs:231-260` (called per match in
 `src/bin/warden.rs:1250-1262` and per click in the GUI)
@@ -301,6 +310,13 @@ across the pool, for no benefit. Read directly from the `File`.
 Restoring a 3-part bundle walks the whole trash tree three times, then
 `trash::restore` prunes empty dirs with another full walk. Walk once,
 pass the listing.
+
+**Done, 2026-08-31.** `restore_set_in` takes a listing the caller already
+has, and `warden trash restore` builds one for the whole command. The
+projector shortcut also used to walk the tree and then return a result
+that ignored the walk; it returns first now. The prune walk after each
+rename is left as it is: it stops at the first non-empty directory and
+exists only to keep the trash tidy.
 
 ### E13. No release profile
 `Cargo.toml` — no `[profile.release]` section
@@ -333,14 +349,22 @@ credit it with speed.
   allocations per hash — implemented **twice**
   (`identity.rs:62-67`, `backup.rs:297-303`). One shared function writing
   into a pre-sized `String` with `write!`, or a 512-byte lookup table.
+  **Done, 2026-08-31**: `format::hex`, used by both.
 - **E15.** `backup()` scans `man.files` linearly for each catalog entry
   (`backup.rs:106`) — O(n·m) on a drive with many files. Build a
-  `HashSet<&str>` of hashes once.
+  `HashSet<&str>` of hashes once. **Done, 2026-08-31**, and the set
+  learns about each copy as it lands — two catalog entries can share one
+  hash, and without that the second would be copied again.
 - **E16.** The GUI's job queue (`VecDeque<Box<dyn FnOnce>>`) and the
   `Msg` channel are both unbounded. Fifty impatient clicks on "Update
   Catalog" queue fifty full rescans; a fast hash of many small files can
   outrun the 4 Hz drain and pile up messages. Coalesce duplicate job
   labels; drop `Progress` messages older than the newest.
+  **Half done, 2026-08-31**: duplicate job labels are coalesced, so a
+  repeat click is ignored with a line in the log instead of queueing
+  another full rescan. `Progress` is left alone — `drain_messages`
+  already empties the channel every frame and keeps only the last value
+  it sees, so nothing accumulates to drop.
 - **E17.** `Inventory::live_accessible` calls `self.root()` (a linear
   scan of `roots`) and then `path.exists()` (**a syscall**) for every
   location, and it is called inside per-frame loops and inside
