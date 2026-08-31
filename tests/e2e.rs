@@ -121,10 +121,13 @@ fn backup_demote_restore_round_trip_by_label() {
     let backup = e.ok(&["backup", drive_s, "keeper"]);
     assert!(backup.contains("1 copied"), "{backup}");
 
-    // Demote by LABEL with --remove-source: verified move off the shelf.
+    // Demote by LABEL with --remove-source: verified move off the shelf,
+    // with the shelf copy recoverable until the trash is emptied.
     let demote = e.ok(&["archive", "demote", "loner", "--to", "Cold", "--remove-source"]);
-    assert!(demote.contains("removed shelf copy"), "{demote}");
+    assert!(demote.contains("moved to trash"), "{demote}");
     assert!(!e.shelf().join("loner.gguf").exists());
+    let trashed = e.shelf().join(".modelwarden/trash/loner.gguf");
+    assert!(trashed.is_file(), "a verified move must be undoable too");
     // The catalog still knows it — offline is not gone, demoted is not lost.
     let wh = e.ok(&["where", "loner"]);
     assert!(wh.contains("loner"), "{wh}");

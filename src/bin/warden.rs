@@ -41,7 +41,8 @@ Organizing it:
   archive <query>                  keep a cache-owned model on the shelf
   archive demote <query…> --to <path|id|label> [--remove-source]
                                    cold storage: verified move to a drive; the
-                                   shelf copy goes only with --remove-source
+                                   shelf copy goes to the trash (restorable)
+                                   only with --remove-source
   restore <query>                  verified copy from a drive back to the shelf
   dedup [--hardlink]               collapse same-fs duplicate copies in owned
                                    roots (default: dry-run report)
@@ -57,7 +58,7 @@ Organizing it:
 Health, acquisition, and history:
   doctor [--fix]                   store health, every finding explained with a
                                    remedy and its cost; --fix runs the safe ones
-  fetch <org/repo> [pattern] [--token T [--save-token]]
+  fetch <org/repo> [pattern] [--token-file F | --token T [--save-token]]
                                    download from HuggingFace: split sets and one
                                    vision projector travel together, dropped
                                    connections auto-resume, provenance recorded
@@ -703,9 +704,10 @@ fn cmd_archive(args: &[String]) -> ExitCode {
                     let l = format!("demoted {} to {}", e.display_name, out.dest.display());
                     jot(&l);
                     println!("{l}");
-                    if let Some(src) = out.removed_source {
+                    if let Some(src) = out.trashed_source {
                         let l = format!(
-                            "removed shelf copy {} (verified on cold storage first)",
+                            "shelf copy moved to trash: {} (verified on cold storage first; \
+                             `warden trash restore` brings it back)",
                             src.display()
                         );
                         jot(&l);
@@ -719,7 +721,7 @@ fn cmd_archive(args: &[String]) -> ExitCode {
             }
         }
         if !remove_source {
-            println!("shelf copies kept (pass --remove-source to free them)");
+            println!("shelf copies kept (pass --remove-source to move them to the trash)");
         }
         rerun_hash_quietly();
         if failed { ExitCode::FAILURE } else { ExitCode::SUCCESS }
@@ -889,14 +891,38 @@ fn cmd_restore(args: &[String]) -> ExitCode {
 fn cmd_fetch(args: &[String], json: bool) -> ExitCode {
     use modelwarden::core::acquire;
     let Some(repo) = args.get(1).filter(|a| !a.starts_with("--")) else {
-        eprintln!("usage: warden fetch <org/repo> [pattern] [--token T]");
+        eprintln!("usage: warden fetch <org/repo> [pattern] [--token-file F | --token T]");
         return ExitCode::from(2);
     };
     let pattern = args.get(2).filter(|a| !a.starts_with("--"));
-    let cli_token = args
+    // --token-file is the recommended form: --token puts the credential
+    // in argv, readable by any local process via /proc/*/cmdline while
+    // the download runs, and then in the shell's history.
+    let token_file = args
         .iter()
-        .position(|a| a == "--token")
+        .position(|a| a == "--token-file")
         .and_then(|i| args.get(i + 1).cloned());
+    let cli_token = match token_file {
+        Some(p) => match modelwarden::core::acquire::token_from_path(std::path::Path::new(&p)) {
+            Ok(t) => Some(t),
+            Err(e) => {
+                eprintln!("warden: {e:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        None => {
+            if args.iter().any(|a| a == "--token") {
+                eprintln!(
+                    "warden: note — --token is visible to other local processes \
+                     (/proc/*/cmdline) and lands in your shell history; \
+                     --token-file <path> or $HF_TOKEN avoids both"
+                );
+            }
+            args.iter()
+                .position(|a| a == "--token")
+                .and_then(|i| args.get(i + 1).cloned())
+        }
+    };
     let mut cfg_for_token = settings::AppConfig::load(&settings::config_file());
     if let Some(t) = &cli_token
         && args.iter().any(|a| a == "--save-token")

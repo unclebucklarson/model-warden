@@ -454,9 +454,9 @@ impl App {
                 }
                 match modelwarden::core::archive::demote(&inv, &k, e, &target, remove_source, &mut on)
                 {
-                    Ok(out) => lines.push(match out.removed_source {
+                    Ok(out) => lines.push(match out.trashed_source {
                         Some(src) => format!(
-                            "demoted {} → {} — removed {} (verified first)",
+                            "demoted {} → {} — shelf copy to trash: {} (verified first)",
                             e.display_name,
                             out.dest.display(),
                             src.display()

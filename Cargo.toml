@@ -22,7 +22,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 rfd = "0.15"
 sha2 = "0.10"
-thiserror = "2"
 ureq = { version = "2", features = ["json"] }
 
 # Lock liveness probe: kill(pid, 0) on every unix.

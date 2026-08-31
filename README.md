@@ -105,9 +105,9 @@ detected and stolen.
   and both sides are re-hashed against the bytes on disk first.
 - **Bytes are destroyed only by `trash empty`**: deletion is two-stage —
   `delete` renames bundles into the root's trash (restorable), and only
-  the explicit empty destroys them. The other sanctioned removal,
-  `demote --remove-source`, fires only after the cold copy verified — a
-  provably completed move.
+  the explicit empty destroys them. `demote --remove-source` goes the
+  same way: the shelf copy moves to the trash, and only after the cold
+  copy has verified — a provably completed move that is still undoable.
 - **Offline is not gone**: unplugged drives keep their manifests; the
   catalog answers "it's on the drive labeled archive1".
 

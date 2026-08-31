@@ -46,6 +46,10 @@ pub fn promote(
         .canonicalize()
         .with_context(|| format!("resolving {}", src_loc.rel_path.display()))?;
 
+    // Foreign-store kinds only: the owned kinds were rejected twenty
+    // lines up, and `unreachable!("guarded above")` here trusted a
+    // reader to remember that. This asks the same question the guard
+    // asks, in the arm that would have panicked.
     let (subdir, file_name) = match src_loc.kind {
         RootKind::Ollama => {
             let safe = entry.display_name.replace([':', '/'], "-");
@@ -71,7 +75,11 @@ pub fn promote(
                 },
             )
         }
-        RootKind::Shelf | RootKind::Removable => unreachable!("guarded above"),
+        RootKind::Shelf | RootKind::Removable => bail!(
+            "{} is already on owned storage ({})",
+            entry.display_name,
+            src_loc.kind.label()
+        ),
     };
     let dir = shelf_root.join(subdir);
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
@@ -94,12 +102,15 @@ pub fn promote(
 
 pub struct DemoteOutcome {
     pub dest: PathBuf,
-    pub removed_source: Option<PathBuf>,
+    /// Where the shelf copy went — inside the shelf's trash, restorable
+    /// until `trash empty`. `None` when the source was kept.
+    pub trashed_source: Option<PathBuf>,
 }
 
 /// Verified copy of a shelf-resident content to a cold root; with
-/// `remove_source`, the shelf copy is deleted afterwards — strictly after
-/// the cold copy's read-back hash matched. Updates the cold root's carried
+/// `remove_source`, the shelf copy goes to the shelf's trash afterwards
+/// — strictly after the cold copy's read-back hash matched, and
+/// restorable until `trash empty`. Updates the cold root's carried
 /// manifest so the drive stays self-describing.
 pub fn demote(
     inv: &Inventory,
@@ -172,15 +183,20 @@ pub fn demote(
     man.generated_unix = manifest::now_unix();
     manifest::save_json(&man, &mpath)?;
 
-    let removed_source = if remove_source {
-        std::fs::remove_file(&src).with_context(|| format!("removing {}", src.display()))?;
-        Some(src)
+    let trashed_source = if remove_source {
+        // Into the trash, not into oblivion. `delete` has been undoable
+        // since M15 while this — the operation described to the user as
+        // a *verified move* — destroyed the shelf copy outright, which
+        // is the wrong way round: if the cold drive fails minutes later
+        // there was nothing to go back to. A rename costs nothing, and
+        // `trash empty` stays the only thing that destroys bytes.
+        Some(crate::core::trash::trash_one(&src_root.path, &src_loc.rel_path)?)
     } else {
         None
     };
     Ok(DemoteOutcome {
         dest,
-        removed_source,
+        trashed_source,
     })
 }
 
@@ -416,17 +432,31 @@ mod tests {
         // Without remove_source: copy exists, original stays.
         let out = demote(&inv, key, entry, &cold_spec, false, &mut |_| {}).unwrap();
         assert!(out.dest.is_file());
-        assert!(out.removed_source.is_none());
+        assert!(out.trashed_source.is_none());
         assert!(shelf.path().join("Big/warm.gguf").is_file());
         // The drive's carried manifest knows the file.
         let carried =
             manifest::load_manifest(&backup::target_manifest_path(cold.path())).unwrap();
         assert_eq!(carried.files.len(), 1);
 
-        // With remove_source: idempotent on the copy, then the shelf copy goes.
+        // With remove_source: idempotent on the copy, then the shelf copy
+        // moves to the trash — a verified move must be at least as
+        // recoverable as a delete, and `trash empty` stays the only thing
+        // that destroys bytes.
         let out2 = demote(&inv, key, entry, &cold_spec, true, &mut |_| {}).unwrap();
-        assert_eq!(out2.removed_source.as_deref(), Some(shelf.path().join("Big/warm.gguf").as_path()));
-        assert!(!shelf.path().join("Big/warm.gguf").exists());
+        assert!(!shelf.path().join("Big/warm.gguf").exists(), "off the shelf");
+        let trashed = out2.trashed_source.expect("the shelf copy is recoverable");
+        assert!(trashed.is_file(), "still on disk, in the trash");
+        assert!(
+            trashed.starts_with(crate::core::trash::trash_dir(shelf.path())),
+            "{}",
+            trashed.display()
+        );
+        assert_eq!(
+            identity::sha256_file(&trashed, |_, _| {}).unwrap(),
+            key.strip_prefix("sha256:").unwrap(),
+            "and it is the same bytes"
+        );
         assert!(out2.dest.is_file(), "cold copy intact");
     }
 }

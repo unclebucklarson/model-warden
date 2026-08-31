@@ -237,6 +237,11 @@ the "verified move" recoverable if the destination drive fails minutes
 later, at essentially zero cost. Today `delete` is undoable and
 `demote --remove-source` is not, which is the wrong way round given the
 second one is advertised as the safe operation.
+**Done, 2026-08-31.** The per-file trash move was extracted as
+`trash::trash_one` and both paths use it; `DemoteOutcome::removed_source`
+is now `trashed_source`, and the CLI, the GUI, the README, the users
+guide and the tutorial all say where the copy went. `trash empty`
+remains the only thing that destroys bytes.
 
 ---
 
@@ -269,6 +274,11 @@ A model nested four directories deep in a shelf is invisible, and nothing
 tells the user. For a tool whose entire purpose is "know what you have",
 silently not-knowing is the worst failure mode. Either raise the cap
 substantially, or report directories that were skipped for depth.
+**Done, 2026-08-31**: one `MAX_DEPTH = 16` shared by all three walkers.
+Raised rather than reported — the deepest real shape warden handles is
+four or five levels (an HF snapshot with per-quant subfolders and a
+`1_Pooling/` companion), so at sixteen the cap only ever stops something
+pathological, and a report about a limit nothing reaches is noise.
 
 ### C14. Wrong string's length in a slice bound
 `src/core/roots.rs:119`
@@ -304,17 +314,23 @@ errors.
 
 - **C17.** `thiserror` is declared in `Cargo.toml:25` and never used
   anywhere in `src/`. Dead dependency: compile time and audit surface for
-  nothing.
-- **C18.** `src/bin/warden-gui/main.rs`: `self.activity` has 15 push
+  nothing. **Removed, 2026-08-31.**
+- **C18.** *(Done, 2026-08-31 — one `log()` keeps the last ~500 lines.)*
+  `src/bin/warden-gui/main.rs`: `self.activity` has 15 push
   sites and no cap. A long session grows it without bound and re-lays
   out every line every frame (see the efficiency review, E2).
 - **C19.** `src/core/archive.rs:74` `unreachable!("guarded above")` — a
   panic keyed to a guard twenty lines away. Restructure so the compiler
-  enforces it.
+  enforces it. **Done, 2026-08-31**: the arm asks the same question the
+  guard asks and returns an error instead of aborting. The compiler
+  cannot prove the relationship here without restructuring the location
+  search itself, so the fix is to stop punishing a reader's memory with a
+  panic, not to pretend the invariant is type-level.
 - **C20.** No `[profile.release]` in `Cargo.toml`: no LTO, no
   `codegen-units = 1`, no `strip`. Shipped binaries carry symbols
   (measured: `warden` 6.33 MB → 4.92 MB stripped; `warden-gui`
-  34.43 MB → 25.72 MB).
+  34.43 MB → 25.72 MB). **Done, 2026-08-31** — see efficiency E13 for the
+  after-the-fact numbers (27% and 33%).
 
 ---
 

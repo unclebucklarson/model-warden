@@ -95,46 +95,56 @@ pub fn move_to_trash(inv: &Inventory, del: &BTreeSet<String>) -> Result<TrashRep
                 report.offline.push((entry.display_name.clone(), label));
                 continue;
             }
-            // A catalog path must be genuinely inside its root before
-            // anything is moved: deletion is not a place to trust input.
-            let Ok(safe_rel) = manifest::sanitize_rel(&loc.rel_path) else {
+            let Ok(dst) = trash_one(&root.path, &loc.rel_path) else {
                 continue;
             };
-            let src = root.path.join(&safe_rel);
-            let mut dst = trash_dir(&root.path).join(&safe_rel);
-            if let Some(dir) = dst.parent() {
-                std::fs::create_dir_all(dir)
-                    .with_context(|| format!("creating {}", dir.display()))?;
-            }
-            // A same-named file already in the trash never blocks a delete
-            // and is never overwritten — the new arrival gets a counter
-            // BEFORE the extension ("model.1.gguf", never "model.gguf.1"),
-            // so a later restore yields a name the scanner still catalogs.
-            let base = safe_rel
-                .file_name()
-                .map(|f| f.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".into());
-            let mut n = 1;
-            while dst.exists() {
-                let name = match base.rsplit_once('.') {
-                    Some((stem, ext)) => format!("{stem}.{n}.{ext}"),
-                    None => format!("{base}.{n}"),
-                };
-                dst = dst.with_file_name(name);
-                n += 1;
-            }
-            crate::core::fsx::rename_noreplace(&src, &dst)
-                .with_context(|| format!("moving {} to trash", src.display()))?;
-            // Rename preserves mtime, but the trash listing derives its
-            // "trashed N ago" age from it — stamp now, or a year-old file
-            // deleted today reads as ancient and safe to destroy.
-            if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&dst) {
-                let _ = f.set_modified(std::time::SystemTime::now());
-            }
-            report.trashed.push((entry.display_name.clone(), dst.clone()));
+            report.trashed.push((entry.display_name.clone(), dst));
         }
     }
     Ok(report)
+}
+
+/// Move one file inside an owned root into that root's trash, and
+/// return where it landed. Nothing is destroyed: this is a rename.
+///
+/// Shared by `delete` and by `demote --remove-source`, so the one
+/// operation advertised as the *safe* move is as recoverable as the one
+/// advertised as a deletion.
+pub fn trash_one(root_path: &Path, rel: &Path) -> Result<PathBuf> {
+    // A catalog path must be genuinely inside its root before anything
+    // is moved: deletion is not a place to trust input.
+    let safe_rel = manifest::sanitize_rel(rel)?;
+    let src = root_path.join(&safe_rel);
+    let mut dst = trash_dir(root_path).join(&safe_rel);
+    if let Some(dir) = dst.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    // A same-named file already in the trash never blocks a delete and is
+    // never overwritten — the new arrival gets a counter BEFORE the
+    // extension ("model.1.gguf", never "model.gguf.1"), so a later
+    // restore yields a name the scanner still catalogs.
+    let base = safe_rel
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    let mut n = 1;
+    while dst.exists() {
+        let name = match base.rsplit_once('.') {
+            Some((stem, ext)) => format!("{stem}.{n}.{ext}"),
+            None => format!("{base}.{n}"),
+        };
+        dst = dst.with_file_name(name);
+        n += 1;
+    }
+    crate::core::fsx::rename_noreplace(&src, &dst)
+        .with_context(|| format!("moving {} to trash", src.display()))?;
+    // Rename preserves mtime, but the trash listing derives its "trashed
+    // N ago" age from it — stamp now, or a year-old file deleted today
+    // reads as ancient and safe to destroy.
+    if let Ok(f) = std::fs::OpenOptions::new().append(true).open(&dst) {
+        let _ = f.set_modified(std::time::SystemTime::now());
+    }
+    Ok(dst)
 }
 
 /// The owner commands a deletion would surface, for previewing in a

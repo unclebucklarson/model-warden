@@ -167,9 +167,10 @@ These invariants hold everywhere, in both the GUI and CLI:
    automatically spared. Otherwise, space reclaim is *hardlinking* —
    making two directory entries share one copy of the bytes (see 2.6) —
    after re-hashing both files to prove they are still identical; and an
-   *archive with move* (`demote --remove-source`) deletes the original
-   **only after** the new copy's bytes have been read back from the
-   destination and hash-verified.
+   *archive with move* (`demote --remove-source`) moves the original to
+   the trash **only after** the new copy's bytes have been read back from
+   the destination and hash-verified — so even a verified move can be
+   walked back until you empty the trash.
 2. **Every copy is verified end-to-end.** Copies are written to a temporary
    `.partial` name, hashed as written, read back from the destination and
    hashed *again*, and only then renamed into place. A power cut mid-copy
@@ -472,9 +473,10 @@ that write take the single-instance lock automatically.
   is untouched; you've just made sure a pruner can't take the model away.
 - **`warden archive demote <query…> --to <path|root-id|label> [--remove-source]`**
   — *demote*: move one or many models to cold storage in one command. A verified copy lands on the
-  drive and is recorded in the drive's carried manifest; the shelf copy is
-  deleted only if you passed `--remove-source`, and only after the drive
-  copy's read-back hash matched.
+  drive and is recorded in the drive's carried manifest; the shelf copy
+  moves to the shelf's trash only if you passed `--remove-source`, and
+  only after the drive copy's read-back hash matched. It stays restorable
+  with `warden trash restore` until you empty the trash.
 - **`warden restore <query>`** — the return leg: verified copy from a drive
   back to the shelf. The drive is never modified. If the drive is offline,
   the refusal names which drive to plug in.
@@ -502,7 +504,7 @@ hash prefix matters when two different models share a name.
   copies there, and how many existed nowhere else and will leave the
   catalog. A working drive can always be re-registered and re-cataloged
   later. GUI: the **Forget…** button in File → Storage Roots….
-- **`warden fetch <org/repo> [pattern] [--token T [--save-token]]`** —
+- **`warden fetch <org/repo> [pattern] [--token-file F | --token T [--save-token]]`** —
   download from Hugging Face into the shelf. With just a repo, lists its
   GGUF files and sizes; with a pattern matching exactly one file, downloads
   it — automatically expanding split models to all their parts. Resumes
@@ -625,9 +627,12 @@ warden fetch BAAI/bge-small-en-v1.5 --snapshot   # whole directory, one bundle
 ```
 
 **Gated repos** (licenses you must accept, e.g. Llama-family) need a
-Hugging Face token: pass `--token hf_…` once with `--save-token` to store
-it, or set `$HF_TOKEN`, or log in with the `hf` CLI — warden finds any of
-them. In the GUI, the download dialog has a masked token field with a
+Hugging Face token. The safest form is `--token-file <path>` pointing at
+a file only you can read; you can also set `$HF_TOKEN`, or log in with
+the `hf` CLI, and warden finds any of them. `--token hf_…` works and can
+be stored with `--save-token`, but the token is then visible to every
+other process on the machine while the download runs, and lands in your
+shell history — warden says so when you use it. In the GUI, the download dialog has a masked token field with a
 "Remember" checkbox. Note: Hugging Face answers *401* both for gated repos
 and for repo ids that don't exist — warden tells you which it thinks it is,
 with did-you-mean suggestions for likely typos.
@@ -740,6 +745,62 @@ Identity is still the hash, so nothing breaks; it's just slower.
 registered drive. To uninstall completely, delete the binaries and those
 folders — your models are untouched (they were never warden's to move
 without asking).
+
+---
+
+## 8.1 What warden trusts, and what it doesn't
+
+Short section, worth reading once. These are deliberate choices, not
+oversights, and knowing them tells you when to be careful.
+
+**Your Hugging Face token.** Warden stores it, if you ask it to, in
+`~/.config/modelwarden/config.json` with mode `0600` — owner-readable
+only, and it tightens the file's permissions at every startup if
+something loosened them. Pass it with **`--token-file <path>`** rather
+than `--token hf_…`: an argument on the command line is visible to every
+other process on the machine through `/proc/*/cmdline` while the download
+runs, and afterwards it sits in your shell's history file. `$HF_TOKEN`
+and the GUI's masked field are fine too. Warden prints a reminder if you
+use `--token` anyway.
+
+**A drive's claim about which drive it is.** A registered drive is
+identified by its filesystem UUID when the kernel offers one, and
+otherwise by a small marker file, `.modelwarden/root-id`, that warden
+writes on the drive. The marker is what lets a drive keep its identity
+across remounts and across machines — and it is a plain file, so a drive
+carrying a *copy* of another drive's marker presents as that drive.
+Warden refuses to register an id it already knows, which limits this to
+"a prepared disk mounted where your real backup drive normally goes"
+rather than a silent takeover. If you plug in disks you did not prepare,
+check `warden roots list` before trusting a backup report.
+
+**A drive's manifest.** Every drive carries its own catalog so it stays
+readable without warden. That file is *not* trusted: paths in it are
+checked to be inside the drive before anything acts on them, and records
+naming files that are absent or the wrong size are dropped rather than
+believed.
+
+**The `hf` and `ollama` commands.** Cleaning a foreign store is done by
+asking that tool's own CLI, found on your `PATH` at the moment it runs.
+No shell is involved and arguments are passed as a list, so there is
+nothing to inject — but a writable directory earlier in your `PATH` could
+substitute those binaries, which is ordinary `PATH` hygiene rather than
+anything specific to warden. Warden never trusts the exit code either: it
+re-checks that the thing is actually gone.
+
+**HTTPS certificates.** Warden trusts a certificate bundle compiled into
+the binary rather than your system's trust store. That makes downloads
+behave identically everywhere and immune to a broken local store, at the
+cost of one real limitation: **an intercepting corporate proxy will fail
+to connect**, and picking up new root certificates means updating warden.
+If downloads fail on a managed network with a certificate error, that is
+why.
+
+**The journal and catalog name your files.** `~/.local/state/modelwarden/`
+and the operations journal contain the full path of every model on the
+machine. Both are written `0600` in a `0700` directory. On a shared
+machine that is the difference between "someone can see my model
+collection" and not.
 
 ---
 

@@ -209,6 +209,16 @@ takeover, but the trust assumption should be documented and the fs-UUID
 check should be preferred over the marker when both are available (today
 the marker wins unconditionally, `roots.rs:115-125`).
 
+**Documented, not changed, 2026-08-31.** The trust assumption is now in
+the users guide. Preferring the fs-UUID over the marker is *not* done and
+should not be done casually: the marker is the whole reason a drive keeps
+its identity across a remount, across a filesystem that reports no UUID,
+and across machines, so flipping the precedence would silently re-id
+existing drives — turning a security nicety into a catalog that has lost
+track of real backups. If this is worth hardening, the shape is a doctor
+finding that reports a marker/fs-UUID disagreement, not a change of
+precedence.
+
 ## M3 — URL path segments are interpolated without encoding
 `src/core/acquire.rs:374`, `:253`, `:308`
 
@@ -240,6 +250,10 @@ by any user via `/proc/*/cmdline` for the process's lifetime, and into
 shell history. The GUI's masked field and `$HF_TOKEN` are both fine; the
 CLI flag should be documented as the insecure option, and ideally offer
 `--token-file` or a stdin prompt as the recommended path.
+**Done, 2026-08-31.** `--token-file <path>` added and documented as the
+recommended form; `--token` still works and now prints why it is the
+worse one. The users guide gained a "What warden trusts, and what it
+doesn't" section covering this along with M2, L1b and L1d.
 
 ## M5 — Unbounded allocation from a crafted GGUF header
 `src/core/gguf.rs:126-134`
@@ -281,6 +295,10 @@ nested arrays, and a global header ceiling. This is the one gap.
   rather than the system store, so enterprise MITM proxies fail and root
   updates require a warden release. Correct default for reproducibility;
   worth a documented `--ca-bundle` escape hatch if users complain.
+  **Documented, 2026-08-31**: the users guide now says plainly that an
+  intercepting proxy will fail and why. No flag yet — adding one means
+  accepting a user-supplied trust anchor, which deserves a real request
+  behind it rather than a speculative one.
 - **L1e.** `trash::empty` (`trash.rs:310`) calls `remove_dir_all` on a
   path derived from a root in the config. With the config group-writable
   (H3), another group member can point a root at a directory whose

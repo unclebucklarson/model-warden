@@ -91,6 +91,18 @@ fn meta_of(path: &Path, fp: Option<Fingerprint>, known: MetaCache) -> Option<Ggu
     known(path, fp).unwrap_or_else(|| gguf::read_meta(path).ok())
 }
 
+/// How deep a walk goes before it stops.
+///
+/// This was 3, which silently hid any model nested four directories
+/// down: for a tool whose whole job is "know what you have", not
+/// knowing and not saying so is the worst failure mode there is. The
+/// cap exists only to bound pathological trees — a symlink chain, a
+/// mount loop — so it belongs far above any real layout rather than
+/// just above the common one. The deepest real shape warden handles is
+/// an HF snapshot with per-quant subfolders and a `1_Pooling/`
+/// companion, four or five levels; sixteen is out of the way.
+const MAX_DEPTH: usize = 16;
+
 /// A dot-entry is never part of a model: `.gitattributes`, `.cache/`,
 /// `.no_exist/`, and — critically on the shelf — `.modelwarden/trash/`,
 /// or a deleted model re-catalogs on the rescan that follows its own
@@ -280,7 +292,7 @@ fn collect_snapshot(
     others: &mut Vec<PathBuf>,
     has_weights: &mut bool,
 ) {
-    if depth > 3 {
+    if depth > MAX_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -373,7 +385,7 @@ pub fn hf_repo_from_dirname(dirname: &str) -> Option<String> {
 }
 
 fn walk_gguf(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<ModelFile>) {
-    if depth > 3 {
+    if depth > MAX_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -412,7 +424,7 @@ fn walk_gguf(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<ModelFile
 /// Every file under a weights-model directory, skipping warden's own
 /// metadata and dotfiles.
 fn emit_dir_as_model(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<ModelFile>) {
-    if depth > 3 {
+    if depth > MAX_DEPTH {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else {
@@ -702,6 +714,22 @@ mod tests {
                 .iter()
                 .all(|m| matches!(&m.source, Source::HfHub { repo } if repo == "unsloth/Test-GGUF"))
         );
+    }
+
+    #[test]
+    fn a_deeply_filed_model_is_still_found() {
+        // The walk stopped at depth 3 and said nothing about it, so a
+        // model filed a few folders down simply did not exist as far as
+        // warden was concerned — no error, no warning, no row.
+        let shelf = tempfile::tempdir().unwrap();
+        let deep = shelf
+            .path()
+            .join("by-vendor/meta/llama-3/70b/quants/Q4_K_M");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("m.gguf"), synthetic_gguf("llama", 8192, 15)).unwrap();
+        let models = shelf_models(shelf.path());
+        assert_eq!(models.len(), 1, "six levels down is a filing choice, not a hiding place");
+        assert_eq!(models[0].meta.as_ref().unwrap().architecture.as_deref(), Some("llama"));
     }
 
     #[test]

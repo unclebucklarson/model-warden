@@ -158,6 +158,17 @@ pub fn resolve_token(explicit: Option<String>, cfg: &crate::core::settings::AppC
         })
 }
 
+/// Read a token out of a file the user points at.
+///
+/// `--token hf_…` puts the credential in `argv`, where any local process
+/// can read it from `/proc/*/cmdline` for the life of the download, and
+/// in the shell's history file afterwards. A file the user controls the
+/// mode of leaks neither.
+pub fn token_from_path(path: &Path) -> Result<String> {
+    token_from_file(path)
+        .with_context(|| format!("no token in {}", path.display()))
+}
+
 fn token_from_file(path: &Path) -> Option<String> {
     let t = std::fs::read_to_string(path).ok()?;
     let t = t.trim();

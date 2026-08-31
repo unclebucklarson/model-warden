@@ -413,9 +413,10 @@ right?
 
 Models you want to *keep but not keep here*. **Demote** is a **verified
 move** to a drive: verified copy first, recorded in the drive's carried
-manifest, and only then — only because you said `--remove-source` — is
-the shelf copy deleted. Deletion happens strictly *after* the bytes
-provably exist elsewhere.
+manifest, and only then — only because you said `--remove-source` — does
+the shelf copy move to the trash. It happens strictly *after* the bytes
+provably exist elsewhere, and even then nothing is destroyed: the shelf
+copy waits in `.modelwarden/trash/` until you empty it.
 
 ```sh
 wt archive demote tinyllama-Q8 nano-embed --to "Practice Drive" --remove-source
@@ -445,7 +446,8 @@ no pruner can take it.
 restore, shelf again too.
 
 🧠 **Check yourself:** (1) What must happen before `--remove-source`
-deletes anything? (2) Why does restore leave the drive untouched?
+touches the shelf copy, and where does that copy actually go? (2) Why
+does restore leave the drive untouched?
 
 ---
 
