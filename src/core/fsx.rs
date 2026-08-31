@@ -102,6 +102,21 @@ pub fn temp_sibling(dest: &Path, suffix: &str) -> PathBuf {
     dest.with_file_name(name)
 }
 
+
+/// Descend into this entry during a directory walk?
+///
+/// A real directory, yes. A *symlinked* directory, no. Following one
+/// turns an unbounded walk into a stack overflow (trash::walk recursed
+/// with no cap) or an endless loop with unbounded memory growth
+/// (ollama_models pushes onto an explicit stack) the moment a link
+/// points at an ancestor — and a hostile drive can put such a link in
+/// warden's own trash directory. The trees warden walks without a depth
+/// cap are its own trash and another tool's own store; nothing
+/// legitimate in either is a link to a directory.
+pub fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -242,15 +242,25 @@ second one is advertised as the safe operation.
 
 ## S3 — real but bounded
 
-### C12. Unbounded recursion and symlink loops
+### C12. Symlink loops are walked repeatedly, inflating the trash listing
 `src/core/trash.rs:200-221`, `src/core/scan.rs:372-386`
 
 `trash::walk` recurses with no depth cap and follows symlinks via
-`p.is_dir()`; a symlink loop under a trash directory is a stack overflow
-(process abort). `ollama_models` uses an explicit stack — no overflow —
-but also follows symlinks, so a loop is an infinite loop with unbounded
-memory growth. `collect_snapshot`, `walk_gguf` and `emit_dir_as_model`
-are capped at depth 3 and are safe.
+`p.is_dir()`; `ollama_models` walks an explicit stack and follows them
+too. A symlink pointing at an ancestor is therefore walked repeatedly.
+`collect_snapshot`, `walk_gguf` and `emit_dir_as_model` are capped at
+depth 3 and are safe.
+
+**Correction (verified while fixing, 2026-08-31).** The heading and
+severity here were revised. This was first written up as a stack overflow / unbounded loop. It is neither: the
+kernel refuses to resolve a path with more than ~40 symlink components
+(`ELOOP`), so the walk terminates on its own. The real defect is a
+*wrong answer*, measured with the pre-fix walk against a trash directory
+holding one file and one loop link: **42 entries listed for that one
+file**, the deepest at `deep/loop/…/deep/kept.gguf`. That is 42× its
+bytes in the reclaim figure the Empty-Trash confirmation shows, and 42
+redundant manifest parses on the Ollama side. Downgrade the severity;
+keep the fix.
 
 ### C13. The depth-3 scan cap hides models silently
 `src/core/scan.rs:292`, `:322`, `:199`
@@ -365,8 +375,11 @@ group is independently shippable.
 
 **Group 5 — robustness.**
 11. **C6** verify continues past I/O errors (new `unreadable` bucket).
-12. **C12** depth cap + visited-inode set in `trash::walk` and
-    `ollama_models`.
+12. **C12** depth cap, and stop descending through symlinked
+    directories, in `trash::walk` and `ollama_models`. (A visited-inode
+    set was the original proposal; refusing to follow linked directories
+    at all is simpler and is the right policy for these two trees —
+    warden's own trash and another tool's own store.)
 13. **C13** raise or report the scan depth limit.
 14. **C16** `exists()` → `symlink_metadata()`.
 

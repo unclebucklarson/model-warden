@@ -472,6 +472,62 @@ impl RefreshEvent {
 /// persist per-root manifests, and merge ALL stored manifests (offline roots
 /// included) into the inventory. Returns the merged inventory.
 /// Callers pass `roots::discover_roots(&cfg)`.
+/// When to make hashing progress durable during a long run.
+///
+/// Checkpointing after every finished file made the resume guarantee
+/// cost O(n²) bytes: a 600-file root serialised its entire manifest 600
+/// times and did 1,800 renames, and every one of those writes was
+/// another window in which the manifest could be caught half-written.
+///
+/// The guarantee that actually matters is "an interrupted hash resumes
+/// near where it stopped", and an interval delivers it: any file that
+/// takes longer than `INTERVAL` to hash — which is every file big
+/// enough for its loss to hurt — checkpoints when it lands. Only work
+/// done in the last few seconds, i.e. small files, can be repeated. The
+/// first finished file always checkpoints, both so an early crash is
+/// never a total loss and so an unwritable state dir is discovered at
+/// the start of a long run rather than at the end of it. The caller
+/// writes once more on completion regardless.
+pub struct Checkpoint {
+    last: Option<std::time::Instant>,
+    since: usize,
+}
+
+impl Default for Checkpoint {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Checkpoint {
+    /// Files that may accumulate between writes.
+    pub const EVERY: usize = 32;
+    /// Work that may be repeated after an interruption.
+    pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new() -> Self {
+        Self { last: None, since: 0 }
+    }
+
+    /// Call once per finished file; `true` means "make it durable now".
+    pub fn tick(&mut self) -> bool {
+        self.tick_at(std::time::Instant::now())
+    }
+
+    pub fn tick_at(&mut self, now: std::time::Instant) -> bool {
+        self.since += 1;
+        let due = match self.last {
+            None => true,
+            Some(last) => self.since >= Self::EVERY || now.duration_since(last) >= Self::INTERVAL,
+        };
+        if due {
+            self.last = Some(now);
+            self.since = 0;
+        }
+        due
+    }
+}
+
 pub fn refresh(
     specs: &[RootSpec],
     state: &Path,
@@ -568,6 +624,7 @@ pub fn refresh(
             .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
             .min(4);
         let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut checkpoint = Checkpoint::new();
         let (etx, erx) = std::sync::mpsc::channel::<HashMsg>();
         std::thread::scope(|s| {
             for _ in 0..threads {
@@ -620,10 +677,14 @@ pub fn refresh(
                     }
                     HashMsg::Done { m_i, f_i, hex, label, secs } => {
                         manifests[m_i].files[f_i].sha256 = Some(hex);
-                        // Checkpoint first, report second: crash after
-                        // this line and the hash is already durable.
-                        let m = &manifests[m_i];
-                        let _ = save_json(m, &manifest_path(state, &m.root.id));
+                        // Checkpoint first, report second: when this
+                        // file is one the policy makes durable, the
+                        // hash is on disk before its completion is
+                        // announced.
+                        if checkpoint.tick() {
+                            let m = &manifests[m_i];
+                            let _ = save_json(m, &manifest_path(state, &m.root.id));
+                        }
                         on(RefreshEvent::HashDone { label, secs });
                     }
                     HashMsg::Failed { label, error } => {
@@ -1396,7 +1457,7 @@ mod tests {
             label: None,
         }];
         let mut models = BTreeMap::new();
-        let mut two_copies = |a: u64, b: u64| ModelEntry {
+        let two_copies = |a: u64, b: u64| ModelEntry {
             size: 100,
             display_name: "m".into(),
             meta: None,
@@ -1437,6 +1498,26 @@ mod tests {
             .insert("sha256:cc".into(), entry_with(&[(RootKind::Ollama, true)]));
         assert_eq!(backup_coverage(&inv), (1, 3));
     }
+    #[test]
+    fn checkpoints_are_paced_by_time_not_taken_per_file() {
+        let t0 = std::time::Instant::now();
+        let mut cp = Checkpoint::new();
+        // The first finished file is always made durable: an early
+        // crash is never a total loss, and a state dir warden cannot
+        // write to is discovered now, not after an hour of hashing.
+        assert!(cp.tick_at(t0));
+        // Small files that land in a burst do NOT each rewrite the
+        // whole manifest — that was O(n²) bytes over a large root.
+        for _ in 1..Checkpoint::EVERY {
+            assert!(!cp.tick_at(t0));
+        }
+        assert!(cp.tick_at(t0), "a full batch is worth making durable");
+        assert!(!cp.tick_at(t0), "and the count starts over");
+        // A file slow enough for its loss to hurt checkpoints on time,
+        // whatever the count: that is the resume guarantee.
+        assert!(cp.tick_at(t0 + Checkpoint::INTERVAL));
+    }
+
     #[test]
     fn hashing_checkpoints_each_file_and_reports_every_job() {
         use crate::core::gguf::tests::synthetic_gguf;

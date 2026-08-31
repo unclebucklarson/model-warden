@@ -201,12 +201,28 @@ pub fn list(roots: &[RootSpec]) -> Vec<TrashedFile> {
     out
 }
 
+/// The trash holds moved bundles: a safetensors container is the
+/// deepest thing in it, and those are a handful of levels. A cap this
+/// far above the real shape only ever stops something pathological.
+const TRASH_MAX_DEPTH: usize = 16;
+
 fn walk(dir: &Path, base: &Path, root: &RootSpec, out: &mut Vec<TrashedFile>) {
+    walk_at(dir, base, root, 0, out)
+}
+
+fn walk_at(dir: &Path, base: &Path, root: &RootSpec, depth: usize, out: &mut Vec<TrashedFile>) {
+    if depth > TRASH_MAX_DEPTH {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for e in entries.flatten() {
         let p = e.path();
-        if p.is_dir() {
-            walk(&p, base, root, out);
+        if crate::core::fsx::is_real_dir(&p) {
+            walk_at(&p, base, root, depth + 1, out);
+        } else if p.is_dir() {
+            // A symlink to a directory: not descended into (that is the
+            // loop), and not a trashed file either. Skipped entirely.
+            continue;
         } else if let Ok(md) = e.metadata() {
             out.push(TrashedFile {
                 root_id: root.id.clone(),
@@ -546,5 +562,32 @@ mod tests {
             owner_removal_command("x", RootKind::Shelf, Path::new("m.gguf")),
             None
         );
+    }
+
+    #[test]
+    fn a_symlink_loop_in_the_trash_does_not_take_the_process_down() {
+        // `walk` recursed with no depth cap and descended through
+        // `is_dir()`, which follows links. One link pointing at an
+        // ancestor — and a drive carries its own trash directory, so it
+        // can arrive with one — got walked over and over until the
+        // kernel's own symlink limit stopped it: measured at 42 listings
+        // of ONE trashed file, which is 42x its bytes in the trash total
+        // the Empty-Trash confirmation shows the user.
+        let root_dir = tempfile::tempdir().unwrap();
+        let td = trash_dir(root_dir.path());
+        std::fs::create_dir_all(td.join("deep")).unwrap();
+        std::fs::write(td.join("deep/kept.gguf"), b"bytes").unwrap();
+        std::os::unix::fs::symlink(&td, td.join("deep/loop")).unwrap();
+
+        let root = RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: root_dir.path().to_path_buf(),
+            label: None,
+        };
+        let mut out = Vec::new();
+        walk(&td, &td, &root, &mut out);
+        let names: Vec<_> = out.iter().map(|f| f.rel_path.display().to_string()).collect();
+        assert_eq!(names, vec!["deep/kept.gguf"], "the real file, once, and no loop");
     }
 }

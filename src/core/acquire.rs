@@ -300,7 +300,11 @@ fn files_from_siblings(
 /// scanner, which never catalogs dotfiles.
 pub fn snapshot_set(all: &[RemoteFile]) -> Vec<RemoteFile> {
     all.iter()
-        .filter(|f| !f.filename.split('/').any(|c| c.starts_with('.')))
+        .filter(|f| {
+            !f.filename
+                .split('/')
+                .any(crate::core::scan::is_dot_entry)
+        })
         .cloned()
         .collect()
 }

@@ -60,6 +60,16 @@ fn is_dangling_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.is_file()
 }
 
+/// A dot-entry is never part of a model: `.gitattributes`, `.cache/`,
+/// `.no_exist/`, and — critically on the shelf — `.modelwarden/trash/`,
+/// or a deleted model re-catalogs on the rescan that follows its own
+/// deletion. `acquire::snapshot_set` applies the same rule to a
+/// `--snapshot` fetch, so this is the one place the rule lives: a repo
+/// must not have different contents depending on how it arrived.
+pub fn is_dot_entry(name: &str) -> bool {
+    name.starts_with('.')
+}
+
 fn is_gguf(path: &Path) -> bool {
     path.extension()
         .is_some_and(|x| x.eq_ignore_ascii_case("gguf"))
@@ -233,6 +243,9 @@ fn collect_snapshot(
     };
     for f in entries.flatten() {
         let path = f.path();
+        if is_dot_entry(&f.file_name().to_string_lossy()) {
+            continue;
+        }
         if path.is_dir() {
             collect_snapshot(&path, depth + 1, ggufs, others, has_weights);
         } else if is_gguf(&path) {
@@ -328,10 +341,7 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
     }
     for e in entries {
         let path = e.path();
-        // Dot-entries are never models — critically including
-        // `.modelwarden/trash/`, or deleted models would re-catalog on
-        // the rescan that follows every delete.
-        if e.file_name().to_string_lossy().starts_with('.') {
+        if is_dot_entry(&e.file_name().to_string_lossy()) {
             continue;
         }
         if path.is_dir() {
@@ -360,8 +370,7 @@ fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
     };
     for e in entries.flatten() {
         let path = e.path();
-        let name = e.file_name().to_string_lossy().into_owned();
-        if name.starts_with('.') {
+        if is_dot_entry(&e.file_name().to_string_lossy()) {
             continue;
         }
         if path.is_dir() {
@@ -402,7 +411,7 @@ pub fn ollama_models(store: &Path) -> Vec<ModelFile> {
         };
         for e in entries.flatten() {
             let path = e.path();
-            if path.is_dir() {
+            if crate::core::fsx::is_real_dir(&path) {
                 stack.push(path);
             } else {
                 ollama_models_from_manifest(store, &manifests, &path, &mut out);
@@ -635,6 +644,48 @@ mod tests {
                 .iter()
                 .all(|m| matches!(&m.source, Source::HfHub { repo } if repo == "unsloth/Test-GGUF"))
         );
+    }
+
+    #[test]
+    fn a_cached_snapshot_holds_what_a_fetched_one_would() {
+        // snapshot_set documented itself as excluding dotfiles
+        // "mirroring the scanner", but collect_snapshot had no such
+        // filter: a safetensors repo cataloged .gitattributes when found
+        // in the cache, while the same repo fetched with --snapshot did
+        // not contain it. Same model, different contents, depending on
+        // how it arrived.
+        let hub = tempfile::tempdir().unwrap();
+        let snap = hub.path().join("models--org--Embed/snapshots/rev1");
+        std::fs::create_dir_all(snap.join(".cache/huggingface")).unwrap();
+        for f in ["model.safetensors", "tokenizer.json", ".gitattributes"] {
+            std::fs::write(snap.join(f), b"x").unwrap();
+        }
+        std::fs::write(snap.join(".cache/huggingface/download.metadata"), b"x").unwrap();
+
+        let mut names: Vec<String> = hf_hub_models(hub.path())
+            .iter()
+            .map(|m| m.path.strip_prefix(&snap).unwrap().display().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["model.safetensors", "tokenizer.json"]);
+
+        // And the downloader, given the same listing, agrees exactly.
+        use crate::core::acquire::{RemoteFile, snapshot_set};
+        let remote: Vec<RemoteFile> = [
+            "model.safetensors",
+            "tokenizer.json",
+            ".gitattributes",
+            ".cache/huggingface/download.metadata",
+        ]
+        .iter()
+        .map(|f| RemoteFile { filename: (*f).into(), size: Some(1) })
+        .collect();
+        let mut fetched: Vec<String> = snapshot_set(&remote)
+            .into_iter()
+            .map(|f| f.filename)
+            .collect();
+        fetched.sort();
+        assert_eq!(names, fetched, "the cache and the download must agree");
     }
 
     #[test]
