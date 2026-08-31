@@ -19,11 +19,32 @@ pub fn journal_path(state_dir: &Path) -> PathBuf {
 /// Append one line, timestamped now. Best-effort by design: journaling
 /// must never fail an operation that already succeeded.
 pub fn record(state_dir: &Path, line: &str) {
-    record_at(state_dir, now_unix(), line);
+    record_all(state_dir, std::slice::from_ref(&line));
 }
 
+/// Append several lines in one open.
+///
+/// The GUI journals from `drain_messages`, which runs on the render
+/// thread, and a long job produces a line per file: that was a
+/// `create_dir_all` + open + write + close for every one of them,
+/// interleaved with frame rendering. Batching a drain costs one open
+/// instead of hundreds. The file is deliberately not held open across
+/// the session — the journal is the user's to rotate or delete, and a
+/// held descriptor would keep a deleted one alive.
+pub fn record_all(state_dir: &Path, lines: &[&str]) {
+    record_all_at(state_dir, now_unix(), lines);
+}
+
+#[cfg(test)]
 fn record_at(state_dir: &Path, unix: u64, line: &str) {
+    record_all_at(state_dir, unix, std::slice::from_ref(&line));
+}
+
+fn record_all_at(state_dir: &Path, unix: u64, lines: &[&str]) {
     use std::io::Write;
+    if lines.is_empty() {
+        return;
+    }
     let _ = crate::core::settings::create_private_dir(state_dir);
     let path = journal_path(state_dir);
     let mut opts = std::fs::OpenOptions::new();
@@ -34,8 +55,13 @@ fn record_at(state_dir: &Path, unix: u64, line: &str) {
         // The journal names every model path on the machine.
         opts.mode(0o600);
     }
-    if let Ok(mut f) = opts.open(&path) {
-        let _ = writeln!(f, "{}\t{}", utc_datetime(unix), line);
+    if let Ok(f) = opts.open(&path) {
+        let mut w = std::io::BufWriter::new(f);
+        let stamp = utc_datetime(unix);
+        for line in lines {
+            let _ = writeln!(w, "{stamp}\t{line}");
+        }
+        let _ = w.flush();
     }
 }
 
@@ -103,5 +129,22 @@ mod tests {
         assert_eq!(all.len(), 2, "{all:?}");
         assert!(all[0].1.contains("with\ttab") || all[0].1.contains("with tab"), "{all:?}");
         assert!(all[1].1.contains("garbage"), "{all:?}");
+    }
+
+    #[test]
+    fn a_batch_appends_every_line_in_order() {
+        let state = tempfile::tempdir().unwrap();
+        record(state.path(), "first");
+        record_all(state.path(), &["second", "third"]);
+        record(state.path(), "fourth");
+        let lines: Vec<String> = tail(state.path(), None)
+            .into_iter()
+            .map(|(_, l)| l)
+            .collect();
+        assert_eq!(lines, ["first", "second", "third", "fourth"]);
+        // An empty batch must not create or touch anything.
+        let before = std::fs::read_to_string(journal_path(state.path())).unwrap();
+        record_all(state.path(), &[]);
+        assert_eq!(std::fs::read_to_string(journal_path(state.path())).unwrap(), before);
     }
 }

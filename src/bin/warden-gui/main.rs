@@ -258,7 +258,7 @@ impl App {
     fn start_job(&mut self, label: &str, job: Box<dyn FnOnce(&Sender<Msg>) + Send>) {
         self.last_error = None; // a new action supersedes the banner
         self.busy = Some(label.to_string());
-        self.activity.push(format!("{label}…"));
+        self.log(format!("{label}…"));
         let tx = self.tx.clone();
         std::thread::spawn(move || job(&tx));
     }
@@ -581,15 +581,33 @@ impl App {
         });
     }
 
+    /// One activity line, with the panel kept to a bounded length.
+    ///
+    /// `activity` was pushed to from fifteen sites and trimmed by none,
+    /// so a long session (a snapshot fetch, a large hash) grew it without
+    /// limit and re-laid-out every historical line on every repaint. The
+    /// journal is the durable record; this panel is the recent view.
+    fn log(&mut self, line: String) {
+        const KEEP: usize = 500;
+        self.activity.push(line);
+        if self.activity.len() > KEEP * 2 {
+            self.activity.drain(..self.activity.len() - KEEP);
+        }
+    }
+
     fn drain_messages(&mut self) {
+        // Journal lines are collected and written once at the end of the
+        // drain: this runs on the render thread, and a long job produces
+        // a line per file.
+        let mut journal: Vec<String> = Vec::new();
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 Msg::Progress(line) => self.progress = Some(line),
                 Msg::Activity(line) => {
                     // The activity panel, persisted: every durable line is
                     // also an operations-journal entry.
-                    modelwarden::core::journal::record(&settings::state_dir(), &line);
-                    self.activity.push(line);
+                    journal.push(line.clone());
+                    self.log(line);
                 }
                 Msg::RemoteFiles(files) => {
                     self.fetch_models = modelwarden::core::acquire::group_listing(&files);
@@ -608,21 +626,25 @@ impl App {
                 }
                 Msg::Finished(line) => {
                     if !line.is_empty() {
-                        modelwarden::core::journal::record(&settings::state_dir(), &line);
+                        journal.push(line.clone());
                     }
-                    self.activity.push(line);
+                    self.log(line);
                     self.busy = None;
                     self.progress = None;
                 }
                 Msg::Error(line) => {
                     let line = format!("error: {line}");
-                    modelwarden::core::journal::record(&settings::state_dir(), &line);
+                    journal.push(line.clone());
                     self.last_error = Some(line.clone());
-                    self.activity.push(line);
+                    self.log(line);
                     self.busy = None;
                     self.progress = None;
                 }
             }
+        }
+        if !journal.is_empty() {
+            let refs: Vec<&str> = journal.iter().map(String::as_str).collect();
+            modelwarden::core::journal::record_all(&settings::state_dir(), &refs);
         }
         // A finished job hands the worker to the next in line.
         if self.busy.is_none()
@@ -801,26 +823,51 @@ impl App {
         let mut actions: Vec<RowAction> = Vec::new();
         let (sort_col, sort_asc) = (self.inv_sort_col, self.inv_sort_asc);
         let mut sort_clicked: Option<InvCol> = None;
-        let quant_of = |e: &manifest::ModelEntry| {
-            e.meta
-                .as_ref()
-                .and_then(|g| g.quantization.clone())
-                .unwrap_or_default()
-        };
-        let where_of = |e: &manifest::ModelEntry| {
-            let mut kinds: Vec<&str> = e.locations.iter().map(|l| l.kind.label()).collect();
-            kinds.sort();
-            kinds.dedup();
-            kinds.join(" + ")
-        };
-        // Rows sorted by the chosen column (ties break on name), with the
-        // live-location count precomputed once per row.
-        let mut rows: Vec<_> = inv
+        // Everything the sort, the filter and the cells need, derived
+        // once per row. The comparator used to call these per comparison
+        // — and `where_of` builds a Vec, sorts it, dedups it and joins
+        // it into a String — so an O(n log n) sort meant that many
+        // allocations, on every repaint.
+        struct Row<'a> {
+            key: &'a String,
+            entry: &'a manifest::ModelEntry,
+            live: usize,
+            quant: String,
+            places: String,
+            backed: bool,
+            /// Cold = every copy is on a registered (cold) root. Those
+            /// models leave the Active view but never the catalog.
+            cold: bool,
+            /// Name, quant, locations and hash key, lowercased once for
+            /// the filter box.
+            haystack: String,
+        }
+        let mut rows: Vec<Row> = inv
             .models
             .iter()
             .map(|(k, e)| {
                 let live = e.locations.iter().filter(|l| inv.live_accessible(l)).count();
-                (k, e, live)
+                let quant = e
+                    .meta
+                    .as_ref()
+                    .and_then(|g| g.quantization.clone())
+                    .unwrap_or_default();
+                let mut kinds: Vec<&str> = e.locations.iter().map(|l| l.kind.label()).collect();
+                kinds.sort();
+                kinds.dedup();
+                let places = kinds.join(" + ");
+                let haystack =
+                    format!("{} {quant} {places} {k}", e.display_name).to_lowercase();
+                Row {
+                    key: k,
+                    entry: e,
+                    live,
+                    quant,
+                    places,
+                    backed: manifest::is_backed_up(inv, e),
+                    cold: e.locations.iter().all(|l| l.kind == RootKind::Removable),
+                    haystack,
+                }
             })
             .collect();
         // The "required by" relation comes from core — the single source
@@ -847,44 +894,48 @@ impl App {
         for (parent, slot) in split_extra.iter_mut() {
             slot.0 += inv.models.get(parent).map(|e| e.size).unwrap_or(0);
         }
-        let disp_size = |k: &String, e: &manifest::ModelEntry| {
-            split_extra.get(k).map(|(s, _, _)| *s).unwrap_or(e.size)
-        };
+        let disp_size = |r: &Row| split_extra.get(r.key).map(|(s, _, _)| *s).unwrap_or(r.entry.size);
         let is_child = |k: &String| parents_of.contains_key(k) || split_of.contains_key(k);
 
         rows.sort_by(|a, b| {
             let ord = match sort_col {
-                InvCol::Name => a.1.display_name.to_lowercase().cmp(&b.1.display_name.to_lowercase()),
-                InvCol::Quant => quant_of(a.1).cmp(&quant_of(b.1)),
-                InvCol::Size => disp_size(a.0, a.1).cmp(&disp_size(b.0, b.1)),
-                InvCol::Where => where_of(a.1).cmp(&where_of(b.1)),
-                InvCol::Backup => {
-                    manifest::is_backed_up(inv, a.1).cmp(&manifest::is_backed_up(inv, b.1))
-                }
-                InvCol::State => a.2.cmp(&b.2),
+                InvCol::Name => a.haystack.cmp(&b.haystack),
+                InvCol::Quant => a.quant.cmp(&b.quant),
+                InvCol::Size => disp_size(a).cmp(&disp_size(b)),
+                InvCol::Where => a.places.cmp(&b.places),
+                InvCol::Backup => a.backed.cmp(&b.backed),
+                InvCol::State => a.live.cmp(&b.live),
             };
             let ord = if sort_asc { ord } else { ord.reverse() };
-            ord.then_with(|| a.1.display_name.cmp(&b.1.display_name))
+            ord.then_with(|| a.entry.display_name.cmp(&b.entry.display_name))
         });
 
-
-        // Cold-stored = every copy lives on a registered (cold) root. Those
-        // models leave the Active view but never the catalog.
-        let is_cold = |e: &manifest::ModelEntry| {
-            e.locations.iter().all(|l| l.kind == RootKind::Removable)
+        // Which rows hang under which parent, resolved once. Both the
+        // cold-count and the display loop used to answer this by
+        // scanning every row for every row — O(n^2) closure calls per
+        // repaint, which at a few thousand models dwarfed the sort.
+        let mut children_of: std::collections::BTreeMap<&String, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for (i, r) in rows.iter().enumerate() {
+            if let Some(parent) = parents_of
+                .get(r.key)
+                .and_then(|ps| ps.first())
+                .or_else(|| split_of.get(r.key))
+            {
+                children_of.entry(parent).or_default().push(i);
+            }
+        }
+        let kids_of = |key: &String| -> &[usize] {
+            children_of.get(key).map(Vec::as_slice).unwrap_or_default()
         };
+
+
         let cold_count = rows
             .iter()
-            .filter(|(k, e, _)| {
-                !is_child(k)
-                    && is_cold(e)
-                    && rows
-                        .iter()
-                        .filter(|(ck, _, _)| {
-                            parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
-                                || split_of.get(*ck) == Some(*k)
-                        })
-                        .all(|(_, ce, _)| is_cold(ce))
+            .filter(|r| {
+                !is_child(r.key)
+                    && r.cold
+                    && kids_of(r.key).iter().all(|i| rows[*i].cold)
             })
             .count();
         ui.horizontal(|ui| {
@@ -907,13 +958,7 @@ impl App {
             }
         });
         let filter = self.inv_filter.trim().to_lowercase();
-        let row_matches = |k: &String, e: &manifest::ModelEntry| {
-            filter.is_empty()
-                || e.display_name.to_lowercase().contains(&filter)
-                || quant_of(e).to_lowercase().contains(&filter)
-                || where_of(e).to_lowercase().contains(&filter)
-                || k.to_lowercase().contains(&filter)
-        };
+        let row_matches = |r: &Row| filter.is_empty() || r.haystack.contains(&filter);
 
         // Final display order: each primary model followed by its indented
         // companions (a companion shows under its first parent in sort
@@ -924,65 +969,58 @@ impl App {
             key: &'a String,
             entry: &'a manifest::ModelEntry,
             live: usize,
+            quant: &'a str,
+            places: &'a str,
             required_by: Option<String>,
             kids: usize,
             expanded: bool,
         }
+        fn disp<'a>(
+            r: &'a Row<'a>,
+            required_by: Option<String>,
+            kids: usize,
+            expanded: bool,
+        ) -> DispRow<'a> {
+            DispRow {
+                key: r.key,
+                entry: r.entry,
+                live: r.live,
+                quant: &r.quant,
+                places: &r.places,
+                required_by,
+                kids,
+                expanded,
+            }
+        }
         let mut display: Vec<DispRow> = Vec::new();
-        for (k, e, live) in &rows {
-            if is_child(k) {
+        for r in &rows {
+            if is_child(r.key) {
                 continue; // rendered under its parent below
             }
-            let children: Vec<_> = rows
-                .iter()
-                .filter(|(ck, _, _)| {
-                    parents_of.get(*ck).and_then(|ps| ps.first()) == Some(*k)
-                        || split_of.get(*ck) == Some(*k)
-                })
-                .collect();
+            let children = kids_of(r.key);
             // Active view: a group leaves only when EVERY member is cold —
             // a shelf-resident projector must not vanish because its
             // parent model was demoted.
-            if !self.inv_show_all
-                && is_cold(e)
-                && children.iter().all(|(_, ce, _)| is_cold(ce))
-            {
+            if !self.inv_show_all && r.cold && children.iter().all(|i| rows[*i].cold) {
                 continue;
             }
-            if !row_matches(k, e) && !children.iter().any(|(ck, ce, _)| row_matches(ck, ce)) {
+            if !row_matches(r) && !children.iter().any(|i| row_matches(&rows[*i])) {
                 continue;
             }
-            let expanded = !filter.is_empty() || self.inv_expanded.contains(*k);
-            display.push(DispRow {
-                key: k,
-                entry: e,
-                live: *live,
-                required_by: None,
-                kids: children.len(),
-                expanded,
-            });
+            let expanded = !filter.is_empty() || self.inv_expanded.contains(r.key);
+            display.push(disp(r, None, children.len(), expanded));
             if expanded {
-                for (ck, ce, clive) in children {
-                    let note = if split_of.get(*ck).is_some() {
-                        format!(
-                            "part of {}",
-                            e.display_name
-                        )
+                for c in children.iter().map(|i| &rows[*i]) {
+                    let note = if split_of.get(c.key).is_some() {
+                        format!("part of {}", r.entry.display_name)
                     } else {
-                        let req: Vec<&str> = parents_of[*ck]
+                        let req: Vec<&str> = parents_of[c.key]
                             .iter()
                             .filter_map(|p| inv.models.get(p).map(|pe| pe.display_name.as_str()))
                             .collect();
                         format!("required by {}", req.join(", "))
                     };
-                    display.push(DispRow {
-                        key: ck,
-                        entry: ce,
-                        live: *clive,
-                        required_by: Some(note),
-                        kids: 0,
-                        expanded: false,
-                    });
+                    display.push(disp(c, Some(note), 0, false));
                 }
             }
         }
@@ -1020,7 +1058,7 @@ impl App {
                     header(ui, "State", InvCol::State);
                     ui.strong("");
                     ui.end_row();
-                    for DispRow { key, entry, live, required_by, kids, expanded } in display {
+                    for DispRow { key, entry, live, quant, places, required_by, kids, expanded } in display {
                         let offline_only = live == 0;
                         let text = |s: String| {
                             if offline_only {
@@ -1085,9 +1123,11 @@ impl App {
                                     .on_hover_text(hover.join("\n"));
                             }
                         }
-                        ui.label(text(quant_of(entry)));
-                        ui.label(text(human_size(disp_size(key, entry))));
-                        ui.label(text(where_of(entry)));
+                        ui.label(text(quant.to_string()));
+                        ui.label(text(human_size(
+                            split_extra.get(key).map(|(s, _, _)| *s).unwrap_or(entry.size),
+                        )));
+                        ui.label(text(places.to_string()));
                         let row_backed = manifest::is_backed_up(inv, entry)
                             && split_extra.get(key).map(|(_, _, b)| *b).unwrap_or(true);
                         if row_backed {
@@ -1431,7 +1471,7 @@ impl App {
             return;
         }
         let Some(inv) = self.inv.clone() else {
-            self.activity.push("no catalog yet — File → Update Catalog first".into());
+            self.log("no catalog yet — File → Update Catalog first".into());
             self.show_cold = false;
             return;
         };
@@ -2215,8 +2255,8 @@ impl App {
             if cfg.hf_token.as_deref() != Some(t.as_str()) {
                 cfg.hf_token = Some(t.clone());
                 match cfg.save(&settings::config_file()) {
-                    Ok(()) => self.activity.push("token saved to config".into()),
-                    Err(e) => self.activity.push(format!("error saving token: {e:#}")),
+                    Ok(()) => self.log("token saved to config".into()),
+                    Err(e) => self.log(format!("error saving token: {e:#}")),
                 }
             }
         }
@@ -2250,20 +2290,23 @@ impl App {
             };
             match parts {
                 Ok(parts) => {
-                    if parts.len() > 1 {
-                        self.activity.push(format!("split model: {} parts", parts.len()));
-                    }
+                    let split_note =
+                        (parts.len() > 1).then(|| format!("split model: {} parts", parts.len()));
                     let before = parts.len();
                     let parts = acquire::with_projectors(all, parts);
-                    for extra in &parts[before..] {
-                        self.activity.push(format!(
+                    let extras: Vec<String> = parts[before..].to_vec();
+                    if let Some(note) = split_note {
+                        self.log(note);
+                    }
+                    for extra in &extras {
+                        self.log(format!(
                             "vision projector included (required for images): {extra}"
                         ));
                     }
                     self.spawn_fetch(repo, parts, explicit_token.clone());
                     open = false;
                 }
-                Err(e) => self.activity.push(format!("error: {e:#}")),
+                Err(e) => self.log(format!("error: {e:#}")),
             }
         }
         self.show_fetch = open;
@@ -2577,16 +2620,16 @@ impl App {
                     cfg.discover_stores = self.settings_discover;
                     match cfg.save(&settings::config_file()) {
                         Ok(()) => {
-                            self.activity.push(
+                            self.log(
                                 "settings saved — File → Update Catalog to rescan".into(),
                             );
                             self.show_settings = false;
                             return;
                         }
-                        Err(e) => self.activity.push(format!("error saving settings: {e:#}")),
+                        Err(e) => self.log(format!("error saving settings: {e:#}")),
                     }
                 }
-                Err(e) => self.activity.push(format!("settings not saved: {e:#}")),
+                Err(e) => self.log(format!("settings not saved: {e:#}")),
             }
         }
         self.show_settings = open;
@@ -2674,7 +2717,7 @@ impl App {
                             Ok(root)
                         }) {
                             Ok(root) => {
-                                self.activity.push(format!(
+                                self.log(format!(
                                     "registered {} as {} — File → Update Catalog to catalog it",
                                     root.path.display(),
                                     root.id
@@ -2682,7 +2725,7 @@ impl App {
                                 self.roots_add_path.clear();
                                 self.roots_add_label.clear();
                             }
-                            Err(e) => self.activity.push(format!("error: {e:#}")),
+                            Err(e) => self.log(format!("error: {e:#}")),
                         }
                     }
                 });

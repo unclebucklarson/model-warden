@@ -108,6 +108,21 @@ it without limit and re-lays out every historical line every frame. The
 journal is the durable record now, so the in-memory log can safely keep
 the last ~500 lines.
 
+**Status, 2026-08-31.** The activity cap landed: every one of the fifteen
+push sites now goes through one `log()` that keeps the last ~500 lines,
+and the journal remains the durable record.
+
+**The grid virtualisation is deliberately deferred.** `ScrollArea::
+show_rows` wants a uniform row height and a flat row count; the
+inventory is an `egui::Grid` whose column widths adapt to the content
+actually laid out, so feeding it only the visible rows makes the columns
+jitter as you scroll. Doing it properly means `egui_extras::TableBuilder`
+— a new dependency and a rewrite of the pane — and the result is a visual
+change that no test here can verify. It is worth doing when someone can
+look at the window; it should not be done blind. Real cost today: 57
+rows. The threshold where it matters is the same few-hundred-row mark as
+E1, which is now fixed.
+
 **Fix:** `show_rows` for the inventory and trash grids; cap `activity` at
 a few hundred entries with a `VecDeque`.
 
