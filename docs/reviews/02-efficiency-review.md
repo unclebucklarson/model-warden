@@ -66,6 +66,22 @@ Order of magnitude, with L ≈ 1.5 locations per model:
 | 500 | ~10⁷ — visible stutter while scrolling |
 | 2,000 | ~10⁹ — the tab is unusable |
 
+**Measured, 2026-08-31** (synthetic catalog, split-part filenames, four
+models per directory; `companion_parents` + `split_primary_of`, the pair
+the inventory tab wanted on every repaint):
+
+| Catalog size | before | after the index |
+|---|---|---|
+| 100 | 0.69 ms | 0.28 ms |
+| 500 | 14.7 ms | 0.99 ms |
+| 2,000 | 233.7 ms | 4.5 ms |
+
+The 500-model figure is the interesting one: 14.7 ms per frame is
+already over a 60 Hz frame budget on its own, so the stutter predicted
+below starts well before the catalog gets large. Both fixes landed —
+the index, and the cache — because 4.5 ms per repaint would still be
+the most expensive thing in the frame.
+
 **Fix:** compute both relations once when the inventory changes
 (`set_inventory`, `main.rs:214-228`, which already does `dup_groups` and
 `family_usage` there) and cache them beside `self.inv`. That is a

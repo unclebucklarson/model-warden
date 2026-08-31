@@ -102,6 +102,15 @@ struct App {
     provenance: std::collections::BTreeMap<String, modelwarden::core::acquire::Provenance>,
     dups: Vec<DupGroup>,
     usage: Vec<FamilyUsage>,
+    /// The companion and split relations, derived once per inventory.
+    /// egui is immediate-mode, so anything computed in a draw fn is
+    /// computed on every repaint: every mouse move over the window,
+    /// every scroll tick, every keystroke in the filter box, and
+    /// continuously at 4 Hz while a job runs. These two are the most
+    /// expensive things the inventory tab wanted, and neither can
+    /// change without the inventory changing.
+    parents_of: std::collections::BTreeMap<String, Vec<String>>,
+    split_of: std::collections::BTreeMap<String, String>,
     findings: Option<Vec<Finding>>,
     activity: Vec<String>,
     busy: Option<String>,
@@ -170,6 +179,8 @@ impl App {
             provenance: Default::default(),
             dups: Vec::new(),
             usage: Vec::new(),
+            parents_of: Default::default(),
+            split_of: Default::default(),
             findings: None,
             activity: Vec::new(),
             busy: None,
@@ -227,6 +238,8 @@ impl App {
             modelwarden::core::acquire::load_provenance(&settings::state_dir());
         self.dups = manifest::dup_groups(&inv);
         self.usage = manifest::family_usage(&inv);
+        self.parents_of = manifest::companion_parents(&inv);
+        self.split_of = manifest::split_primary_of(&inv);
         self.inv = Some(inv);
     }
 
@@ -811,15 +824,16 @@ impl App {
             })
             .collect();
         // The "required by" relation comes from core — the single source
-        // of truth shared with the cold-storage dialog and delete.
-        let parents_of = manifest::companion_parents(inv);
+        // of truth shared with the cold-storage dialog and delete — and
+        // is derived once per inventory, not once per repaint.
+        //
         // Split models display as ONE row: parts 2..N group under part 1
         // with a combined size and "(N parts)" — per-part rows showed a
         // 51 GiB model as misleading 46.5 + 4.5 GiB peers.
-        let split_of = manifest::split_primary_of(inv);
+        let (parents_of, split_of) = (&self.parents_of, &self.split_of);
         let mut split_extra: std::collections::BTreeMap<String, (u64, usize, bool)> =
             std::collections::BTreeMap::new();
-        for (child, parent) in &split_of {
+        for (child, parent) in split_of {
             let (csz, cbacked) = inv
                 .models
                 .get(child)
@@ -1430,8 +1444,11 @@ impl App {
         if self.cold_target.is_empty() || !targets.iter().any(|(id, _)| *id == self.cold_target) {
             self.cold_target = targets.first().map(|(id, _)| id.clone()).unwrap_or_default();
         }
-        let companions = companion_keys(&inv);
-        let split_children = manifest::split_primary_of(&inv);
+        // Both relations are derived once per inventory; this dialog
+        // redraws continuously while it is open, so it reads the cache.
+        let companions: std::collections::BTreeSet<String> =
+            self.parents_of.keys().cloned().collect();
+        let split_children = self.split_of.clone();
         // Selectable: primary models with a live shelf copy to move.
         let eligible: Vec<(&String, &manifest::ModelEntry)> = inv
             .models
@@ -2672,12 +2689,6 @@ impl App {
             });
         self.show_roots = open;
     }
-}
-
-/// Contents that ride in another model's bundle while their own bundle
-/// stays alone — core's companion relation, key set only.
-fn companion_keys(inv: &manifest::Inventory) -> std::collections::BTreeSet<String> {
-    manifest::companion_parents(inv).into_keys().collect()
 }
 
 /// Backup/archive events all render the same way: durable log_line()

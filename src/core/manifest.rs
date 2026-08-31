@@ -390,10 +390,13 @@ pub fn backup_coverage(inv: &Inventory) -> (usize, usize) {
 /// companion → the models that require it. Symmetric bundle members
 /// (split parts) are peers, not companions.
 pub fn companion_parents(inv: &Inventory) -> BTreeMap<String, Vec<String>> {
+    // One index for the whole pass — it was being rebuilt implicitly,
+    // as a full catalog scan, twice per model per bundle member.
+    let idx = BundleIndex::of(inv);
     let mut out: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for k in inv.models.keys() {
-        for m in bundle_for(inv, k) {
-            if &m != k && !bundle_for(inv, &m).iter().any(|x| x == k) {
+        for m in bundle_for_indexed(inv, &idx, k) {
+            if &m != k && !bundle_for_indexed(inv, &idx, &m).iter().any(|x| x == k) {
                 out.entry(m).or_default().push(k.clone());
             }
         }
@@ -416,6 +419,8 @@ pub fn split_primary_of(inv: &Inventory) -> BTreeMap<String, String> {
             .and_then(|l| l.rel_path.file_name())
             .map(|f| f.to_string_lossy().into_owned())
     };
+    // `idx` is taken here by the split part number; this is the bundle one.
+    let bundles = BundleIndex::of(inv);
     let mut out = BTreeMap::new();
     for k in inv.models.keys() {
         let Some(name) = filename_of(k) else { continue };
@@ -425,7 +430,7 @@ pub fn split_primary_of(inv: &Inventory) -> BTreeMap<String, String> {
         if idx == 1 {
             continue;
         }
-        for m in bundle_for(inv, k) {
+        for m in bundle_for_indexed(inv, &bundles, k) {
             if m == *k {
                 continue;
             }
@@ -444,7 +449,10 @@ pub fn split_primary_of(inv: &Inventory) -> BTreeMap<String, String> {
 /// once — the contract every multi-model operation (backup, demote,
 /// delete) applies before moving anything.
 pub fn bundle_union(inv: &Inventory, keys: &[String]) -> std::collections::BTreeSet<String> {
-    keys.iter().flat_map(|k| bundle_for(inv, k)).collect()
+    let idx = BundleIndex::of(inv);
+    keys.iter()
+        .flat_map(|k| bundle_for_indexed(inv, &idx, k))
+        .collect()
 }
 
 /// The one projector-filename rule, shared by the catalog (bundle_for),
@@ -737,6 +745,77 @@ pub struct DupGroup {
 /// Deliberately asymmetric: selecting a projector does NOT drag in every
 /// quant that shares its directory.
 pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
+    bundle_for_indexed(inv, &BundleIndex::of(inv), key)
+}
+
+/// Which models could possibly be in the same bundle, looked up instead
+/// of searched for.
+///
+/// `bundle_for` used to compare the subject against every model in the
+/// catalog and every one of its locations. Two models are only ever
+/// bundled when they sit in the same directory on the same root, or
+/// share an Ollama base name, so those are the only candidates worth
+/// testing — and both are lookups. Measured on a synthetic 2,000-model
+/// catalog, computing `companion_parents` + `split_primary_of` went from
+/// 234 ms to a few ms; the GUI was doing that twice per repaint.
+pub struct BundleIndex {
+    by_container: BTreeMap<(String, PathBuf), Vec<String>>,
+    by_ollama: BTreeMap<(String, String), Vec<String>>,
+}
+
+impl BundleIndex {
+    pub fn of(inv: &Inventory) -> Self {
+        let mut by_container: BTreeMap<(String, PathBuf), Vec<String>> = BTreeMap::new();
+        let mut by_ollama: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+        for (k, e) in &inv.models {
+            for l in &e.locations {
+                if l.kind == RootKind::Ollama {
+                    by_ollama
+                        .entry((l.root_id.clone(), ollama_base(&e.display_name).to_string()))
+                        .or_default()
+                        .push(k.clone());
+                } else {
+                    by_container
+                        .entry((l.root_id.clone(), container_of(l.kind, &l.rel_path)))
+                        .or_default()
+                        .push(k.clone());
+                }
+            }
+        }
+        Self { by_container, by_ollama }
+    }
+
+    fn in_container(&self, root_id: &str, container: &Path) -> &[String] {
+        self.by_container
+            .get(&(root_id.to_string(), container.to_path_buf()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    /// Every key under `container` on this root, the container itself
+    /// included — the subtree a non-GGUF weights file claims. Paths sort
+    /// component-wise, so a prefix's descendants are contiguous.
+    fn under_container(&self, root_id: &str, container: &Path) -> Vec<&String> {
+        let start = (root_id.to_string(), container.to_path_buf());
+        let mut out = Vec::new();
+        for ((r, c), keys) in self.by_container.range(start..) {
+            if r != root_id || !c.starts_with(container) {
+                break;
+            }
+            out.extend(keys.iter());
+        }
+        out
+    }
+
+    fn same_ollama_base(&self, root_id: &str, base: &str) -> &[String] {
+        self.by_ollama
+            .get(&(root_id.to_string(), base.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+}
+
+pub fn bundle_for_indexed(inv: &Inventory, idx: &BundleIndex, key: &str) -> Vec<String> {
     let mut keys = std::collections::BTreeSet::new();
     keys.insert(key.to_string());
     let Some(entry) = inv.models.get(key) else {
@@ -746,13 +825,8 @@ pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
         match loc.kind {
             RootKind::Ollama => {
                 let base = ollama_base(&entry.display_name);
-                for (k2, e2) in &inv.models {
-                    if k2 != key
-                        && e2.locations.iter().any(|l2| {
-                            l2.kind == RootKind::Ollama && l2.root_id == loc.root_id
-                        })
-                        && ollama_base(&e2.display_name) == base
-                    {
+                for k2 in idx.same_ollama_base(&loc.root_id, base) {
+                    if k2 != key {
                         keys.insert(k2.clone());
                     }
                 }
@@ -766,10 +840,22 @@ pub fn bundle_for(inv: &Inventory, key: &str) -> Vec<String> {
                 // A non-GGUF weights file isn't self-contained: the model is
                 // the whole container (tokenizer, configs, everything).
                 let i_am_weights = crate::core::scan::is_weights_filename(&fname);
-                for (k2, e2) in &inv.models {
+                // Only models in this same directory can be companions —
+                // except for weights, which claim their whole subtree.
+                let candidates: Vec<&String> = if i_am_weights {
+                    if container.as_os_str().is_empty() {
+                        Vec::new()
+                    } else {
+                        idx.under_container(&loc.root_id, &container)
+                    }
+                } else {
+                    idx.in_container(&loc.root_id, &container).iter().collect()
+                };
+                for k2 in candidates {
                     if k2 == key {
                         continue;
                     }
+                    let Some(e2) = inv.models.get(k2) else { continue };
                     let companion = e2.locations.iter().any(|l2| {
                         if l2.root_id != loc.root_id {
                             return false;
@@ -1508,6 +1594,40 @@ mod tests {
             .insert("sha256:cc".into(), entry_with(&[(RootKind::Ollama, true)]));
         assert_eq!(backup_coverage(&inv), (1, 3));
     }
+    /// Not an assertion — a measurement, printed with `--nocapture`,
+    /// to size the relation cache honestly rather than by arithmetic.
+    #[test]
+    #[ignore]
+    fn measure_relation_cost() {
+        for n in [100usize, 500, 2000] {
+            let mut models = BTreeMap::new();
+            for i in 0..n {
+                let dir = format!("fam{}", i / 4);
+                models.insert(
+                    format!("sha256:{i:04}"),
+                    ModelEntry {
+                        size: 1,
+                        display_name: format!("m{i}"),
+                        meta: None,
+                        locations: vec![Location {
+                            root_id: "shelf-1".into(),
+                            kind: RootKind::Shelf,
+                            rel_path: PathBuf::from(format!("{dir}/m{i}-00001-of-00002.gguf")),
+                            accessible: true,
+                            dev: 1,
+                            ino: i as u64,
+                        }],
+                    },
+                );
+            }
+            let inv = inv_with(vec![], models);
+            let t = std::time::Instant::now();
+            let _ = companion_parents(&inv);
+            let _ = split_primary_of(&inv);
+            println!("n={n}: {:?} per frame", t.elapsed());
+        }
+    }
+
     #[test]
     fn an_unchanged_file_never_has_its_header_read_again() {
         // build_root_manifest carried sha256 and verified_unix forward

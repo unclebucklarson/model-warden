@@ -31,6 +31,9 @@ pub fn trash_dir(root: &Path) -> PathBuf {
 /// OUTSIDE the selection still needs.
 pub fn deletable_set(inv: &Inventory, keys: &[String]) -> (BTreeSet<String>, Vec<(String, String)>) {
     let union = manifest::bundle_union(inv, keys);
+    // This asks bundle_for once per model in the catalog; one index
+    // serves them all.
+    let idx = manifest::BundleIndex::of(inv);
     let mut del = BTreeSet::new();
     let mut kept = Vec::new();
     // A candidate is spared only when a model OUTSIDE the deletion union
@@ -43,7 +46,7 @@ pub fn deletable_set(inv: &Inventory, keys: &[String]) -> (BTreeSet<String>, Vec
             if union.contains(other) || *other == c {
                 continue;
             }
-            if manifest::bundle_for(inv, other).iter().any(|m| *m == c) {
+            if manifest::bundle_for_indexed(inv, &idx, other).iter().any(|m| *m == c) {
                 let name = inv
                     .models
                     .get(&c)
