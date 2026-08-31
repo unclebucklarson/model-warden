@@ -60,6 +60,27 @@ fn is_dangling_link(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) && !path.is_file()
 }
 
+/// Answers "do you already know this file's header metadata?" so a scan
+/// can skip opening the file at all.
+///
+/// `Some(meta)` means known — including `Some(None)`, "known to have no
+/// readable header". `None` means "read it". Parsing a GGUF header is
+/// not free: it walks the entire KV block, skipping tokenizer arrays 8
+/// KiB at a time, which cost ~12 ms per file and was paid again on every
+/// single scan for the whole life of the catalog. A file whose
+/// fingerprint has not moved has nothing new in its header.
+pub type MetaCache<'a> = &'a dyn Fn(&Path) -> Option<Option<GgufMeta>>;
+
+/// The cache that knows nothing: read every header.
+pub fn no_meta_cache(_: &Path) -> Option<Option<GgufMeta>> {
+    None
+}
+
+/// `known(path)` if it answers, otherwise parse the header.
+fn meta_of(path: &Path, known: MetaCache) -> Option<GgufMeta> {
+    known(path).unwrap_or_else(|| gguf::read_meta(path).ok())
+}
+
 /// A dot-entry is never part of a model: `.gitattributes`, `.cache/`,
 /// `.no_exist/`, and — critically on the shelf — `.modelwarden/trash/`,
 /// or a deleted model re-catalogs on the rescan that follows its own
@@ -172,6 +193,10 @@ pub fn default_hf_hub() -> Option<PathBuf> {
 /// GGUFs in the HF hub cache: `hub/models--org--name/snapshots/<rev>/**.gguf`
 /// — every revision, subdirectories included.
 pub fn hf_hub_models(hub: &Path) -> Vec<ModelFile> {
+    hf_hub_models_cached(hub, &no_meta_cache)
+}
+
+pub fn hf_hub_models_cached(hub: &Path, known: MetaCache) -> Vec<ModelFile> {
     let mut out = Vec::new();
     let Ok(repos) = std::fs::read_dir(hub) else {
         return out;
@@ -195,11 +220,15 @@ pub fn hf_hub_models(hub: &Path) -> Vec<ModelFile> {
             let mut has_weights = false;
             collect_snapshot(&rev.path(), 0, &mut ggufs, &mut others, &mut has_weights);
             for path in ggufs {
-                out.push(hf_entry(&path, &repo, gguf::read_meta(&path).ok()));
+                let meta = meta_of(&path, known);
+                out.push(hf_entry(&path, &repo, meta));
             }
             if has_weights {
                 for path in others {
-                    let meta = is_weights(&path).then(|| weights_meta(&path)).flatten();
+                    let meta = match known(&path) {
+                        Some(cached) => cached,
+                        None => is_weights(&path).then(|| weights_meta(&path)).flatten(),
+                    };
                     out.push(hf_entry(&path, &repo, meta));
                 }
             }
@@ -271,7 +300,7 @@ pub fn scan(
 ) -> Vec<ModelFile> {
     let mut out = Vec::new();
     for dir in scan_dirs {
-        walk_gguf(dir, 0, &mut out);
+        walk_gguf(dir, 0, &no_meta_cache, &mut out);
     }
     for store in ollama_stores {
         out.extend(ollama_models(store));
@@ -308,8 +337,12 @@ pub fn scan(
 /// individually rather than through the deduping `scan()` view — per-root
 /// truth lists a file in every root that has it).
 pub fn shelf_models(dir: &Path) -> Vec<ModelFile> {
+    shelf_models_cached(dir, &no_meta_cache)
+}
+
+pub fn shelf_models_cached(dir: &Path, known: MetaCache) -> Vec<ModelFile> {
     let mut out = Vec::new();
-    walk_gguf(dir, 0, &mut out);
+    walk_gguf(dir, 0, known, &mut out);
     out
 }
 
@@ -324,7 +357,7 @@ pub fn hf_repo_from_dirname(dirname: &str) -> Option<String> {
     Some(dirname.strip_prefix("models--")?.replace("--", "/"))
 }
 
-fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
+fn walk_gguf(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<ModelFile>) {
     if depth > 3 {
         return;
     }
@@ -336,7 +369,7 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
         let p = e.path();
         p.is_file() && is_weights(&p)
     }) {
-        emit_dir_as_model(dir, 0, out);
+        emit_dir_as_model(dir, 0, known, out);
         return;
     }
     for e in entries {
@@ -345,11 +378,11 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
             continue;
         }
         if path.is_dir() {
-            walk_gguf(&path, depth + 1, out);
+            walk_gguf(&path, depth + 1, known, out);
         } else if is_gguf(&path) {
             let (file_size, accessible) = stat_target(&path);
             out.push(ModelFile {
-                meta: gguf::read_meta(&path).ok(),
+                meta: meta_of(&path, known),
                 path,
                 file_size,
                 source: Source::Shelf,
@@ -361,7 +394,7 @@ fn walk_gguf(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
 
 /// Every file under a weights-model directory, skipping warden's own
 /// metadata and dotfiles.
-fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
+fn emit_dir_as_model(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<ModelFile>) {
     if depth > 3 {
         return;
     }
@@ -374,14 +407,13 @@ fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
             continue;
         }
         if path.is_dir() {
-            emit_dir_as_model(&path, depth + 1, out);
+            emit_dir_as_model(&path, depth + 1, known, out);
         } else if path.is_file() || is_dangling_link(&path) {
-            let meta = if is_gguf(&path) {
-                gguf::read_meta(&path).ok()
-            } else if is_weights(&path) {
-                weights_meta(&path)
-            } else {
-                None
+            let meta = match known(&path) {
+                Some(cached) => cached,
+                None if is_gguf(&path) => gguf::read_meta(&path).ok(),
+                None if is_weights(&path) => weights_meta(&path),
+                None => None,
             };
             let (file_size, accessible) = stat_target(&path);
             out.push(ModelFile {
@@ -402,6 +434,10 @@ fn emit_dir_as_model(dir: &Path, depth: usize, out: &mut Vec<ModelFile>) {
 /// `manifests/registry.ollama.ai/library/<name>/<tag>`; the name shown is
 /// `<name>:<tag>` (with the namespace kept when it isn't `library`).
 pub fn ollama_models(store: &Path) -> Vec<ModelFile> {
+    ollama_models_cached(store, &no_meta_cache)
+}
+
+pub fn ollama_models_cached(store: &Path, known: MetaCache) -> Vec<ModelFile> {
     let mut out = Vec::new();
     let manifests = store.join("manifests");
     let mut stack = vec![manifests.clone()];
@@ -414,7 +450,7 @@ pub fn ollama_models(store: &Path) -> Vec<ModelFile> {
             if crate::core::fsx::is_real_dir(&path) {
                 stack.push(path);
             } else {
-                ollama_models_from_manifest(store, &manifests, &path, &mut out);
+                ollama_models_from_manifest(store, &manifests, &path, known, &mut out);
             }
         }
     }
@@ -425,6 +461,7 @@ fn ollama_models_from_manifest(
     store: &Path,
     manifests_root: &Path,
     manifest: &Path,
+    known: MetaCache,
     out: &mut Vec<ModelFile>,
 ) {
     let Some(json) = std::fs::read_to_string(manifest)
@@ -465,7 +502,7 @@ fn ollama_models_from_manifest(
         // as a pruned HF snapshot: list it, honestly inaccessible.
         let (file_size, accessible) = stat_target(&blob);
         out.push(ModelFile {
-            meta: gguf::read_meta(&blob).ok(),
+            meta: meta_of(&blob, known),
             path: blob,
             file_size,
             source: Source::Ollama {

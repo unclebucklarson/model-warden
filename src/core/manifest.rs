@@ -54,11 +54,6 @@ pub struct FileRecord {
 /// fingerprint is unchanged keeps its stored sha256; anything changed or new
 /// starts unhashed.
 pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> RootManifest {
-    let models: Vec<ModelFile> = match spec.kind {
-        RootKind::Shelf | RootKind::Removable => scan::shelf_models(&spec.path),
-        RootKind::Ollama => scan::ollama_models(&spec.path),
-        RootKind::HfHub => scan::hf_hub_models(&spec.path),
-    };
     let prior: BTreeMap<&Path, &FileRecord> = previous
         .map(|p| {
             p.files
@@ -67,6 +62,21 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
                 .collect()
         })
         .unwrap_or_default();
+
+    // Nothing about an unchanged file needs re-reading — not its hash,
+    // and not its header either. The scanners ask this before opening
+    // anything, so a settled catalog costs stats and no parses.
+    let known = |abs: &Path| {
+        let rel = abs.strip_prefix(&spec.path).unwrap_or(abs);
+        let old = prior.get(rel)?;
+        (old.fingerprint.is_some() && old.fingerprint == Fingerprint::of(abs).ok())
+            .then(|| old.meta.clone())
+    };
+    let models: Vec<ModelFile> = match spec.kind {
+        RootKind::Shelf | RootKind::Removable => scan::shelf_models_cached(&spec.path, &known),
+        RootKind::Ollama => scan::ollama_models_cached(&spec.path, &known),
+        RootKind::HfHub => scan::hf_hub_models_cached(&spec.path, &known),
+    };
 
     let files = models
         .iter()
@@ -1498,6 +1508,66 @@ mod tests {
             .insert("sha256:cc".into(), entry_with(&[(RootKind::Ollama, true)]));
         assert_eq!(backup_coverage(&inv), (1, 3));
     }
+    #[test]
+    fn an_unchanged_file_never_has_its_header_read_again() {
+        // build_root_manifest carried sha256 and verified_unix forward
+        // when the fingerprint was unchanged, then threw away the meta
+        // it already had and re-derived it — which means opening and
+        // walking the whole KV block of every GGUF, on every scan, for
+        // the entire life of the catalog. Nothing about an unchanged
+        // file needs re-reading.
+        //
+        // Staged by making the bytes unreadable while leaving the
+        // fingerprint (size, mtime, dev, ino) untouched: a scan that
+        // still parses headers loses the metadata, one that carries it
+        // forward does not.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use crate::core::gguf::tests::synthetic_gguf;
+        use std::os::unix::fs::PermissionsExt;
+        let shelf = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let model = shelf.path().join("m.gguf");
+        std::fs::write(&model, synthetic_gguf("llama", 8192, 15)).unwrap();
+        let specs = [RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        }];
+
+        let first = refresh(&specs, state.path(), |_| {}).unwrap();
+        let arch = |inv: &Inventory| {
+            inv.models
+                .values()
+                .next()
+                .and_then(|e| e.meta.as_ref())
+                .and_then(|m| m.architecture.clone())
+        };
+        assert_eq!(arch(&first).as_deref(), Some("llama"));
+        let before = std::fs::metadata(&model).unwrap().modified().unwrap();
+
+        std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let again = refresh(&specs, state.path(), |_| {}).unwrap();
+        std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&model).unwrap().modified().unwrap(),
+            before,
+            "the file itself did not change — the fingerprint must still match"
+        );
+        assert_eq!(
+            arch(&again).as_deref(),
+            Some("llama"),
+            "the header was re-read instead of carried forward"
+        );
+        assert!(
+            again.models.keys().all(|k| k.starts_with("sha256:")),
+            "and the hash is still carried too"
+        );
+    }
+
     #[test]
     fn checkpoints_are_paced_by_time_not_taken_per_file() {
         let t0 = std::time::Instant::now();

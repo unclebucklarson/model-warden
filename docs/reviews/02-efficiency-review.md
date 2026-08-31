@@ -123,10 +123,27 @@ skipping tokenizer arrays 8 KiB at a time (`gguf.rs:160-168`), which is
 why `scan` burns 0.53 s of CPU on 44 files (~12 ms each) with almost no
 kernel time.
 
-**Fix:** carry `meta` forward exactly like `sha256` — same condition,
-same three lines. Expected effect: `scan`/`hash`/post-write refresh drop
-to near-zero CPU for unchanged catalogs, which also removes most of E3's
-sting. This is the cheapest large win available.
+**Fix:** carry `meta` forward exactly like `sha256`. It is not three
+lines: the metadata is produced by the *scanner*, which has already
+opened the file by the time `build_root_manifest` sees it, so the prior
+manifest has to reach the scanners. They now take a `MetaCache` — "do
+you already know this file's header?" — that `build_root_manifest`
+answers from the fingerprint it was going to check anyway.
+
+**Measured, 2026-08-31**, on this machine's real catalog (57 files, 576
+GiB across five roots, warm cache, release build, alternating binaries):
+
+| | `warden hash` on an unchanged catalog |
+|---|---|
+| before | 0.60 s real, 0.54 s user |
+| after | 0.02 s real, 0.00 s user |
+
+That is the path every write takes on the way back (the GUI rescans
+after each operation) and the first half of the weekly scrub. **The
+claim above about `warden scan` was wrong**: `scan` is a standalone
+scanner with no manifest to carry anything forward, by design, and it is
+unchanged at 0.57 s. E3's sting is reduced for the same reason the
+refresh got faster, not because `scan` improved.
 
 ### E5. `verify` is single-threaded while `hash` uses four cores
 `src/core/backup.rs:424-448` vs `manifest.rs:470-545`
