@@ -245,7 +245,7 @@ pub fn save_json<T: Serialize>(value: &T, path: &Path) -> Result<()> {
 
 // ---- merged inventory ----
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Inventory {
     pub schema_version: u32,
     pub generated_unix: u64,
@@ -254,6 +254,27 @@ pub struct Inventory {
     /// while the hash worker hasn't reached it, `unknown:<root>:<rel>` when
     /// the bytes are unreachable.
     pub models: BTreeMap<String, ModelEntry>,
+    /// Which roots are mounted, resolved once per loaded inventory.
+    ///
+    /// Deciding it per location meant a linear scan of `roots` plus a
+    /// `stat` syscall, and the inventory row loop asks once per row on
+    /// every repaint — measured at 1.1 ms per frame over 2,000 models,
+    /// on top of everything else the frame does. It is deliberately not
+    /// part of the inventory's value and is never serialized: plugging a
+    /// drive in becomes visible on the next catalog update, which is the
+    /// same point at which that drive's contents become known.
+    #[serde(skip)]
+    online: std::sync::OnceLock<BTreeMap<String, bool>>,
+}
+
+/// The liveness cache is not part of the value.
+impl PartialEq for Inventory {
+    fn eq(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.generated_unix == other.generated_unix
+            && self.roots == other.roots
+            && self.models == other.models
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -310,7 +331,16 @@ impl Inventory {
     pub fn location_state(&self, loc: &Location) -> LocationState {
         // An unregistered root is treated as offline, not broken: the
         // same "missing is offline, not gone" rule roots follow.
-        let online = self.root(&loc.root_id).is_some_and(|r| r.path.exists());
+        let online = *self
+            .online
+            .get_or_init(|| {
+                self.roots
+                    .iter()
+                    .map(|r| (r.id.clone(), r.path.exists()))
+                    .collect()
+            })
+            .get(&loc.root_id)
+            .unwrap_or(&false);
         match (online, loc.accessible) {
             (false, _) => LocationState::Offline,
             (true, true) => LocationState::Present,
@@ -364,6 +394,7 @@ pub fn merge(manifests: &[RootManifest]) -> Inventory {
         generated_unix: now_unix(),
         roots: manifests.iter().map(|m| m.root.clone()).collect(),
         models,
+        online: Default::default(),
     }
 }
 
@@ -1280,6 +1311,7 @@ mod tests {
             generated_unix: 0,
             roots: vec![],
             models,
+        online: Default::default(),
         };
         // Picking one split part pulls the other part and the projector,
         // but not the unrelated quant.
@@ -1337,6 +1369,7 @@ mod tests {
             generated_unix: 0,
             roots: vec![],
             models,
+            online: Default::default(),
         };
         assert_eq!(
             bundle_for(&inv, "sha256:weights"),
@@ -1413,6 +1446,7 @@ mod tests {
                 })
                 .collect(),
             models,
+            online: Default::default(),
         };
         let groups = dup_groups(&inv);
         assert_eq!(groups.len(), 1);
@@ -1480,6 +1514,7 @@ mod tests {
             generated_unix: 0,
             roots,
             models,
+            online: Default::default(),
         }
     }
 
@@ -1583,6 +1618,7 @@ mod tests {
             generated_unix: 0,
             roots: Vec::new(),
             models: BTreeMap::new(),
+            online: Default::default(),
         };
         inv.models.insert(
             "sha256:aa".into(),
@@ -1624,7 +1660,28 @@ mod tests {
             let t = std::time::Instant::now();
             let _ = companion_parents(&inv);
             let _ = split_primary_of(&inv);
-            println!("n={n}: {:?} per frame", t.elapsed());
+            println!("n={n}: relations {:?} per frame", t.elapsed());
+
+            // E17: the liveness predicate stats the root filesystem for
+            // every location, and the row loop asks it for every row.
+            let mounted = tempfile::tempdir().unwrap();
+            let live = inv_with(
+                vec![RootSpec {
+                    id: "shelf-1".into(),
+                    kind: RootKind::Shelf,
+                    path: mounted.path().to_path_buf(),
+                    label: None,
+                }],
+                inv.models.clone(),
+            );
+            let t = std::time::Instant::now();
+            let n_live = live
+                .models
+                .values()
+                .flat_map(|e| &e.locations)
+                .filter(|l| live.live_accessible(l))
+                .count();
+            println!("n={n}: liveness {:?} per frame ({n_live} live)", t.elapsed());
         }
     }
 

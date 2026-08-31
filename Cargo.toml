@@ -45,3 +45,11 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.cpufeatures]
 opt-level = 3
+
+# Defaults ship ~9 MB of debug symbols in every release tarball and every
+# `cargo install`, with no LTO and codegen-units=16 on paths that are
+# genuinely CPU-bound (GGUF header parsing, JSON serialisation, SHA-256).
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

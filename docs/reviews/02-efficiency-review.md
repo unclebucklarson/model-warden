@@ -276,6 +276,13 @@ symbols nobody asked for. Adding `lto = "thin"`, `codegen-units = 1`, and
 `strip = "symbols"` typically also buys 5–15% on the CPU-bound paths
 (header parsing, JSON serialisation) for free.
 
+**Measured after the change, 2026-08-31.** The size win is real and
+slightly better than predicted — `warden` 6.45 MB → 4.70 MB (27%),
+`warden-gui` 34.46 MB → 23.11 MB (33%). **The CPU claim is not borne
+out**: `warden scan`, the most header-parse-heavy path there is, went
+0.57 s → 0.565 s, which is noise. Keep the profile for the size; do not
+credit it with speed.
+
 ---
 
 ## P3 — tidy-up
@@ -297,6 +304,10 @@ symbols nobody asked for. Adding `lto = "thin"`, `codegen-units = 1`, and
   location, and it is called inside per-frame loops and inside
   `family_usage`/`dedup`. At 2,000 models that is thousands of `stat`
   calls per frame. Cache root liveness once per inventory load.
+  **Measured 2026-08-31**: asking the predicate for every location cost
+  1.11 ms per frame at n=2,000; with the cache, 42 µs. Landed as a
+  `OnceLock` on `Inventory`, deliberately outside the value (`PartialEq`
+  is hand-written) and never serialized.
 
 ---
 
