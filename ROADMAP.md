@@ -304,6 +304,39 @@ backed up, which are the same bytes — without ever losing bytes.**
   Nothing here blocks shipping — the design holds; these are places the
   implementation doesn't yet keep the documentation's promises.
 
+- **Review remediation — all 50 findings, complete 2026-08-31.** Six
+  phases, test-first, each pushed with CI green on Linux and macOS. 118
+  unit tests plus the 10-test whole-binary suite (from 101/2 at review
+  time). Every finding carries a dated note in its own document saying
+  what happened.
+
+  What changed structurally: writes go through one atomic `save_json`
+  and one `fsx::rename_noreplace`; the write lock is `flock`, arbitrated
+  by the kernel; a drive's carried manifest is sanitised before any of
+  it is believed; config and state are `0600`/`0700` and self-heal at
+  startup; downloads verify against the origin's `x-linked-etag`; there
+  is one symlink policy (`scan::stat_target`) and one liveness predicate
+  (`manifest::LocationState` — Present / Offline / Unreadable) instead of
+  four disagreeing ones; `verify` survives a bad sector and uses the
+  cores; `demote --remove-source` routes through the trash, so `trash
+  empty` really is the only thing that destroys bytes.
+
+  Measured on the real catalog (47 contents, 576 GiB, five roots):
+  `warden hash` on an unchanged catalog **0.60 s → 0.02 s**; the GUI's
+  per-frame relation cost **234 ms → 4.5 ms** at 2,000 models and then
+  out of the frame entirely; binaries 27–33% smaller.
+
+  Four findings turned out to be **wrong** and are corrected in place,
+  not dropped: C12 was not a stack overflow (ELOOP bounds it; the real
+  defect was a 42× inflated trash listing), E4 could not speed up
+  `warden scan` (it has no manifest to carry forward), E11's 32 MiB was
+  never resident, E13's CPU claim was noise. Three are deliberately not
+  fixed with the reasoning recorded beside each: grid virtualisation
+  (needs TableBuilder and a visual check), `DirEntry::file_type()` (would
+  stop the shelf walker following symlinked directories), and fs-UUID
+  precedence over the drive marker (would silently re-id existing
+  drives). Status table at the top of docs/reviews/README.md.
+
 ## ⇒ PICK UP HERE (state as of 2026-08-26, v0.2.0)
 
 **Everything through M15 + the use-in-anger wave is complete and
