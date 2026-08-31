@@ -142,6 +142,18 @@ would be milliseconds. Failing that, the rescan should at least be
 incremental per root rather than global: `warden delete` only ever
 touches owned roots, yet it re-scans the HF cache too.
 
+**Closed by E4, 2026-08-31 — not fixed on its own terms, and that is
+deliberate.** The premise above was the 0.53 s. `rerun_hash_quietly` and
+the GUI's `refresh_catalog` both call `manifest::refresh`, which is the
+path E4 fixed: the full post-write rescan of all five roots on this
+machine now costs **0.02 s**, measured. Targeted manifest patching would
+buy back at most those 20 ms and would introduce a class of bug warden
+cannot afford — a catalog that disagrees with the disk because an update
+was scoped too narrowly. The cheap half of the suggestion (refresh only
+owned roots after a delete) has the same hazard for the same ~15 ms: it
+would build the merged inventory from a partially refreshed set. Left
+alone on purpose.
+
 ### E4. GGUF headers are re-parsed on every scan, forever
 `src/core/scan.rs:307` and `:349`, consumed by
 `manifest.rs:56-101`
@@ -233,6 +245,21 @@ borrowed paths removes both.
 Individually small; collectively this is the difference between one stat
 per file and three or four, on a tree that can hold tens of thousands of
 entries (an HF cache with blobs and snapshots).
+
+**Fixed and measured, 2026-08-31.** `ModelFile` now carries the
+`Fingerprint` from the single stat the walker already did, so the
+inode-dedupe pass and `build_root_manifest` both read it instead of
+stat'ing again. Counted with `strace -c` on this machine's real stores:
+`warden scan` 251 → 224 stat calls, `warden hash` 365 → 287. Wall time
+is unchanged (0.56 s → 0.55 s on `scan`), exactly as "individually
+small" predicts; the value is at HF-cache scale, not here.
+
+**Not done: `DirEntry::file_type()` in the walk loops.** `file_type()`
+comes from `readdir` and does not follow symlinks, while `path.is_dir()`
+does — and a shelf of symlinks into a big drive is a layout warden
+supports (see code-review C5). Swapping them would silently stop the
+shelf walker descending through a symlinked directory. Saving one stat
+is not worth changing what gets found.
 
 ### E9. The journal opens, writes, and closes a file per line — on the UI thread
 `src/bin/warden-gui/main.rs:575,596,604` → `src/core/journal.rs:25-35`

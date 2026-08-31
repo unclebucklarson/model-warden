@@ -66,11 +66,10 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
     // Nothing about an unchanged file needs re-reading — not its hash,
     // and not its header either. The scanners ask this before opening
     // anything, so a settled catalog costs stats and no parses.
-    let known = |abs: &Path| {
+    let known = |abs: &Path, fp: Option<Fingerprint>| {
         let rel = abs.strip_prefix(&spec.path).unwrap_or(abs);
         let old = prior.get(rel)?;
-        (old.fingerprint.is_some() && old.fingerprint == Fingerprint::of(abs).ok())
-            .then(|| old.meta.clone())
+        (old.fingerprint.is_some() && old.fingerprint == fp).then(|| old.meta.clone())
     };
     let models: Vec<ModelFile> = match spec.kind {
         RootKind::Shelf | RootKind::Removable => scan::shelf_models_cached(&spec.path, &known),
@@ -86,7 +85,8 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
                 .strip_prefix(&spec.path)
                 .unwrap_or(&m.path)
                 .to_path_buf();
-            let fingerprint = m.accessible.then(|| Fingerprint::of(&m.path).ok()).flatten();
+            // The scanner's one stat, not a second one.
+            let fingerprint = m.fingerprint;
             let unchanged = prior
                 .get(rel_path.as_path())
                 .filter(|old| old.fingerprint.is_some() && old.fingerprint == fingerprint);

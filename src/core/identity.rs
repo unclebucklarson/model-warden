@@ -24,16 +24,22 @@ pub struct Fingerprint {
 
 impl Fingerprint {
     pub fn of(path: &Path) -> Result<Self> {
-        use std::os::unix::fs::MetadataExt;
         let md = std::fs::metadata(path)
             .with_context(|| format!("fingerprinting {}", path.display()))?;
-        Ok(Self {
+        Ok(Self::from_metadata(&md))
+    }
+
+    /// From a stat the caller already did — the scanners hold one for
+    /// every file they list.
+    pub fn from_metadata(md: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
             size: md.len(),
             mtime_s: md.mtime(),
             mtime_nsec: md.mtime_nsec(),
             dev: md.dev(),
             ino: md.ino(),
-        })
+        }
     }
 }
 

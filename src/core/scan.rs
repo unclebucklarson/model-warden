@@ -17,6 +17,7 @@
 //!   incident) is listed with `accessible: false` instead of vanishing.
 
 use crate::core::gguf::{self, GgufMeta};
+use crate::core::identity::Fingerprint;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
@@ -36,7 +37,8 @@ fn is_weights(path: &Path) -> bool {
         .is_some_and(|f| is_weights_filename(&f.to_string_lossy()))
 }
 
-/// Size and reachability for one cataloged file — decided in ONE place.
+/// One stat per cataloged file, answering every question about it:
+/// how big, still there, and which inode.
 ///
 /// Shelf entries can be symlinks (a curated shelf of links into a big
 /// drive is a normal layout, and the HF cache builds every snapshot that
@@ -47,10 +49,18 @@ fn is_weights(path: &Path) -> bool {
 /// and the trash's reclaim figure. When the target is gone the file is
 /// listed at size 0 and `accessible: false`: visible and honestly
 /// broken, never silently dropped.
-fn stat_target(path: &Path) -> (u64, bool) {
+fn stat_target(path: &Path) -> Option<Fingerprint> {
     match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => (m.len(), true),
-        _ => (0, false),
+        Ok(m) if m.is_file() => Some(Fingerprint::from_metadata(&m)),
+        _ => None,
+    }
+}
+
+/// `(size, accessible)` from that one stat.
+fn size_and_reach(fp: Option<Fingerprint>) -> (u64, bool) {
+    match fp {
+        Some(f) => (f.size, true),
+        None => (0, false),
     }
 }
 
@@ -69,16 +79,16 @@ fn is_dangling_link(path: &Path) -> bool {
 /// KiB at a time, which cost ~12 ms per file and was paid again on every
 /// single scan for the whole life of the catalog. A file whose
 /// fingerprint has not moved has nothing new in its header.
-pub type MetaCache<'a> = &'a dyn Fn(&Path) -> Option<Option<GgufMeta>>;
+pub type MetaCache<'a> = &'a dyn Fn(&Path, Option<Fingerprint>) -> Option<Option<GgufMeta>>;
 
 /// The cache that knows nothing: read every header.
-pub fn no_meta_cache(_: &Path) -> Option<Option<GgufMeta>> {
+pub fn no_meta_cache(_: &Path, _: Option<Fingerprint>) -> Option<Option<GgufMeta>> {
     None
 }
 
 /// `known(path)` if it answers, otherwise parse the header.
-fn meta_of(path: &Path, known: MetaCache) -> Option<GgufMeta> {
-    known(path).unwrap_or_else(|| gguf::read_meta(path).ok())
+fn meta_of(path: &Path, fp: Option<Fingerprint>, known: MetaCache) -> Option<GgufMeta> {
+    known(path, fp).unwrap_or_else(|| gguf::read_meta(path).ok())
 }
 
 /// A dot-entry is never part of a model: `.gitattributes`, `.cache/`,
@@ -134,6 +144,10 @@ pub enum Source {
 pub struct ModelFile {
     pub path: PathBuf,
     pub file_size: u64,
+    /// The one stat the scanner already did: size, mtime, dev, ino.
+    /// `None` when the bytes are unreachable. Carried so the manifest
+    /// and the inode-dedupe pass do not each stat the file again.
+    pub fingerprint: Option<Fingerprint>,
     pub source: Source,
     /// `false` when the bytes aren't reachable: a dangling snapshot symlink
     /// (pruned blob) or a manifest naming a blob that's gone. The entry is
@@ -220,12 +234,12 @@ pub fn hf_hub_models_cached(hub: &Path, known: MetaCache) -> Vec<ModelFile> {
             let mut has_weights = false;
             collect_snapshot(&rev.path(), 0, &mut ggufs, &mut others, &mut has_weights);
             for path in ggufs {
-                let meta = meta_of(&path, known);
+                let meta = meta_of(&path, stat_target(&path), known);
                 out.push(hf_entry(&path, &repo, meta));
             }
             if has_weights {
                 for path in others {
-                    let meta = match known(&path) {
+                    let meta = match known(&path, stat_target(&path)) {
                         Some(cached) => cached,
                         None => is_weights(&path).then(|| weights_meta(&path)).flatten(),
                     };
@@ -242,11 +256,13 @@ fn hf_entry(path: &Path, repo: &str, meta: Option<GgufMeta>) -> ModelFile {
     // same question the shelf asks: how big is the target, and is it
     // still there? A pruned blob leaves the symlink behind; that file is
     // listed as inaccessible, not skipped.
-    let (file_size, accessible) = stat_target(path);
+    let fingerprint = stat_target(path);
+    let (file_size, accessible) = size_and_reach(fingerprint);
     ModelFile {
         meta,
         path: path.to_path_buf(),
         file_size,
+        fingerprint,
         source: Source::HfHub {
             repo: repo.to_string(),
         },
@@ -314,12 +330,11 @@ pub fn scan(
     // that survives. (Byte-identical copies with different inodes are the
     // hash worker's job, not this pass's.)
     let mut seen = std::collections::HashSet::new();
-    out.retain(|m| {
-        use std::os::unix::fs::MetadataExt;
-        let key = std::fs::metadata(&m.path)
-            .map(|md| (md.dev(), md.ino()))
-            .unwrap_or((0, 0));
-        key == (0, 0) || seen.insert(key)
+    out.retain(|m| match m.fingerprint {
+        // The walkers already stat'ed every one of these; this pass used
+        // to stat them all over again.
+        Some(fp) => seen.insert((fp.dev, fp.ino)),
+        None => true,
     });
     // Stable order: shelf, then Ollama, then HF hub — alphabetical within.
     out.sort_by(|a, b| {
@@ -380,11 +395,13 @@ fn walk_gguf(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<ModelFile
         if path.is_dir() {
             walk_gguf(&path, depth + 1, known, out);
         } else if is_gguf(&path) {
-            let (file_size, accessible) = stat_target(&path);
+            let fingerprint = stat_target(&path);
+            let (file_size, accessible) = size_and_reach(fingerprint);
             out.push(ModelFile {
-                meta: meta_of(&path, known),
+                meta: meta_of(&path, fingerprint, known),
                 path,
                 file_size,
+                fingerprint,
                 source: Source::Shelf,
                 accessible,
             });
@@ -409,17 +426,19 @@ fn emit_dir_as_model(dir: &Path, depth: usize, known: MetaCache, out: &mut Vec<M
         if path.is_dir() {
             emit_dir_as_model(&path, depth + 1, known, out);
         } else if path.is_file() || is_dangling_link(&path) {
-            let meta = match known(&path) {
+            let fingerprint = stat_target(&path);
+            let (file_size, accessible) = size_and_reach(fingerprint);
+            let meta = match known(&path, fingerprint) {
                 Some(cached) => cached,
                 None if is_gguf(&path) => gguf::read_meta(&path).ok(),
                 None if is_weights(&path) => weights_meta(&path),
                 None => None,
             };
-            let (file_size, accessible) = stat_target(&path);
             out.push(ModelFile {
                 meta,
                 path,
                 file_size,
+                fingerprint,
                 source: Source::Shelf,
                 accessible,
             });
@@ -500,11 +519,13 @@ fn ollama_models_from_manifest(
         let blob = store.join("blobs").join(digest.replace(':', "-"));
         // A manifest naming a blob that's gone is the same incident class
         // as a pruned HF snapshot: list it, honestly inaccessible.
-        let (file_size, accessible) = stat_target(&blob);
+        let fingerprint = stat_target(&blob);
+        let (file_size, accessible) = size_and_reach(fingerprint);
         out.push(ModelFile {
-            meta: meta_of(&blob, known),
+            meta: meta_of(&blob, fingerprint, known),
             path: blob,
             file_size,
+            fingerprint,
             source: Source::Ollama {
                 name: format!("{name}{suffix}"),
             },
