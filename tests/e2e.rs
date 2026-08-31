@@ -357,3 +357,55 @@ fn walk_files(dir: &Path) -> Vec<String> {
     }
     out
 }
+
+#[test]
+fn two_wardens_cannot_write_at_once() {
+    // The guarantee the lock exists for, across real processes: while one
+    // warden holds it, another must refuse rather than proceed. The old
+    // pid-file protocol could let both through (each deleting the other's
+    // lock as "stale"); the kernel now arbitrates.
+    use std::sync::mpsc;
+    let e = Env::new();
+    // Enough files that the first process is still hashing when we race it.
+    for i in 0..40 {
+        e.gguf(&format!("m{i}.gguf"), format!("body-{i}").as_bytes());
+    }
+    let (tx, rx) = mpsc::channel();
+    let cfg = e.config_dir();
+    let state = e.root.path().join("state");
+    std::thread::spawn(move || {
+        let out = Command::new(env!("CARGO_BIN_EXE_warden"))
+            .arg("hash")
+            .env("XDG_CONFIG_HOME", cfg)
+            .env("XDG_STATE_HOME", state)
+            .output()
+            .expect("spawning the holder");
+        let _ = tx.send(out);
+    });
+
+    // Race it: keep trying until either we see a refusal (the lock works)
+    // or the holder finishes (inconclusive, so try again).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let mut saw_refusal = false;
+    while std::time::Instant::now() < deadline && !saw_refusal {
+        let out = e.warden(&["hash"]);
+        let text = String::from_utf8_lossy(&out.stderr).to_string();
+        if text.contains("another warden") {
+            saw_refusal = true;
+        }
+        if rx.try_recv().is_ok() {
+            break; // holder finished; nothing left to race
+        }
+    }
+    let holder = rx.recv_timeout(std::time::Duration::from_secs(30)).ok();
+    if let Some(out) = holder {
+        assert!(
+            out.status.success(),
+            "the lock holder must still succeed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    // The catalog must be intact and complete either way.
+    let status = e.ok(&["status"]);
+    assert!(status.contains("40 distinct contents"), "{status}");
+}

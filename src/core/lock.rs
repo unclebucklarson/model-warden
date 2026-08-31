@@ -1,10 +1,19 @@
 //! Single-instance write lock: two wardens must never race a backup,
 //! reclaim, or catalog rewrite.
 //!
-//! A pid file under the state dir, dependency-free: created with
-//! `create_new` (atomic on Linux), holder's pid inside. A lock whose pid no
-//! longer exists in /proc is stale (crashed warden) and is stolen. Read
-//! commands never lock — only operations that write.
+//! An advisory lock (`flock(LOCK_EX|LOCK_NB)`) on a file under the state
+//! dir. The kernel arbitrates, so there is nothing to race and nothing
+//! to clean up: a holder that crashes releases the lock when its
+//! descriptor closes, and a leftover lock *file* means nothing on its
+//! own. The pid is still written inside, purely so the refusal message
+//! can name who is holding it.
+//!
+//! This replaces a pid-file protocol with two defects: it decided
+//! staleness by reading the file and then unconditionally deleting it
+//! (two wardens could each delete the other's fresh lock and both
+//! proceed), and it created the file before writing the pid (a reader in
+//! that window saw an empty file and stole a *live* lock). Read commands
+//! never lock — only operations that write.
 
 use anyhow::{Context, Result, bail};
 use std::path::{Path, PathBuf};
@@ -12,6 +21,8 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub struct WriteLock {
     path: PathBuf,
+    /// Holding the descriptor open IS the lock; dropping it releases.
+    file: std::fs::File,
 }
 
 pub fn lock_path(state_dir: &Path) -> PathBuf {
@@ -19,65 +30,64 @@ pub fn lock_path(state_dir: &Path) -> PathBuf {
 }
 
 impl WriteLock {
-    /// Take the write lock or explain who holds it. The guard removes the
-    /// lock file on drop (including unwind).
+    /// Take the write lock or explain who holds it.
     pub fn acquire(state_dir: &Path) -> Result<Self> {
         let path = lock_path(state_dir);
-        std::fs::create_dir_all(state_dir)
-            .with_context(|| format!("creating {}", state_dir.display()))?;
-        loop {
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&path)
-            {
-                Ok(mut f) => {
-                    use std::io::Write;
-                    let _ = writeln!(f, "{}", std::process::id());
-                    return Ok(Self { path });
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    let holder = std::fs::read_to_string(&path)
-                        .ok()
-                        .and_then(|s| s.trim().parse::<u32>().ok());
-                    match holder {
-                        Some(pid) if process_alive(pid) => {
-                            bail!(
-                                "another warden (pid {pid}) is writing — retry when it finishes \
-                                 (or remove {} if that pid is not warden)",
-                                path.display()
-                            );
-                        }
-                        _ => {
-                            // Stale (crashed holder) or unreadable: steal.
-                            let _ = std::fs::remove_file(&path);
-                            continue;
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(e).with_context(|| format!("creating {}", path.display()));
-                }
+        crate::core::settings::create_private_dir(state_dir)?;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening {}", path.display()))?;
+        if !try_lock(&file)? {
+            let holder = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|s| s.trim().parse::<u32>().ok());
+            match holder {
+                Some(pid) => bail!(
+                    "another warden (pid {pid}) is writing — retry when it finishes"
+                ),
+                None => bail!("another warden is writing — retry when it finishes"),
             }
         }
+        // Ours now: record who, for the other side's error message.
+        use std::io::{Seek, Write};
+        let mut f = &file;
+        let _ = f.set_len(0);
+        let _ = f.rewind();
+        let _ = writeln!(f, "{}", std::process::id());
+        let _ = f.flush();
+        Ok(Self { path, file })
     }
 }
 
-/// One probe for every unix: `kill(pid, 0)` delivers nothing and only
-/// checks existence; EPERM means "exists but not ours" — still alive.
-/// (An earlier /proc-based Linux variant judged live locks stale on
-/// macOS — the portability spike's one failure, docs/spikes.md #5 —
-/// and /proc also lies under hidepid mounts and some containers, so a
-/// single kill-based implementation is both portable and stronger.)
+/// `true` when the lock was taken, `false` when someone else holds it.
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
-    let r = unsafe { libc::kill(pid as libc::pid_t, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+fn try_lock(file: &std::fs::File) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Ok(false),
+        _ => Err(err).context("locking the state directory"),
+    }
 }
 
 impl Drop for WriteLock {
     fn drop(&mut self) {
+        // Unlink first, then release: a waiter that wins the lock on a
+        // fresh open never finds itself holding a file we then delete.
         let _ = std::fs::remove_file(&self.path);
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
     }
 }
 
@@ -98,7 +108,7 @@ mod tests {
     #[test]
     fn a_stale_lock_from_a_dead_process_is_stolen() {
         let state = tempfile::tempdir().unwrap();
-        // No such pid on any sane system.
+        // A crashed holder leaves the file behind; nothing holds it.
         std::fs::write(lock_path(state.path()), "999999999\n").unwrap();
         let lock = WriteLock::acquire(state.path()).unwrap();
         drop(lock);
@@ -109,6 +119,30 @@ mod tests {
     fn garbage_lock_files_are_stolen_too() {
         let state = tempfile::tempdir().unwrap();
         std::fs::write(lock_path(state.path()), "not a pid").unwrap();
+        assert!(WriteLock::acquire(state.path()).is_ok());
+    }
+
+    #[test]
+    fn a_lock_file_nobody_holds_is_not_an_obstacle() {
+        // The old protocol decided liveness by parsing a pid and asking
+        // whether *some* process with that number exists. After a crash
+        // and pid reuse that answer is wrong in the dangerous direction:
+        // warden refuses every write forever. Worse, deciding staleness
+        // by reading the file raced with the writer of a brand-new lock.
+        // With an advisory lock on the descriptor, "held" is a fact the
+        // kernel answers, and death releases it.
+        let state = tempfile::tempdir().unwrap();
+        // A leftover file naming a live pid — this process — held by nobody.
+        std::fs::write(
+            lock_path(state.path()),
+            format!("{}\n", std::process::id()),
+        )
+        .unwrap();
+        let lock = WriteLock::acquire(state.path())
+            .expect("an unheld lock file must never block a write");
+        // And while it IS held, a second acquisition is refused.
+        assert!(WriteLock::acquire(state.path()).is_err());
+        drop(lock);
         assert!(WriteLock::acquire(state.path()).is_ok());
     }
 }
