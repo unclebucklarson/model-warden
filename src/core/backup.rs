@@ -166,6 +166,7 @@ pub fn backup(
                     sha256: Some(hash.to_string()),
                     name: Some(entry.display_name.clone()),
                     meta: entry.meta.clone(),
+                    meta_reader: crate::core::gguf::READER_VERSION,
                     accessible: true,
                     verified_unix: Some(manifest::now_unix()),
                 });
@@ -758,6 +759,7 @@ mod tests {
             sha256: Some("no-such-content".into()),
             name: None,
             meta: None,
+            meta_reader: 0,
             accessible: true,
             verified_unix: None,
         });
@@ -895,6 +897,7 @@ mod tests {
                 sha256: Some(crate::core::identity::sha256_file(&path, |_, _| {}).unwrap()),
                 name: None,
                 meta: None,
+                meta_reader: 0,
                 accessible: true,
                 verified_unix: None,
             });
@@ -966,6 +969,7 @@ mod tests {
                 sha256: Some(hash),
                 name: None,
                 meta: None,
+                meta_reader: 0,
                 accessible: true,
                 verified_unix: None,
             }],

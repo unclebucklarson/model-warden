@@ -16,6 +16,10 @@ update it when milestones land.
 ## Commands
 
 - `cargo build` / `cargo test` — core is headless and fully testable.
+- `cargo build --no-default-features` — core + CLI without the GUI stack
+  (the `gui` feature gates eframe/rfd; this is what library consumers
+  such as modellab get with `default-features = false`). CI builds and
+  tests both ways.
 - `cargo run` — opens the GUI (`default-run = "warden-gui"`).
 - `cargo run --bin warden -- <scan|hash|status|dups|doctor|roots|where|backup|verify|scrub|archive|restore|dedup|report|fetch|delete|trash|journal>` — CLI; `--json` on all read commands.
 - Config: `~/.config/modelwarden/config.json` (records only what the user changed).
@@ -46,7 +50,9 @@ Single crate, strict core/ui split: `src/core/` is GUI-free and testable;
 `src/bin/warden.rs` (CLI) and `src/bin/warden-gui/` (egui 0.36, traditional
 menus) render over it and must never be dependencies of it.
 
-Core modules: `gguf` (header reader), `scan` (store scanners + inode dedupe),
+Core modules: `gguf` (header reader — `read_meta` for the inventory's
+fields, `read_fields` for any key typed as stored; the family's one GGUF
+parser, modellab reads through it), `scan` (store scanners + inode dedupe),
 `identity` (fingerprint + SHA-256 worker), `lock` (single-instance write
 lock), `manifest` (per-root JSON + merged view + bundles), `roots`
 (storage-root registry, removable-media identity), `backup`, `archive`

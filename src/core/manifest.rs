@@ -9,7 +9,7 @@
 //! version. A root whose path is missing keeps its manifest — offline is
 //! not gone.
 
-use crate::core::gguf::GgufMeta;
+use crate::core::gguf::{self, GgufMeta};
 use crate::core::identity::Fingerprint;
 use crate::core::roots::{RootKind, RootSpec};
 use crate::core::scan::{self, ModelFile, Source};
@@ -43,6 +43,11 @@ pub struct FileRecord {
     /// What the owning tool calls it (Ollama `model:tag`, HF `org/repo`).
     pub name: Option<String>,
     pub meta: Option<GgufMeta>,
+    /// `gguf::READER_VERSION` that produced `meta`. A record from an
+    /// older reader is re-read once so the fields the reader has since
+    /// learned get filled; a current one is carried forward unread.
+    #[serde(default)]
+    pub meta_reader: u32,
     pub accessible: bool,
     /// When these bytes were last read end-to-end and matched `sha256`
     /// (set by backup and `warden verify`, carried while unchanged).
@@ -55,12 +60,7 @@ pub struct FileRecord {
 /// starts unhashed.
 pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> RootManifest {
     let prior: BTreeMap<&Path, &FileRecord> = previous
-        .map(|p| {
-            p.files
-                .iter()
-                .map(|f| (f.rel_path.as_path(), f))
-                .collect()
-        })
+        .map(|p| p.files.iter().map(|f| (f.rel_path.as_path(), f)).collect())
         .unwrap_or_default();
 
     // Nothing about an unchanged file needs re-reading — not its hash,
@@ -69,7 +69,12 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
     let known = |abs: &Path, fp: Option<Fingerprint>| {
         let rel = abs.strip_prefix(&spec.path).unwrap_or(abs);
         let old = prior.get(rel)?;
-        (old.fingerprint.is_some() && old.fingerprint == fp).then(|| old.meta.clone())
+        let unchanged = old.fingerprint.is_some() && old.fingerprint == fp;
+        // A meta an older reader wrote is re-read once, to pick up what
+        // the reader has learned since; a file that had no meta (not a
+        // GGUF, or unreadable then) is not re-opened for that reason.
+        let current = old.meta.is_none() || old.meta_reader >= gguf::READER_VERSION;
+        (unchanged && current).then(|| old.meta.clone())
     };
     let models: Vec<ModelFile> = match spec.kind {
         RootKind::Shelf | RootKind::Removable => scan::shelf_models_cached(&spec.path, &known),
@@ -104,6 +109,7 @@ pub fn build_root_manifest(spec: &RootSpec, previous: Option<&RootManifest>) -> 
                 sha256,
                 name,
                 meta: m.meta.clone(),
+                meta_reader: gguf::READER_VERSION,
                 accessible: m.accessible,
                 verified_unix,
             }
@@ -497,11 +503,24 @@ pub fn is_projector_name(name: &str) -> bool {
 /// file takes ~35s, so byte-level progress matters.
 #[derive(Debug, Clone)]
 pub enum RefreshEvent {
-    HashStart { label: String, size: u64 },
+    HashStart {
+        label: String,
+        size: u64,
+    },
     /// Sent every ~64 MiB, not every read.
-    HashProgress { label: String, done: u64, total: u64 },
-    HashDone { label: String, secs: f32 },
-    HashFailed { label: String, error: String },
+    HashProgress {
+        label: String,
+        done: u64,
+        total: u64,
+    },
+    HashDone {
+        label: String,
+        secs: f32,
+    },
+    HashFailed {
+        label: String,
+        error: String,
+    },
 }
 
 impl RefreshEvent {
@@ -555,7 +574,10 @@ impl Checkpoint {
     pub const INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
     pub fn new() -> Self {
-        Self { last: None, since: 0 }
+        Self {
+            last: None,
+            since: 0,
+        }
     }
 
     /// Call once per finished file; `true` means "make it durable now".
@@ -650,10 +672,26 @@ pub fn refresh(
         size: u64,
     }
     enum HashMsg {
-        Start { label: String, size: u64 },
-        Progress { label: String, done: u64, total: u64 },
-        Done { m_i: usize, f_i: usize, hex: String, label: String, secs: f32 },
-        Failed { label: String, error: String },
+        Start {
+            label: String,
+            size: u64,
+        },
+        Progress {
+            label: String,
+            done: u64,
+            total: u64,
+        },
+        Done {
+            m_i: usize,
+            f_i: usize,
+            hex: String,
+            label: String,
+            secs: f32,
+        },
+        Failed {
+            label: String,
+            error: String,
+        },
     }
     let mut jobs: Vec<HashJob> = Vec::new();
     for (m_i, m) in manifests.iter().enumerate() {
@@ -676,7 +714,11 @@ pub fn refresh(
     if !jobs.is_empty() {
         let threads = jobs
             .len()
-            .min(std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1))
+            .min(
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1),
+            )
             .min(4);
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut checkpoint = Checkpoint::new();
@@ -730,7 +772,13 @@ pub fn refresh(
                     HashMsg::Progress { label, done, total } => {
                         on(RefreshEvent::HashProgress { label, done, total })
                     }
-                    HashMsg::Done { m_i, f_i, hex, label, secs } => {
+                    HashMsg::Done {
+                        m_i,
+                        f_i,
+                        hex,
+                        label,
+                        secs,
+                    } => {
                         manifests[m_i].files[f_i].sha256 = Some(hex);
                         // Checkpoint first, report second: when this
                         // file is one the policy makes durable, the
@@ -819,7 +867,10 @@ impl BundleIndex {
                 }
             }
         }
-        Self { by_container, by_ollama }
+        Self {
+            by_container,
+            by_ollama,
+        }
     }
 
     fn in_container(&self, root_id: &str, container: &Path) -> &[String] {
@@ -892,7 +943,9 @@ pub fn bundle_for_indexed(inv: &Inventory, idx: &BundleIndex, key: &str) -> Vec<
                     if k2 == key {
                         continue;
                     }
-                    let Some(e2) = inv.models.get(k2) else { continue };
+                    let Some(e2) = inv.models.get(k2) else {
+                        continue;
+                    };
                     let companion = e2.locations.iter().any(|l2| {
                         if l2.root_id != loc.root_id {
                             return false;
@@ -912,8 +965,7 @@ pub fn bundle_for_indexed(inv: &Inventory, idx: &BundleIndex, key: &str) -> Vec<
                             crate::core::acquire::split_parts(&f2)
                                 .is_some_and(|(p2, _, c2)| p2 == p && c2 == *c)
                         });
-                        same_split
-                            || (!i_am_projector && is_projector_name(&f2))
+                        same_split || (!i_am_projector && is_projector_name(&f2))
                     });
                     if companion {
                         keys.insert(k2.clone());
@@ -1042,10 +1094,7 @@ pub fn dup_groups(inv: &Inventory) -> Vec<DupGroup> {
         {
             by_dev.entry(l.dev).or_default().insert(l.ino);
         }
-        let extra_inodes: u64 = by_dev
-            .values()
-            .map(|inos| inos.len() as u64 - 1)
-            .sum();
+        let extra_inodes: u64 = by_dev.values().map(|inos| inos.len() as u64 - 1).sum();
         if extra_inodes > 0 {
             out.push(DupGroup {
                 sha256: hash.to_string(),
@@ -1126,9 +1175,10 @@ mod tests {
         save_json(&serde_json::json!({"v": 2}), &path).unwrap();
         let cur: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        let bak: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(path.with_extension("json.bak")).unwrap())
-                .unwrap();
+        let bak: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path.with_extension("json.bak")).unwrap(),
+        )
+        .unwrap();
         assert_eq!(cur["v"], 2);
         assert_eq!(bak["v"], 1);
     }
@@ -1153,6 +1203,7 @@ mod tests {
                 sha256: Some("aa".into()),
                 name: None,
                 meta: None,
+                meta_reader: 0,
                 accessible: true,
                 verified_unix: None,
             }],
@@ -1239,6 +1290,7 @@ mod tests {
                 sha256: Some("dd".into()),
                 name: None,
                 meta: None,
+                meta_reader: 0,
                 accessible: true,
                 verified_unix: None,
             }],
@@ -1276,48 +1328,70 @@ mod tests {
         // HF snapshot: split quant in a subfolder + mmproj at snapshot root.
         models.insert(
             "sha256:part1".to_string(),
-            entry("unsloth/Big-GGUF", vec![loc(
-                RootKind::HfHub, "hf",
-                "models--unsloth--Big-GGUF/snapshots/rev1/UD/big-00001-of-00002.gguf",
-            )]),
+            entry(
+                "unsloth/Big-GGUF",
+                vec![loc(
+                    RootKind::HfHub,
+                    "hf",
+                    "models--unsloth--Big-GGUF/snapshots/rev1/UD/big-00001-of-00002.gguf",
+                )],
+            ),
         );
         models.insert(
             "sha256:part2".to_string(),
-            entry("unsloth/Big-GGUF", vec![loc(
-                RootKind::HfHub, "hf",
-                "models--unsloth--Big-GGUF/snapshots/rev1/UD/big-00002-of-00002.gguf",
-            )]),
+            entry(
+                "unsloth/Big-GGUF",
+                vec![loc(
+                    RootKind::HfHub,
+                    "hf",
+                    "models--unsloth--Big-GGUF/snapshots/rev1/UD/big-00002-of-00002.gguf",
+                )],
+            ),
         );
         models.insert(
             "sha256:proj".to_string(),
-            entry("unsloth/Big-GGUF", vec![loc(
-                RootKind::HfHub, "hf",
-                "models--unsloth--Big-GGUF/snapshots/rev1/mmproj-F16.gguf",
-            )]),
+            entry(
+                "unsloth/Big-GGUF",
+                vec![loc(
+                    RootKind::HfHub,
+                    "hf",
+                    "models--unsloth--Big-GGUF/snapshots/rev1/mmproj-F16.gguf",
+                )],
+            ),
         );
         // A different quant in the same snapshot: NOT part of the bundle.
         models.insert(
             "sha256:otherquant".to_string(),
-            entry("unsloth/Big-GGUF", vec![loc(
-                RootKind::HfHub, "hf",
-                "models--unsloth--Big-GGUF/snapshots/rev1/big-Q2_K.gguf",
-            )]),
+            entry(
+                "unsloth/Big-GGUF",
+                vec![loc(
+                    RootKind::HfHub,
+                    "hf",
+                    "models--unsloth--Big-GGUF/snapshots/rev1/big-Q2_K.gguf",
+                )],
+            ),
         );
         // Ollama model + projector tied by name.
         models.insert(
             "sha256:omodel".to_string(),
-            entry("vision:latest", vec![loc(RootKind::Ollama, "ol", "blobs/sha256-m")]),
+            entry(
+                "vision:latest",
+                vec![loc(RootKind::Ollama, "ol", "blobs/sha256-m")],
+            ),
         );
         models.insert(
             "sha256:oproj".to_string(),
-            entry("vision:latest+projector", vec![loc(RootKind::Ollama, "ol", "blobs/sha256-p")]),
+            entry(
+                "vision:latest+projector",
+                vec![loc(RootKind::Ollama, "ol", "blobs/sha256-p")],
+            ),
         );
         let inv = Inventory {
             schema_version: SCHEMA_VERSION,
             generated_unix: 0,
             roots: vec![],
             models,
-        online: Default::default(),
+            online: Default::default(),
         };
         // Picking one split part pulls the other part and the projector,
         // but not the unrelated quant.
@@ -1355,20 +1429,28 @@ mod tests {
         let mut models = BTreeMap::new();
         models.insert(
             "sha256:weights".to_string(),
-            entry(vec![loc("models--org--Embed/snapshots/rev1/model.safetensors")]),
+            entry(vec![loc(
+                "models--org--Embed/snapshots/rev1/model.safetensors",
+            )]),
         );
         models.insert(
             "sha256:tok".to_string(),
-            entry(vec![loc("models--org--Embed/snapshots/rev1/tokenizer.json")]),
+            entry(vec![loc(
+                "models--org--Embed/snapshots/rev1/tokenizer.json",
+            )]),
         );
         models.insert(
             "sha256:pool".to_string(),
-            entry(vec![loc("models--org--Embed/snapshots/rev1/1_Pooling/config.json")]),
+            entry(vec![loc(
+                "models--org--Embed/snapshots/rev1/1_Pooling/config.json",
+            )]),
         );
         // Another repo entirely: not part of the bundle.
         models.insert(
             "sha256:other".to_string(),
-            entry(vec![loc("models--org--Other/snapshots/rev9/model.safetensors")]),
+            entry(vec![loc(
+                "models--org--Other/snapshots/rev9/model.safetensors",
+            )]),
         );
         let inv = Inventory {
             schema_version: SCHEMA_VERSION,
@@ -1529,18 +1611,40 @@ mod tests {
         let attached = tempfile::tempdir().unwrap();
         let inv = inv_with(
             vec![
-                RootSpec { id: "on".into(), kind: RootKind::Removable, path: attached.path().into(), label: None },
-                RootSpec { id: "off".into(), kind: RootKind::Removable, path: attached.path().join("unplugged"), label: None },
+                RootSpec {
+                    id: "on".into(),
+                    kind: RootKind::Removable,
+                    path: attached.path().into(),
+                    label: None,
+                },
+                RootSpec {
+                    id: "off".into(),
+                    kind: RootKind::Removable,
+                    path: attached.path().join("unplugged"),
+                    label: None,
+                },
             ],
             BTreeMap::new(),
         );
         use LocationState::*;
-        assert_eq!(inv.location_state(&loc_on("on", RootKind::Removable, true)), Present);
-        assert_eq!(inv.location_state(&loc_on("on", RootKind::Removable, false)), Unreadable);
+        assert_eq!(
+            inv.location_state(&loc_on("on", RootKind::Removable, true)),
+            Present
+        );
+        assert_eq!(
+            inv.location_state(&loc_on("on", RootKind::Removable, false)),
+            Unreadable
+        );
         // An unplugged drive is Offline whatever the stored flag says —
         // the flag describes the last scan, not now.
-        assert_eq!(inv.location_state(&loc_on("off", RootKind::Removable, true)), Offline);
-        assert_eq!(inv.location_state(&loc_on("off", RootKind::Removable, false)), Offline);
+        assert_eq!(
+            inv.location_state(&loc_on("off", RootKind::Removable, true)),
+            Offline
+        );
+        assert_eq!(
+            inv.location_state(&loc_on("off", RootKind::Removable, false)),
+            Offline
+        );
         // Liveness is that one state, not a second opinion.
         assert!(inv.live_accessible(&loc_on("on", RootKind::Removable, true)));
         assert!(!inv.live_accessible(&loc_on("off", RootKind::Removable, true)));
@@ -1555,8 +1659,18 @@ mod tests {
         // different thing and must still count: the bytes travel with it.
         let attached = tempfile::tempdir().unwrap();
         let roots = vec![
-            RootSpec { id: "here".into(), kind: RootKind::Removable, path: attached.path().into(), label: None },
-            RootSpec { id: "away".into(), kind: RootKind::Removable, path: attached.path().join("unplugged"), label: None },
+            RootSpec {
+                id: "here".into(),
+                kind: RootKind::Removable,
+                path: attached.path().into(),
+                label: None,
+            },
+            RootSpec {
+                id: "away".into(),
+                kind: RootKind::Removable,
+                path: attached.path().join("unplugged"),
+                label: None,
+            },
         ];
         let mut models = BTreeMap::new();
         let mk = |loc: Location| ModelEntry {
@@ -1565,13 +1679,25 @@ mod tests {
             meta: None,
             locations: vec![loc_on("shelf", RootKind::Shelf, true), loc],
         };
-        models.insert("sha256:present".into(), mk(loc_on("here", RootKind::Removable, true)));
-        models.insert("sha256:offline".into(), mk(loc_on("away", RootKind::Removable, true)));
-        models.insert("sha256:broken".into(), mk(loc_on("here", RootKind::Removable, false)));
+        models.insert(
+            "sha256:present".into(),
+            mk(loc_on("here", RootKind::Removable, true)),
+        );
+        models.insert(
+            "sha256:offline".into(),
+            mk(loc_on("away", RootKind::Removable, true)),
+        );
+        models.insert(
+            "sha256:broken".into(),
+            mk(loc_on("here", RootKind::Removable, false)),
+        );
         let inv = inv_with(roots, models);
 
         assert!(is_backed_up(&inv, &inv.models["sha256:present"]));
-        assert!(is_backed_up(&inv, &inv.models["sha256:offline"]), "offline is not gone");
+        assert!(
+            is_backed_up(&inv, &inv.models["sha256:offline"]),
+            "offline is not gone"
+        );
         assert!(
             !is_backed_up(&inv, &inv.models["sha256:broken"]),
             "an unreadable drive copy is not a backup"
@@ -1599,8 +1725,16 @@ mod tests {
             display_name: "m".into(),
             meta: None,
             locations: vec![
-                Location { ino: a, dev: 9, ..loc_on("away", RootKind::Removable, true) },
-                Location { ino: b, dev: 9, ..loc_on("away", RootKind::Removable, true) },
+                Location {
+                    ino: a,
+                    dev: 9,
+                    ..loc_on("away", RootKind::Removable, true)
+                },
+                Location {
+                    ino: b,
+                    dev: 9,
+                    ..loc_on("away", RootKind::Removable, true)
+                },
             ],
         };
         models.insert("sha256:copied".into(), two_copies(1, 2));
@@ -1687,8 +1821,76 @@ mod tests {
                 .flat_map(|e| &e.locations)
                 .filter(|l| live.live_accessible(l))
                 .count();
-            println!("n={n}: liveness {:?} per frame ({n_live} live)", t.elapsed());
+            println!(
+                "n={n}: liveness {:?} per frame ({n_live} live)",
+                t.elapsed()
+            );
         }
+    }
+
+    #[test]
+    fn a_record_from_an_older_reader_is_reread_once_then_carried() {
+        // The 2026-09-01 reader learned the KV-shape fields. A catalog
+        // written before it holds meta without them; on the next
+        // refresh those files must be re-read once — and only once —
+        // rather than carrying the gaps forever or re-reading every
+        // scan (the regression the test below guards).
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        use crate::core::gguf::tests::{Kv, synthetic_gguf_with};
+        use std::os::unix::fs::PermissionsExt;
+        let shelf = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let model = shelf.path().join("m.gguf");
+        std::fs::write(
+            &model,
+            synthetic_gguf_with("llama", 8192, 15, &[("llama.block_count", Kv::U32(40))]),
+        )
+        .unwrap();
+        let specs = [RootSpec {
+            id: "shelf-1".into(),
+            kind: RootKind::Shelf,
+            path: shelf.path().to_path_buf(),
+            label: None,
+        }];
+        let layers = |inv: &Inventory| {
+            inv.models
+                .values()
+                .next()
+                .and_then(|e| e.meta.as_ref())
+                .and_then(|m| m.block_count)
+        };
+
+        let first = refresh(&specs, state.path(), |_| {}).unwrap();
+        assert_eq!(layers(&first), Some(40));
+
+        // Age the stored manifest to what warden 0.4 wrote: no shape
+        // fields, no reader version.
+        let path = manifest_path(state.path(), "shelf-1");
+        let mut v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let rec = v["files"][0].as_object_mut().unwrap();
+        rec.remove("meta_reader");
+        rec["meta"].as_object_mut().unwrap().remove("block_count");
+        std::fs::write(&path, serde_json::to_string(&v).unwrap()).unwrap();
+
+        let again = refresh(&specs, state.path(), |_| {}).unwrap();
+        assert_eq!(
+            layers(&again),
+            Some(40),
+            "an older reader's record must be re-read"
+        );
+
+        // Now current: the header is not opened again.
+        std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let third = refresh(&specs, state.path(), |_| {}).unwrap();
+        std::fs::set_permissions(&model, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            layers(&third),
+            Some(40),
+            "a current record was re-read instead of carried"
+        );
     }
 
     #[test]
@@ -1852,7 +2054,11 @@ mod tests {
         };
         let map = split_primary_of(&inv);
         // Part 2 groups under part 1 — one model, one display row.
-        assert_eq!(map.get(&key_of("big-00002-of")), Some(&key_of("big-00001-of")), "{map:?}");
+        assert_eq!(
+            map.get(&key_of("big-00002-of")),
+            Some(&key_of("big-00001-of")),
+            "{map:?}"
+        );
         // Part 1 is the primary, never a child; non-splits stay out.
         assert!(!map.contains_key(&key_of("big-00001-of")));
         assert!(!map.contains_key(&key_of("mmproj")));
@@ -1872,10 +2078,7 @@ mod tests {
             "",
             "..",
         ] {
-            assert!(
-                sanitize_rel(Path::new(bad)).is_err(),
-                "must refuse {bad:?}"
-            );
+            assert!(sanitize_rel(Path::new(bad)).is_err(), "must refuse {bad:?}");
         }
         // A trailing/interior CurDir is harmless but normalized away.
         assert_eq!(
@@ -1897,6 +2100,7 @@ mod tests {
             sha256: Some("a".repeat(64)),
             name: None,
             meta: None,
+            meta_reader: 0,
             accessible: true,
             verified_unix: None,
         };
@@ -1910,10 +2114,10 @@ mod tests {
             },
             generated_unix: 0,
             files: vec![
-                rec("present.gguf", real.len() as u64), // real: kept
-                rec("../../../../etc/passwd", 10),      // traversal: dropped
-                rec("/etc/shadow", 10),                 // absolute: dropped
-                rec("ghost.gguf", 999),                 // fabricated: dropped
+                rec("present.gguf", real.len() as u64),   // real: kept
+                rec("../../../../etc/passwd", 10),        // traversal: dropped
+                rec("/etc/shadow", 10),                   // absolute: dropped
+                rec("ghost.gguf", 999),                   // fabricated: dropped
                 rec("present.gguf.2", real.len() as u64), // fabricated: dropped
             ],
         };
@@ -1941,7 +2145,9 @@ mod tests {
         let path = dir.path().join("roots/x.json");
         save_json(&vec![1, 2, 3], &path).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap().replace(['\n', ' '], ""),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replace(['\n', ' '], ""),
             "[1,2,3]"
         );
         // The previous version is kept by COPYING it aside, never by
@@ -1950,18 +2156,26 @@ mod tests {
         // manifest at all and the root silently reverted to unknown.
         save_json(&vec![4, 5], &path).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap().replace(['\n', ' '], ""),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .replace(['\n', ' '], ""),
             "[4,5]"
         );
         let bak = path.with_extension("json.bak");
         assert_eq!(
-            std::fs::read_to_string(&bak).unwrap().replace(['\n', ' '], ""),
+            std::fs::read_to_string(&bak)
+                .unwrap()
+                .replace(['\n', ' '], ""),
             "[1,2,3]"
         );
         // Manifests carry every model path on the machine.
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
-        let dmode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+        let dmode = std::fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(dmode, 0o700);
     }
 }

@@ -33,7 +33,17 @@ warden write operation. Read it, never write it.
         "name": "Qwen3.8 27B Instruct",
         "context_length": 262144,
         "quantization": "Q4_K_XL",
-        "size_label": "27B"
+        "size_label": "27B",
+        // Added 2026-09-01 (warden 0.5; additive, schema stays 1): what
+        // a KV-cache fit needs. null when the header lacks them, on
+        // projector files, and when the header holds a per-layer array
+        // (Gemma 4's head_count_kv) — one number would be a guess; the
+        // modelwarden crate's gguf::read_fields hands back the array.
+        "block_count": 64,
+        "embedding_length": 5120,
+        "head_count": 24,
+        "head_count_kv": 4,
+        "head_dim": 256
       },
       "locations": [                   // every place these bytes live
         {
@@ -55,6 +65,9 @@ Semantics consumers must honor:
 
 - **Identity is the key.** Two locations under one key are the same bytes.
   Never treat path or filename as identity.
+- **Fields may be added within a version; null means unknown.** A
+  consumer that ignores unknown fields and treats null as "not known"
+  keeps working across additions; only a shape change bumps the version.
 - **`accessible: false` or a missing root path means offline, not gone.**
   Don't drop such entries; report them as on offline media.
 - **Absolute path** of a location = `roots[id].path` + `/` + `rel_path`.

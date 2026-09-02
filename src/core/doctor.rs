@@ -946,6 +946,7 @@ mod tests {
                 sha256: Some("aa".into()),
                 name: None,
                 meta: None,
+                meta_reader: 0,
                 accessible: true,
                 verified_unix: verified,
             }],

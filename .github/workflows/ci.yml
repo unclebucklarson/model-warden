@@ -30,3 +30,11 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      # Library consumers depend with `default-features = false`; the
+      # core and the CLI must build and pass without the GUI stack.
+      - name: Build without the GUI
+        run: cargo build --locked --no-default-features
+
+      - name: Test without the GUI
+        run: cargo test --locked --no-default-features

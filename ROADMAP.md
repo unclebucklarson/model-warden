@@ -337,6 +337,21 @@ backed up, which are the same bytes — without ever losing bytes.**
   precedence over the drive marker (would silently re-id existing
   drives). Status table at the top of docs/reviews/README.md.
 
+- **modellab prerequisites (2026-09-01, v0.5.0).** The GUI is a
+  feature (`gui`, default on; eframe and rfd optional; `warden-gui`
+  needs it; CI builds and tests both ways) so a library consumer with
+  `default-features = false` never compiles egui. `GgufMeta` gains
+  five additive fields — `block_count`, `embedding_length`,
+  `head_count`, `head_count_kv`, `head_dim` — read the way
+  `context_length` is; per-layer arrays (Gemma 4, Laguna, Ollama's
+  Qwen3.5) yield null rather than a guessed number. `gguf::read_fields`
+  hands back any key typed as stored, arrays whole, so consumers never
+  grow a second parser. A `meta_reader` version on catalog records
+  makes an older catalog re-read each header exactly once. Inventory
+  schema stays v1 (additive; documented). Driven by modellab's Spike 1,
+  which needed per-layer head counts, window patterns and SSM sizes the
+  four scalars could not carry.
+
 ## ⇒ PICK UP HERE (state as of 2026-08-26, v0.2.0)
 
 **Everything through M15 + the use-in-anger wave is complete and
@@ -358,6 +373,19 @@ scrub timer is enabled on the dev machine. What remains:
    not started; plan in docs/portability.md.
 4. Otherwise: **use-in-anger** — real usage keeps nominating the next
    work (it has produced every milestone since M13).
+5. **modellab prerequisites — DONE 2026-09-01 as v0.5.0** (see Done;
+   tag + publish pending). The original ask, for the record:**
+   - **Feature-gate the GUI deps.** `[features] default = ["gui"]`,
+     `gui = ["dep:eframe"]` plus whatever else only the GUI pulls;
+     `required-features = ["gui"]` on the `warden-gui` bin; CI builds
+     both ways. Dependents then use `default-features = false` (today
+     every modellab build compiles egui for nothing).
+   - **KV-math fields on `GgufMeta`.** Block/layer count, KV head count,
+     head dimension (`<arch>.attention.key_length`/`value_length` when
+     present, else embedding ÷ heads), embedding length — read the same
+     way `context_length` is today. Neither reader in the family has
+     them; modellab's fit calculator is arithmetic over them, and its
+     load-bearing Spike 1 waits on this.
 
 Release routine: bump Cargo.toml version → commit → `git tag vX.Y.Z &&
 git push origin vX.Y.Z` (GH release builds itself) → `cargo publish`.
@@ -424,6 +452,17 @@ Serving (llama-server router), measurement, and opencode.json live there.
 Boundary: **warden owns storage truth and acquisition; the sibling owns serving
 + OpenCode.** It will read warden's merged inventory (schema v1, M6) but never
 manages storage; warden never serves or edits configs. Keep the seam crisp.
+
+## Sibling project: modellab (`~/src2/modellab`)
+
+Measurement truth: what a model actually does on this machine (computed
+fit, settled context, throughput, quality, energy). It consumes the
+`modelwarden` crate as a library (GGUF reader, inventory types,
+`acquire`) and reads `inventory.json`; it publishes its own versioned
+results file under `~/.local/state/modellab/`. Boundary: **warden owns
+storage truth and acquisition; modellab owns measurement.** It never
+writes inside the shelf except through `acquire`. Warden-side work it
+needs is PICK UP HERE item 5.
 
 ## Parked / ideas
 

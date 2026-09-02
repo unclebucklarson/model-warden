@@ -176,6 +176,7 @@ pub fn demote(
             sha256: Some(hash.to_string()),
             name: Some(entry.display_name.clone()),
             meta: entry.meta.clone(),
+            meta_reader: crate::core::gguf::READER_VERSION,
             accessible: true,
             verified_unix: Some(manifest::now_unix()),
         });
