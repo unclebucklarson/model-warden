@@ -6,6 +6,46 @@ Nothing here is urgent: the scrub timer fires Mon 2026-09-07 while you're
 away and will run fine in its current form — task 1 just makes the next
 one better.
 
+---
+
+## Amendment — 2026-09-03 (read this first)
+
+You came back briefly, freed the GPU, and work happened. **Every task
+below is still valid and still undone** — this section only says what
+changed around them.
+
+**Shipped since:** warden **v0.5.0** is tagged, released (6 assets:
+Linux + both macOS arches, each with a sha256), and published to
+crates.io. That makes Task 1 below *more* useful, not less: `cargo
+install modelwarden` now gets 0.5.0. Download history on crates.io is
+intact — 118 downloads across all versions; a version page showing 0 is
+just that version's own count.
+
+**modellab reached M3 and its live gate ran.** `modellab ctx` settled the
+27B at **151,808 tokens** — Shepard reports 110,080 for the same model,
+so it was leaving a third of the card's context unused. The gate also
+found three defects in modellab itself, all fixed test-first:
+generation-rate reporting llama.cpp's "could not time it" sentinel as
+`0 tokens/s`; a remaining-time estimate that averaged failed probes with
+held ones ("about 17 s left" for an eight-minute job); and `fit`
+computing ranges without the vision projector while `ctx` loads one.
+102 tests green.
+
+**Four issues in ModelShepard's Lab** are written up with line references
+and the smallest fix for each in modellab's `docs/handoff-shepard.md`,
+for that repo's own instance to pick up. Headline: its `tg_tps` is
+measured at ~zero context (38.25) while a user at its own calibrated
+context gets 28.99 — and its shareable report labels that row
+"measured … not estimated".
+
+**Decision E.1 below is resolved** — `unclebucklarson/modellab` already
+exists and is **private**. Nothing to decide; flip it public any time
+with `gh repo edit unclebucklarson/modellab --visibility public`.
+
+**One new task, added as Task 7.**
+
+---
+
 Record findings in the **Feedback** section at the bottom of this file
 (edit it directly and commit, or just tell the next session "read
 docs/qa/2026-09-02-away-tasks.md and here's what I found").
@@ -137,8 +177,40 @@ that built it). Open a new Claude session in `~/src2/modellab` and say:
 
 > Run the CLI usability review that closes M1, per ROADMAP.md.
 
-Everything else in modellab (M2, the fit calculator) is unblocked and
-waiting behind that review.
+There is a second one owed now too — M2's (the fit calculator) — since
+M1, M2 and M3 have all landed since this doc was written. Both reviews
+want a fresh session; neither blocks M4.
+
+---
+
+## Task 7 (new) — the owed modellab live re-run (~15 min, needs an idle GPU)
+
+The three fixes above are covered by a hermetic test that reproduces the
+exact failure without a GPU, but one live pass is owed to confirm the
+settled number is unchanged and the new wording reads right.
+
+**The GPU must be genuinely idle, and this is the part that caught me
+out:** pausing opencode is *not* enough. ModelShepard's router keeps the
+model resident in VRAM by design — that is what a router is for. You have
+to unload the model too (which is what you did last time), or stop the
+router. Check with:
+
+```sh
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+```
+
+Only ModelShepard's GUI (~200 MiB) should appear. Then:
+
+```sh
+cd ~/src2/modellab
+./target/debug/modellab ctx "Qwen3.8-27B-UD-Q4_K_XL"
+```
+
+Expected (Feedback G): settles at or very near **151,808** tokens in
+about 8 probes; the summary line should now read *"generation not timed —
+the model stopped after 1 token, too few to measure a rate"* rather than
+"generation 0 tokens/s"; and no time estimate should appear until the
+first probe actually holds.
 
 ---
 
@@ -164,11 +236,18 @@ waiting behind that review.
 - Any doc/tutorial wording that now reads wrong:
 
 ## E. Decisions when you're back
-1. **modellab GitHub repo**: create `unclebucklarson/modellab` (public,
-   like model-warden)? yes / no / different name:
-2. **Priority order**: modellab M2 (fit calculator) vs warden backlog vs
-   waiting on ModelShepard's inventory integration — your call:
+1. ~~modellab GitHub repo~~ **resolved**: it exists, private. Public?
+   yes / no:
+2. **Priority order**: modellab M4 (throughput bench — where the
+   `llama-bench -d` depth fix lives, the honest tg-at-context number) vs
+   the modellab M1/M2 usability reviews vs warden backlog vs waiting on
+   ModelShepard — your call:
 3. Anything from A–D worth turning into roadmap items:
+
+## G. Task 7 — modellab live re-run
+- Settled context (expect ~151,808):
+- Did the generation line read "not timed" rather than "0 tokens/s"?
+- Did a time estimate appear before the first probe held? (should not)
 
 ## F. Anything else broken, confusing, or annoying
 -
